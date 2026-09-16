@@ -152,6 +152,26 @@ export class ViesService {
       // lado de um painel VIES que já tinha o nome e a morada certos.
       const nameIsGeneric = isGenericPartyName(party.name, party.nif, party.vatNumber);
       const parsedAddress = result.valid ? parsePostalAddress(result.address) : null;
+      let fallbackName: string | null = null;
+      if (result.valid && !result.name && nameIsGeneric && this.prisma?.document?.findFirst) {
+        const linked = await this.prisma.document.findFirst({
+          where: {
+            OR: [
+              { partyId },
+              ...(party.nif ? [{ supplierNif: party.nif }] : []),
+              ...(party.vatNumber ? [{ supplierNif: party.vatNumber }] : []),
+            ],
+            supplier: { not: null },
+          },
+          select: { supplier: true },
+          orderBy: { createdAt: 'desc' },
+        });
+        if (linked?.supplier && !isGenericPartyName(linked.supplier)) {
+          fallbackName = linked.supplier.trim().slice(0, 200);
+        }
+      }
+      const finalName = result.name || fallbackName;
+
       await this.prisma.party.update({
         where: { id: partyId },
         data: {
@@ -163,7 +183,7 @@ export class ViesService {
           ...(party.vatNumber ? {} : { vatNumber: `${cc}${result.vatNumber}` }),
           // O nome oficial só substitui um nome genérico — nunca
           // sobrepõe um nome que o operador já confirmou ou corrigiu.
-          ...(result.valid && result.name && nameIsGeneric ? { name: result.name } : {}),
+          ...(result.valid && finalName && nameIsGeneric ? { name: finalName } : {}),
           // A morada só preenche o que estiver vazio — nunca apaga
           // dados já corretos.
           ...(parsedAddress && !party.address && parsedAddress.address ? { address: parsedAddress.address } : {}),
@@ -194,7 +214,7 @@ export class ViesService {
       const body = (await res.json()) as Record<string, unknown>;
       const pick = (k: string) => {
         const v = body[k];
-        return typeof v === 'string' && v.trim() && v.trim() !== '---' ? v.trim() : null;
+        return typeof v === 'string' && v.trim() && !/^[-–—\s/._*#]+$/.test(v.trim()) ? v.trim() : null;
       };
       // "MS_UNAVAILABLE"/"SERVICE_UNAVAILABLE" come back as userError with valid=false
       const userError = pick('userError');

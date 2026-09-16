@@ -90,8 +90,19 @@ describe('isGenericPartyName()', () => {
     expect(isGenericPartyName('ESB20869152', null, 'ESB20869152')).toBe(true);
   });
 
+  it('reconhece traços, pontos ou sentinelas de VIES como "---"', () => {
+    expect(isGenericPartyName('---')).toBe(true);
+    expect(isGenericPartyName('--')).toBe(true);
+    expect(isGenericPartyName('-')).toBe(true);
+    expect(isGenericPartyName(' - ')).toBe(true);
+    expect(isGenericPartyName('...')).toBe(true);
+    expect(isGenericPartyName('N/A')).toBe(true);
+    expect(isGenericPartyName('desconhecido')).toBe(true);
+  });
+
   it('não mexe num nome real, mesmo que pareça estranho', () => {
     expect(isGenericPartyName('IKEA PORTUGAL MOVEIS E DECORAÇÃO LDA', '505416654')).toBe(false);
     expect(isGenericPartyName('SAMMIC EQUIP. DE HOTELARIA LDA')).toBe(false);
+    expect(isGenericPartyName('GARCIA DE POU S.A.')).toBe(false);
   });
 });

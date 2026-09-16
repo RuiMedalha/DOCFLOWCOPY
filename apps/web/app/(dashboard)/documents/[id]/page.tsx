@@ -290,13 +290,23 @@ export default function DocumentDetailPage() {
     return draft;
   }, [doc, draft]);
 
-  const downloadUrl = useDownloadUrl(id);
+  const effectiveFileName = useMemo(() => {
+    if (draft?.fileName) return draft.fileName;
+    if (doc?.fileName) return doc.fileName;
+    return null;
+  }, [draft?.fileName, doc?.fileName]);
+
+  const downloadUrl = useDownloadUrl(id, 'pdf', effectiveFileName);
 
   const onFieldChange = useCallback((patch: Partial<ExtractedFields>) => {
     setDraft((prev) => {
       const base = prev ?? {
+        fileName: doc?.fileName,
+        type: doc?.type,
         supplier: doc?.supplier,
         supplierNif: doc?.supplierNif,
+        customer: doc?.customer,
+        customerNif: doc?.customerNif,
         docNumber: doc?.docNumber,
         atcud: doc?.atcud,
         docDate: doc?.docDate,
@@ -329,6 +339,9 @@ export default function DocumentDetailPage() {
     const allowedKeys = [
       'type',
       'status',
+      'fiscalStatus',
+      'expenseCategoryId',
+      'expenseNature',
       'supplier',
       'supplierNif',
       'customer',
@@ -347,6 +360,7 @@ export default function DocumentDetailPage() {
       'paymentStatus',
       'paymentMethod',
       'paymentDueDate',
+      'fileName',
     ] as const;
     const patch: Record<string, unknown> = {};
     for (const k of allowedKeys) {
@@ -356,6 +370,7 @@ export default function DocumentDetailPage() {
       await saveFields.mutateAsync({ id, patch });
       setDraft(null);
       qc.invalidateQueries({ queryKey: ['document-detail', id] });
+      qc.invalidateQueries({ queryKey: ['documents'] });
       toastBus.success('Alterações guardadas.');
     } catch (err: any) {
       // class-validator surfaces a JSON-encoded list of offending keys; keep
@@ -878,11 +893,15 @@ export default function DocumentDetailPage() {
           <DocumentViewer
             src={downloadUrl}
             fileName={
-              (doc as any).pdfKey
-                ? (doc.fileName ? doc.fileName.replace(/\.[^.]+$/, '.pdf') : `${id}.pdf`)
-                : (doc.fileName ?? `${id}.pdf`)
+              (doc as any)?.pdfKey || /^image\//i.test(doc?.mimeType ?? '')
+                ? (doc?.fileName ? doc.fileName.replace(/\.[^.]+$/, '.pdf') : `${id}.pdf`)
+                : (doc?.fileName ?? `${id}.pdf`)
             }
-            mimeType={(doc as any).pdfKey ? 'application/pdf' : doc.mimeType}
+            mimeType={
+              (doc as any)?.pdfKey || /^image\//i.test(doc?.mimeType ?? '')
+                ? 'application/pdf'
+                : doc?.mimeType
+            }
             highlightFields={bundle.data.qrDecodedFields}
           />
 
@@ -1234,7 +1253,21 @@ export default function DocumentDetailPage() {
             typeManualOverride={doc.typeManualOverride}
             fiscalStatusManualOverride={doc.fiscalStatusManualOverride}
             saving={saveFields.isPending}
-            onSave={(patch) => saveFields.mutate({ id, patch: patch as never })}
+            onSave={(patch) =>
+              saveFields.mutate(
+                { id, patch: patch as never },
+                {
+                  onSuccess: () => {
+                    qc.invalidateQueries({ queryKey: ['document-detail', id] });
+                    qc.invalidateQueries({ queryKey: ['documents'] });
+                    toastBus.success('Classificação guardada.');
+                  },
+                  onError: (err: any) => {
+                    toastBus.error(err?.message ?? 'Falha ao guardar classificação.');
+                  },
+                },
+              )
+            }
           />
 
           <FieldPanel

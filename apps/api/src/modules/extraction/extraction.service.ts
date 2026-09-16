@@ -94,6 +94,7 @@ function sanitizeExtractedSupplierAddress(
 import { ImageToPdfService } from "../documents/image-to-pdf/image-to-pdf.service";
 import { ArchiveImageService } from "../documents/image-to-pdf/archive-image.service";
 import { OcrmypdfService } from "./ocrmypdf.service";
+import { ImageEnhancerService } from "./image-enhancer.service";
 // Sprint I — publish `document.extracted` so the processing pipeline's
 // EXTRACTING → ENRICHING handler runs. Previously the extraction service
 // returned its result but never told the pipeline to advance — documents
@@ -417,6 +418,9 @@ export class ExtractionService implements OnModuleDestroy {
     // Zerox — extração e particionamento de PDFs/fotos com visão IA e Markdown estruturado
     @Optional()
     private readonly zerox?: ZeroxService,
+    // Sharp — auto-rotação, recorte de borda de suporte (trim/crop), contraste e nitidez
+    @Optional()
+    private readonly imageEnhancer?: ImageEnhancerService,
   ) {}
 
   /**
@@ -660,70 +664,71 @@ export class ExtractionService implements OnModuleDestroy {
     ) {
       try {
         const obj = await this.storage.getBuffer(doc.fileKey);
-        const oriented = await autoOrientImage(obj.buffer, doc.mimeType, this.logger);
-        // If autoOrient rewrote the bytes (returned something different),
-        // persist them so the next extractor/download/viewer sees an
-        // upright image. Use atomic write so the existing file is never
-        // half-overwritten.
+        let oriented = obj.buffer;
+        let enhancedMime = doc.mimeType;
+
+        if (this.imageEnhancer && this.imageEnhancer.isAvailable()) {
+          oriented = await this.imageEnhancer.processDocumentImage(obj.buffer, doc.mimeType);
+          enhancedMime = 'image/jpeg';
+        } else {
+          oriented = await autoOrientImage(obj.buffer, doc.mimeType, this.logger);
+        }
+
+        // If enhanced/oriented rewrote the bytes, persist them
         if (oriented !== obj.buffer) {
           try {
             if (!this.storage.put) {
               throw new Error("storage.put not available");
             }
             await this.storage.put(doc.fileKey, oriented, {
-              contentType: doc.mimeType,
+              contentType: enhancedMime,
             });
             this.logger.log(
-              `[processDocumentAsync] auto-rotated ${doc.fileName} ` +
-                `(original ${obj.buffer.length}B → upright ${oriented.length}B) ` +
-                `and persisted upright bytes`,
+              `[processDocumentAsync] enhanced/auto-rotated ${doc.fileName} ` +
+                `(original ${obj.buffer.length}B → enhanced ${oriented.length}B) ` +
+                `and persisted enhanced bytes`,
             );
-            // Same fix applies to the PDF derivative when one exists
-            // — pdf-lib previously embedded the sideways pixels, so the
-            // viewer would have shown the rotated version even after we
-            // fixed the upstream file. We rebuild the PDF here against
-            // the upright bytes. Best-effort: a pdf-lib failure is
-            // logged and the upload continues with the sideways PDF
-            // (which is the prior behaviour, not worse than before).
-            try {
-              const docRecord = await this.prisma.document.findFirst({
-                where: { id: documentId },
-                select: { pdfKey: true },
-              });
-              if (docRecord?.pdfKey && (this.ocrmypdf || this.imageToPdf?.supports(doc.mimeType))) {
-                const newPdf = this.ocrmypdf
-                  ? await this.ocrmypdf.processImageOrPdf(
-                      oriented,
-                      doc.mimeType,
-                    )
-                  : await this.imageToPdf!.convert(
-                      oriented,
-                      doc.mimeType,
-                    );
-                if (!this.storage.put) {
-                  throw new Error("storage.put not available");
-                }
-                await this.storage.put(docRecord.pdfKey, newPdf, {
-                  contentType: "application/pdf",
-                });
-                this.logger.log(
-                  `[processDocumentAsync] rebuilt pdf derivative ` +
-                    `${docRecord.pdfKey} from upright bytes`,
-                );
-              }
-            } catch (pdfErr) {
-              this.logger.warn(
-                `[processDocumentAsync] pdf derivative rebuild failed ` +
-                  `for ${doc.fileName}: ${(pdfErr as Error).message}`,
-              );
-            }
           } catch (putErr) {
             this.logger.warn(
-              `[processDocumentAsync] failed to persist upright bytes for ` +
-                `${doc.fileName}: ${(putErr as Error).message}. Continuing ` +
-                `with original bytes for QR decode.`,
+              `[processDocumentAsync] storage.put enhanced image failed for ${doc.fileName}: ` +
+                `${(putErr as Error).message}`,
             );
           }
+        }
+
+        // Always ensure A4 PDF derivative exists for image uploads
+        try {
+          const docRecord = await this.prisma.document.findFirst({
+            where: { id: documentId },
+            select: { pdfKey: true },
+          });
+          const targetPdfKey = docRecord?.pdfKey || doc.fileKey.replace(/\.[^.]+$/, '.pdf');
+          if (this.ocrmypdf || (this.imageToPdf && this.imageToPdf.supports(enhancedMime))) {
+            const newPdf = this.ocrmypdf
+              ? await this.ocrmypdf.processImageOrPdf(oriented, enhancedMime)
+              : await this.imageToPdf!.convert(oriented, enhancedMime);
+            if (this.storage.put) {
+              await this.storage.put(targetPdfKey, newPdf, {
+                contentType: 'application/pdf',
+              });
+              if (!docRecord?.pdfKey) {
+                await this.prisma.document.update({
+                  where: { id: documentId },
+                  data: { pdfKey: targetPdfKey },
+                });
+                doc.pdfKey = targetPdfKey;
+              }
+              this.logger.log(
+                `[processDocumentAsync] built/rebuilt pdf derivative ` +
+                  `${targetPdfKey} from enhanced bytes`,
+              );
+            }
+          }
+        } catch (pdfErr) {
+          this.logger.warn(
+            `[processDocumentAsync] pdf derivative creation failed ` +
+              `for ${doc.fileName}: ${(pdfErr as Error).message}`,
+          );
         }
         // ── Fase 4.1 (P1.4) — PDF de arquivo: direito e ≤ 500 KB ───────
         // O arquivo fiscal é de 10 anos: um JPEG de 3 MB por documento
@@ -1089,7 +1094,9 @@ export class ExtractionService implements OnModuleDestroy {
         }
       }
       if (!fields.supplierPhone) {
-        const phoneMatch = loaded.text.match(/(?:Tel(?:efone|ef|\.)?|Contacto|Phone|Mobile|Tlm)[:\s]*([+0-9\s()./-]{9,20})\b/i);
+        const phoneMatch = loaded.text.match(
+          /(?:Tel[eé]fon[oe]|Tel(?:ef|f|\.)?|Contacto|Phone|Mobile|Tlm)[:\s]*([+0-9\s()./-]{9,20})\b/i,
+        );
         if (phoneMatch) {
           const cleanPhone = phoneMatch[1].replace(/\s+/g, ' ').trim();
           if (cleanPhone.replace(/\D/g, '').length >= 9) {
@@ -3233,6 +3240,81 @@ export class ExtractionService implements OnModuleDestroy {
         }
       }
 
+      // ── CONDITION 6: Tenant's own NIF was assigned to supplierNif
+      // If supplierNif matches our tenant NIF: we are the BUYER / CUSTOMER, not the supplier!
+      // In Portugal, on simplified invoices (FS/FR) or retail receipts, the customer gives their NIF (our tenant NIF).
+      // If the extractor assigned our tenant NIF to supplierNif:
+      // 1) Search hints or customerNif for an alternative valid NIF that is NOT tenantNif.
+      //    If found: supplierNif = altSupplierNif, customerNif = tenantNif.
+      // 2) If no alternative NIF was found, but doc is clearly an incoming invoice/expense/simplified invoice:
+      //    customerNif = tenantNif, supplierNif = undefined, supplier = supplierMatchesTenant ? undefined : fields.supplier.
+      //    If document hints/text or type suggest simplified invoice/receipt, ensure documentType is 'FATURA_SIMPLIFICADA'.
+      if (
+        (supplierNifNorm === tenantNif || authoritativeSupplierNif === tenantNif) &&
+        !customerMatchesTenant
+      ) {
+        const candidateNifs: string[] = [];
+        if (customerNif && customerNif !== tenantNif && isValidPortugueseNif(customerNif)) {
+          candidateNifs.push(customerNif);
+        }
+        if (fields.hints) {
+          for (const h of fields.hints) {
+            const m = h.match(/^(?:nif|customerNif|vat|qrAuthoritativeSupplierNif):([A-Z0-9]+)/i);
+            if (m && m[1]) {
+              const norm = normalizeTenantNif(m[1]);
+              if (norm && norm !== tenantNif && isValidPortugueseNif(norm) && !candidateNifs.includes(norm)) {
+                candidateNifs.push(norm);
+              }
+            }
+          }
+        }
+
+        const altSupplierNif = candidateNifs[0];
+        this.logger.warn(
+          `[ensureSupplierCustomerSanity] CONDITION 6: supplierNif is tenant's own NIF (${tenantNif}). ` +
+            `Tenant is the buyer/customer. Setting customerNif = ${tenantNif}, ` +
+            `supplierNif = ${altSupplierNif ?? "undefined"}.`,
+        );
+
+        const isSimplifiedOrExpense =
+          fields.documentType === "FATURA_SIMPLIFICADA" ||
+          fields.documentType === "RECIBO" ||
+          (fields.hints ?? []).some((h) =>
+            /simplificada|recibo|cup[aã]o|restaurante/i.test(h),
+          ) ||
+          (fields.docNumber &&
+            /^(?:FS|FR|Simplificada)/i.test(fields.docNumber));
+
+        const updated: ExtractedFields = {
+          ...fields,
+          supplierNif: altSupplierNif ?? undefined,
+          supplierVatId: altSupplierNif ?? undefined,
+          customerNif: tenantNif,
+          supplier: supplierMatchesTenant
+            ? altSupplierNif
+              ? undefined
+              : fields.customer
+            : fields.supplier,
+          customer: supplierMatchesTenant
+            ? fields.supplier
+            : fields.customer || id.tenantName || undefined,
+          documentType:
+            isSimplifiedOrExpense &&
+            (!fields.documentType ||
+              fields.documentType === "OUTRO" ||
+              fields.documentType === "ENCOMENDA")
+              ? "FATURA_SIMPLIFICADA"
+              : fields.documentType,
+        };
+        updated.hints = [
+          ...(updated.hints ?? []),
+          `partySwap:tenant_nif_in_supplier_fixed`,
+          `partySwap:customerNif=${tenantNif}`,
+          ...(altSupplierNif ? [`partySwap:supplierNif=${altSupplierNif}`] : []),
+        ];
+        return updated;
+      }
+
       return fields;
     } catch (err) {
       this.logger.warn(
@@ -4513,6 +4595,17 @@ export class ExtractionService implements OnModuleDestroy {
       ENCOMENDA: DocumentType.ENCOMENDA,
       ORDER: DocumentType.ENCOMENDA,
       BON_DE_COMMANDE: DocumentType.ENCOMENDA,
+      CONFIRMACAO_DE_ENCOMENDA: DocumentType.ENCOMENDA,
+      CONFIRMACAO_ENCOMENDA: DocumentType.ENCOMENDA,
+      CONFIRMACION_DE_PEDIDO: DocumentType.ENCOMENDA,
+      CONFIRMACION_PEDIDO: DocumentType.ENCOMENDA,
+      ORDER_CONFIRMATION: DocumentType.ENCOMENDA,
+      PURCHASE_ORDER: DocumentType.ENCOMENDA,
+      NOTA_DE_ENCOMENDA: DocumentType.ENCOMENDA,
+      NOTA_ENCOMENDA: DocumentType.ENCOMENDA,
+      ORDEM_DE_ENCOMENDA: DocumentType.ENCOMENDA,
+      PEDIDO_DE_COMPRA: DocumentType.ENCOMENDA,
+      PEDIDO: DocumentType.ENCOMENDA,
       GUIA_TRANSPORTE: DocumentType.GUIA_TRANSPORTE,
       GUIA_DE_TRANSPORTE: DocumentType.GUIA_TRANSPORTE,
       DELIVERY_NOTE: DocumentType.GUIA_TRANSPORTE,
@@ -4524,8 +4617,8 @@ export class ExtractionService implements OnModuleDestroy {
 
     // 3. Loose keyword scan — reuse the regex-classifier vocabulary
     //    so a verbose label ("Fatura-Recibo n.º FT 2026/1") still
-      //    resolves. Order matters: nota de crédito / débito before
-      //    generic fatura.
+    //    resolves. Order matters: nota de crédito / débito, recibo,
+    //    encomenda before generic fatura.
     const lower = cleaned.toLowerCase();
     if (
       /(nota.{0,3}credito|nota.{0,3}abono|credit.{0,3}note|gutschrift|avoir|(fa[ct]tura|factura).{0,3}rect)/.test(
@@ -4542,6 +4635,9 @@ export class ExtractionService implements OnModuleDestroy {
     ) {
       return DocumentType.RECIBO;
     }
+    if (/(confirma[çc][ãa]o.{0,10}encomenda|confirma[çc][ií]on.{0,10}pedido|order.{0,5}confirmation|nota.{0,5}encomenda|encomenda|purchase.{0,5}order|pedido.{0,5}compra|order|bon.de.commande)/.test(lower)) {
+      return DocumentType.ENCOMENDA;
+    }
     if (
       /(fatura|fatura.?recibo|fatura.?recebida|fatura.?emitida|factura|facture|invoice|rechnung|fattura)/.test(
         lower,
@@ -4551,9 +4647,6 @@ export class ExtractionService implements OnModuleDestroy {
     }
     if (/(comprovativo|proof.of.payment)/.test(lower)) {
       return DocumentType.COMPROVATIVO;
-    }
-    if (/(encomenda|order|bon.de.commande)/.test(lower)) {
-      return DocumentType.ENCOMENDA;
     }
     if (/(guia.{0,3}transporte|delivery.note|cmr|packing.slip)/.test(lower)) {
       return DocumentType.GUIA_TRANSPORTE;
@@ -4602,10 +4695,16 @@ export class ExtractionService implements OnModuleDestroy {
           /\b(recibo|receipt|quittung|quittance|ricevuta|reçu|recibo\s*de\s*vencimentos)\b/i,
         type: "RECIBO",
       },
-      // Invoices (most general — checked last so it doesn't swallow NC/ND/RC).
+      // Purchase orders & Order confirmations (match before generic invoice).
       {
         pattern:
-          /\b(fatura(?:\s*recebida|\s+recebida)?|factura|facture|invoice|rechnung|fattura|nota\s*de\s*encomenda)\b/i,
+          /\b(confirma[çc][ãa]o\s*(?:de\s*)?encomenda|confirma[çc][ií]on\s*(?:de\s*)?pedido|order\s*confirmation|nota\s*de\s*encomenda|ordem\s*de\s*encomenda|pedido\s*de\s*compra|purchase\s*order|bon\s*de\s*commande|bestellung|bestellbest[aä]tigung)\b/i,
+        type: "ENCOMENDA",
+      },
+      // Invoices (most general — checked last so it doesn't swallow NC/ND/RC/ENCOMENDA).
+      {
+        pattern:
+          /\b(fatura(?:\s*recebida|\s+recebida)?|factura|facture|invoice|rechnung|fattura)\b/i,
         type: "FATURA_RECEBIDA",
       },
     ];
@@ -4670,12 +4769,24 @@ export class ExtractionService implements OnModuleDestroy {
 
     // 2) NIF — preserve the Portuguese validation path first.
     let nif: string | undefined;
-    const labeledNif = normalized.match(
-      /(?:NIF|N\.?\s*I\.?\s*F\.?|Contribuinte|NIPC)[:\s]*(\d{9})/i,
-    );
-    if (labeledNif && isValidNif(labeledNif[1])) {
-      nif = normalizeNif(labeledNif[1]);
+    let customerNifFromRegex: string | undefined;
+    const nifRegex = /(?:NIF|N\.?\s*I\.?\s*F\.?|N\.?º?\s*Contr(?:ib(?:uinte)?)?\.?|Contr(?:ib(?:uinte)?)?\.?|NIPC)[:\s]*(?:PT)?(\d{9})\b/gi;
+    const matchedNifs: string[] = [];
+    let nifMatch: RegExpExecArray | null;
+    while ((nifMatch = nifRegex.exec(normalized)) !== null) {
+      const candidate = normalizeNif(nifMatch[1]);
+      if (isValidNif(candidate) && !matchedNifs.includes(candidate)) {
+        matchedNifs.push(candidate);
+      }
+    }
+
+    if (matchedNifs.length > 0) {
+      nif = matchedNifs[0];
       hints.push(`nif:${nif}`);
+      if (matchedNifs.length > 1) {
+        customerNifFromRegex = matchedNifs[1];
+        hints.push(`customerNif:${customerNifFromRegex}`);
+      }
     } else {
       const naked = normalized.match(/\b([1235689]\d{8})\b/);
       if (naked && isValidNif(naked[1])) {
@@ -4749,7 +4860,7 @@ export class ExtractionService implements OnModuleDestroy {
       if (docDate) hints.push(`docDate:${docDate}`);
     }
     const dueLabel = normalized.match(
-      /(?:Vencimento|Data\s*limite|Due\s*date|F[aä]llig(?:keit)?|[ÉE]ch[ée]ance)[:\s]*(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{4})/i,
+      /(?:Vencimento|Vencimiento|Fecha\s*de\s*vencimiento|F\.?\s*Vto|Vto\.?|Data\s*limite|Due\s*date|F[aä]llig(?:keit)?|[ÉE]ch[ée]ance)[:\s]*(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{4})/i,
     );
     if (dueLabel) {
       const dateText = dueLabel[1];
@@ -4762,6 +4873,29 @@ export class ExtractionService implements OnModuleDestroy {
         ? this.parseInvoiceDate(dueMatch, dateCountry, warnings)
         : undefined;
       if (dueDate) hints.push(`dueDate:${dueDate}`);
+    }
+
+    // If no absolute due date was found, calculate from payment terms (e.g. "Forma de Pago: 30 DÍAS")
+    if (!dueDate && docDate) {
+      const paymentTermMatch = normalized.match(
+        /(?:Forma\s*de\s*pago|Condi[çc][õo]es?\s*de\s*pagamento|Forma\s*de\s*pagamento|Prazo\s*de\s*pagamento|Condiciones\s*de\s*pago|Pagamento\s*a|Payment\s*terms|Net)[:\s]*(\d{1,3})\s*(?:d[ií]as?|days?)/i,
+      );
+      if (paymentTermMatch) {
+        const days = parseInt(paymentTermMatch[1], 10);
+        if (Number.isFinite(days) && days > 0 && days <= 365) {
+          const d = new Date(docDate);
+          d.setDate(d.getDate() + days);
+          dueDate = d.toISOString().slice(0, 10);
+          hints.push(`dueDate:${dueDate}`);
+        }
+      } else if (
+        /(?:Forma\s*de\s*pago|Forma\s*de\s*pagamento)[:\s]*(?:Pronto\s*pagamento|A\s*pronto|Contado|Al\s*contado|Immediate)\b/i.test(
+          normalized,
+        )
+      ) {
+        dueDate = docDate;
+        hints.push(`dueDate:${dueDate}`);
+      }
     }
 
     // 5) Totals + VAT — both 1.234,56 and 1,234.56 are common on invoices.
@@ -4880,7 +5014,7 @@ export class ExtractionService implements OnModuleDestroy {
     return {
       supplierNif: supplierVatId,
       supplierVatId,
-      customerNif: undefined,
+      customerNif: customerNifFromRegex,
       supplier,
       customer: undefined,
       docNumber,

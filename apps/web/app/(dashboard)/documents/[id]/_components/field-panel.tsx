@@ -35,8 +35,12 @@ import { useParty, useVerifyIban } from '../../../parties/_components/use-partie
 import Link from 'next/link';
 
 export interface ExtractedFields {
+  fileName?: string | null;
+  type?: string | null;
   supplier?: string | null;
   supplierNif?: string | null;
+  customer?: string | null;
+  customerNif?: string | null;
   docNumber?: string | null;
   atcud?: string | null;
   docDate?: string | null;
@@ -670,17 +674,93 @@ export function FieldPanel(props: FieldPanelProps) {
           ================================================================ */}
       <Group title="Identidade">
         <fieldset disabled={props.approved} className="space-y-6">
-          <Field label="Fornecedor" confidence={confidence.supplier} hasValue={Boolean(fields.supplier)}>
-            <EdInput
-              type="text"
-              value={fields.supplier ?? ''}
-              onChange={(e) => props.onFieldChange({ supplier: e.target.value })}
-              placeholder="Nome do emitente"
-            />
-          </Field>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
+            <Field label="Tipo de Documento">
+              <EdSelect
+                value={fields.type ?? 'FATURA_RECEBIDA'}
+                onChange={(e) => props.onFieldChange({ type: e.target.value })}
+              >
+                <option value="FATURA_RECEBIDA">Fatura de Fornecedor</option>
+                <option value="FATURA_SIMPLIFICADA">Fatura Simplificada (FS / Talão)</option>
+                <option value="RECIBO">Recibo / Fatura-Recibo</option>
+                <option value="NOTA_CREDITO">Nota de Crédito</option>
+                <option value="NOTA_DEBITO">Nota de Débito</option>
+                <option value="ENCOMENDA">Confirmação de Encomenda</option>
+                <option value="PROFORMA">Fatura Proforma</option>
+                <option value="ORCAMENTO">Orçamento</option>
+                <option value="GUIA_TRANSPORTE">Guia de Transporte</option>
+                <option value="AVISO_PAGAMENTO">Aviso de Pagamento</option>
+                <option value="EXTRATO_FORNECEDOR">Extrato de Conta</option>
+                <option value="OUTRO">Outro Documento</option>
+              </EdSelect>
+            </Field>
+
+            <Field label="Categoria da despesa">
+              <EdSelect
+                value={fields.expenseCategory ?? ''}
+                onChange={(e) =>
+                  props.onFieldChange({ expenseCategory: e.target.value || null })
+                }
+              >
+                <option value="">— Selecionar —</option>
+                {categories.map((c, idx) => (
+                  <option key={c.id ?? `cat-${idx}`} value={c.name}>
+                    {c.name}
+                    {c.defaultIvaDeductibilityPct != null
+                      ? ` — dedução ${c.defaultIvaDeductibilityPct}%`
+                      : ''}
+                  </option>
+                ))}
+              </EdSelect>
+            </Field>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
+            <Field label="Fornecedor / Emitente" confidence={confidence.supplier} hasValue={Boolean(fields.supplier)}>
+              <EdInput
+                type="text"
+                value={fields.supplier ?? ''}
+                onChange={(e) => props.onFieldChange({ supplier: e.target.value })}
+                placeholder="Nome do emitente"
+              />
+            </Field>
+
+            <Field label="NIF do Fornecedor" confidence={confidence.supplierNif} hasValue={Boolean(fields.supplierNif)}>
+              <EdInput
+                type="text"
+                mono
+                maxLength={20}
+                value={fields.supplierNif ?? ''}
+                onChange={(e) => props.onFieldChange({ supplierNif: e.target.value })}
+                placeholder="NIF / NIPC do fornecedor"
+              />
+            </Field>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
+            <Field label="Cliente / Destinatário" hasValue={Boolean(fields.customer)}>
+              <EdInput
+                type="text"
+                value={fields.customer ?? ''}
+                onChange={(e) => props.onFieldChange({ customer: e.target.value })}
+                placeholder="Nome do cliente (nossa empresa)"
+              />
+            </Field>
+
+            <Field label="NIF do Cliente" hasValue={Boolean(fields.customerNif)}>
+              <EdInput
+                type="text"
+                mono
+                maxLength={20}
+                value={fields.customerNif ?? ''}
+                onChange={(e) => props.onFieldChange({ customerNif: e.target.value })}
+                placeholder="NIF do cliente (515208566)"
+              />
+            </Field>
+          </div>
 
           {props.partyId ? (
-            <div className="mt-1 mb-4">
+            <div className="mt-1 mb-2">
               <Link
                 href={`/parties/${props.partyId}`}
                 className="text-xs underline inline-flex items-center gap-1"
@@ -690,17 +770,8 @@ export function FieldPanel(props: FieldPanelProps) {
               </Link>
             </div>
           ) : null}
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
-            <Field label="NIF" confidence={confidence.supplierNif} hasValue={Boolean(fields.supplierNif)}>
-              <EdInput
-                type="text"
-                mono
-                maxLength={20}
-                value={fields.supplierNif ?? ''}
-                onChange={(e) => props.onFieldChange({ supplierNif: e.target.value })}
-                placeholder="por preencher"
-              />
-            </Field>
             <Field label="Nº documento" confidence={confidence.docNumber} hasValue={Boolean(fields.docNumber)}>
               <EdInput
                 type="text"
@@ -719,23 +790,17 @@ export function FieldPanel(props: FieldPanelProps) {
                 placeholder="por preencher"
               />
             </Field>
-            <Field label="Categoria da despesa">
-              <EdSelect
-                value={fields.expenseCategory ?? ''}
-                onChange={(e) =>
-                  props.onFieldChange({ expenseCategory: e.target.value || null })
-                }
-              >
-                <option value="">— Selecionar —</option>
-                {categories.map((c, idx) => (
-                  <option key={c.id ?? `cat-${idx}`} value={c.name}>
-                    {c.name}
-                    {c.defaultIvaDeductibilityPct != null
-                      ? ` — dedução ${c.defaultIvaDeductibilityPct}%`
-                      : ''}
-                  </option>
-                ))}
-              </EdSelect>
+          </div>
+
+          <div className="grid grid-cols-1 gap-y-6">
+            <Field label="Nome do Ficheiro" hasValue={Boolean(fields.fileName)}>
+              <EdInput
+                type="text"
+                mono
+                value={fields.fileName ?? ''}
+                onChange={(e) => props.onFieldChange({ fileName: e.target.value })}
+                placeholder="ex: FORNECEDOR_2026-05-12_FT123.pdf"
+              />
             </Field>
           </div>
         </fieldset>

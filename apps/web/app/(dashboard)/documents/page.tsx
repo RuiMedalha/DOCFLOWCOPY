@@ -29,49 +29,80 @@ import {
   useDocumentsList,
   useReExtractAllDocuments,
 } from './_components/use-documents';
-import type { DocumentFiltersState, DocumentOrigin, FiscalStatus } from './_components/types';
+import type { DocumentFiltersState, DocumentOrigin, DocumentType, FiscalStatus } from './_components/types';
 
 const PAGE_SIZE = 20;
 
 const TAB_ORIGINS: Record<InboxTabKey, DocumentOrigin[] | undefined> = {
-  pdf: ['UPLOAD'],
-  scanner: ['SCANNER'],
+  todas: undefined,
+  encomendas: undefined,
   email: ['EMAIL', 'GMAIL', 'OUTLOOK', 'INBOUND_WEBHOOK'],
   onedrive: ['ONEDRIVE'],
+  scanner: ['SCANNER'],
+  pdf: ['UPLOAD'],
   whatsapp: ['WHATSAPP'],
   nao_aplicavel: undefined,
 };
 
 const TAB_FISCAL_STATUS: Record<InboxTabKey, FiscalStatus | ''> = {
-  pdf: '',
-  scanner: '',
+  todas: '',
+  encomendas: '',
   email: '',
   onedrive: '',
+  scanner: '',
+  pdf: '',
   whatsapp: '',
   nao_aplicavel: 'NAO_APLICAVEL',
+};
+
+const TAB_DOCUMENT_TYPE: Record<InboxTabKey, DocumentType | ''> = {
+  todas: '',
+  encomendas: 'ENCOMENDA',
+  email: '',
+  onedrive: '',
+  scanner: '',
+  pdf: '',
+  whatsapp: '',
+  nao_aplicavel: '',
+};
+
+const TAB_EXCLUDE_TYPE: Record<InboxTabKey, DocumentType | ''> = {
+  todas: 'ENCOMENDA',
+  encomendas: '',
+  email: 'ENCOMENDA',
+  onedrive: 'ENCOMENDA',
+  scanner: 'ENCOMENDA',
+  pdf: 'ENCOMENDA',
+  whatsapp: 'ENCOMENDA',
+  nao_aplicavel: '',
 };
 
 const INITIAL_FILTERS: DocumentFiltersState = {
   search: '',
   status: '',
   type: '',
+  excludeType: '',
   fiscalStatus: '',
   dateFrom: '',
   dateTo: '',
 };
 
 export default function DocumentsPage() {
-  const [tab, setTab] = useState<InboxTabKey>('pdf');
+  const [tab, setTab] = useState<InboxTabKey>('todas');
   const [filters, setFilters] = useState<DocumentFiltersState>(INITIAL_FILTERS);
   const [page, setPage] = useState(1);
   const [selection, setSelection] = useState<RowSelectionState>({});
 
   const tabOrigins = TAB_ORIGINS[tab];
   const tabFiscalStatus = TAB_FISCAL_STATUS[tab];
+  const tabType = TAB_DOCUMENT_TYPE[tab];
+  const tabExcludeType = TAB_EXCLUDE_TYPE[tab];
   const mergedFilters: DocumentFiltersState = {
     ...filters,
     origin: tabOrigins,
     fiscalStatus: tabFiscalStatus || filters.fiscalStatus || '',
+    type: tabType || filters.type || '',
+    excludeType: tabExcludeType || filters.excludeType || '',
   };
 
   const { data, isLoading, isError, refetch, isFetching } = useDocumentsList(
@@ -145,7 +176,7 @@ export default function DocumentsPage() {
           setSelection({});
         }} />
 
-        {tab === 'pdf' && <UploadZone />}
+        {(tab === 'todas' || tab === 'pdf') && <UploadZone />}
         {tab === 'scanner' && <ScannerConfig />}
         {tab === 'email' && <EmailConfig />}
 

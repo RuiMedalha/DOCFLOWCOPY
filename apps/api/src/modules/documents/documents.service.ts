@@ -14,6 +14,7 @@ import {
   DocumentStatus,
   DocumentType,
   FiscalStatus,
+  PaymentStatus,
   Prisma,
 
   CategoryNature,
@@ -520,7 +521,11 @@ export class DocumentsService {
     ];
 
     if (query.status) filters.push(Prisma.sql`d.status = ${query.status}::"DocumentStatus"`);
-    if (query.type) filters.push(Prisma.sql`d.type = ${query.type}::"DocumentType"`);
+    if (query.type) {
+      filters.push(Prisma.sql`d.type = ${query.type}::"DocumentType"`);
+    } else if (query.excludeType) {
+      filters.push(Prisma.sql`d.type <> ${query.excludeType}::"DocumentType"`);
+    }
     if (query.partyId) {
       filters.push(Prisma.sql`(d."partyId" = ${query.partyId} OR d."crmContactId" = ${query.partyId})`);
     }
@@ -794,6 +799,11 @@ export class DocumentsService {
         expenseCategoryId: true,
         expenseNature: true,
         fiscalStatus: true,
+        fileName: true,
+        mimeType: true,
+        pdfKey: true,
+        docNumber: true,
+        isNonFiscalDoc: true,
       },
     });
     if (!existing) throw new NotFoundException('Document not found');
@@ -830,7 +840,7 @@ export class DocumentsService {
       manualCategory = (resolvedCategoryRow?.name ?? null) as ExpenseCategory | null;
     }
     if (dto.expenseCategory !== undefined) {
-      if (dto.expenseCategory === '') {
+      if (dto.expenseCategory === '' || dto.expenseCategory === null) {
         manualCategory = null; // explicit clear
       } else if (!isExpenseCategory(dto.expenseCategory)) {
         throw new BadRequestException(
@@ -947,7 +957,39 @@ export class DocumentsService {
     }
 
     const data: Record<string, unknown> = { ...dto };
-    if (dto.docDate !== undefined) data.docDate = new Date(dto.docDate);
+
+    const safeParseDate = (val: unknown): Date | null | undefined => {
+      if (val === undefined) return undefined;
+      if (val === null || val === '') return null;
+      const d = new Date(val as any);
+      return isNaN(d.getTime()) ? null : d;
+    };
+    if (dto.docDate !== undefined) data.docDate = safeParseDate(dto.docDate);
+    if (dto.dueDate !== undefined) data.dueDate = safeParseDate(dto.dueDate);
+    if (dto.paymentDueDate !== undefined) data.paymentDueDate = safeParseDate(dto.paymentDueDate);
+
+    const safeParseDecimal = (val: unknown): number | null | undefined => {
+      if (val === undefined) return undefined;
+      if (val === null || val === '') return null;
+      const num = Number(val);
+      return isNaN(num) ? null : num;
+    };
+    if (dto.total !== undefined) data.total = safeParseDecimal(dto.total);
+    if (dto.taxAmount !== undefined) data.taxAmount = safeParseDecimal(dto.taxAmount);
+    if (dto.netAmount !== undefined) data.netAmount = safeParseDecimal(dto.netAmount);
+
+    if (dto.paymentMethod !== undefined) {
+      const existingMeta = (existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata))
+        ? { ...(existing.metadata as Record<string, unknown>) }
+        : {};
+      existingMeta.paymentMethod = dto.paymentMethod || null;
+      const metaObj = (metadata !== undefined && typeof metadata === 'object' && !Array.isArray(metadata))
+        ? { ...(metadata as Record<string, unknown>), paymentMethod: dto.paymentMethod || null }
+        : existingMeta;
+      metadata = metaObj as Prisma.InputJsonValue;
+      delete data.paymentMethod;
+    }
+
     // ── Fase 4.1 — natureza + dedutibilidade do IVA ───────────────────
     // A dedutibilidade passa a depender da natureza e da categoria
     // (mercadoria para revenda é 100 % dedutível; refeições, viaturas e
@@ -985,15 +1027,27 @@ export class DocumentsService {
     } else {
       delete data.resetClassificationOverride;
     }
-    if (dto.type !== undefined && !dto.resetClassificationOverride) data.typeManualOverride = true;
+
+    const isFiscalType = (t?: string) =>
+      t && ['FATURA_RECEBIDA', 'FATURA_SIMPLIFICADA', 'FATURA_RECIBO', 'NOTA_CREDITO', 'NOTA_DEBITO'].includes(t);
+
+    if (dto.type !== undefined && !dto.resetClassificationOverride) {
+      data.typeManualOverride = true;
+      if (isFiscalType(dto.type) && (existing.fiscalStatus === 'NAO_APLICAVEL' || existing.isNonFiscalDoc)) {
+        if (dto.fiscalStatus === undefined) {
+          data.fiscalStatus = 'FISCAL';
+          data.isNonFiscalDoc = false;
+          data.fiscalReason = `manual:${userId}`;
+          data.fiscalStatusManualOverride = true;
+        }
+      }
+    }
     if (dto.fiscalStatus !== undefined) {
       data.fiscalStatus = dto.fiscalStatus;
       if (!dto.resetClassificationOverride) data.fiscalStatusManualOverride = true;
       data.fiscalReason = `manual:${userId}`;
-      data.isNonFiscalDoc = dto.fiscalStatus === 'NAO_FISCAL';
+      data.isNonFiscalDoc = dto.fiscalStatus === 'NAO_FISCAL' || dto.fiscalStatus === 'NAO_APLICAVEL';
     }
-    if (dto.dueDate !== undefined) data.dueDate = new Date(dto.dueDate);
-    if (dto.paymentDueDate !== undefined) data.paymentDueDate = dto.paymentDueDate ? new Date(dto.paymentDueDate) : null;
     if (suggestedFolder !== undefined) data.suggestedFolder = suggestedFolder;
     if (finalFolder !== undefined) data.finalFolder = finalFolder;
     if (metadata !== undefined) data.metadata = metadata;
@@ -1007,10 +1061,50 @@ export class DocumentsService {
     // INSIDE metadata.filing — strip it from the update payload so we
     // don't create a stray column write.
     delete data.expenseCategory;
+    delete data.resetClassificationOverride;
+    delete data.paymentMethod;
+
+    if (data.partyId === '') data.partyId = null;
+    if (data.expenseCategoryId === '') data.expenseCategoryId = null;
+    if (data.folderId === '') data.folderId = null;
+    if (data.supplierNif === '') data.supplierNif = null;
+    if (data.customerNif === '') data.customerNif = null;
+    if (data.docNumber === '') data.docNumber = null;
+
+    if (dto.fileName) {
+      data.fileName = this.sanitizeFilename(dto.fileName);
+    } else if (
+      dto.supplier !== undefined ||
+      dto.docNumber !== undefined ||
+      dto.docDate !== undefined
+    ) {
+      const supplier = dto.supplier !== undefined ? dto.supplier : existing.supplier;
+      const docNumber = dto.docNumber !== undefined ? dto.docNumber : existing.docNumber;
+      const docDate = (data.docDate as Date) ?? existing.docDate ?? new Date();
+      if (supplier || docNumber) {
+        const hasPdf = !!(existing as any).pdfKey || (existing.mimeType && existing.mimeType.startsWith('image/'));
+        const newSlug = this.buildDocumentFileName({
+          docId: id,
+          supplier,
+          docNumber,
+          docDate,
+          fallbackDate: docDate,
+          mimeType: hasPdf ? 'application/pdf' : existing.mimeType,
+          currentFileName: existing.fileName,
+        });
+        if (newSlug) {
+          data.fileName = newSlug;
+        }
+      }
+    }
 
     const updated = await this.prisma.document.update({
       where: { id },
       data,
+    });
+
+    await this.syncPayableForDocument(tenantId, id).catch((err) => {
+      this.logger.warn(`Failed syncing payable for doc ${id}: ${err.message}`);
     });
 
     await this.audit.log({
@@ -1159,6 +1253,9 @@ export class DocumentsService {
         pdfKey: true,
         mimeType: true,
         fileName: true,
+        supplier: true,
+        docNumber: true,
+        docDate: true,
       },
     });
     if (!doc) throw new NotFoundException('Document not found');
@@ -1169,11 +1266,63 @@ export class DocumentsService {
     let key = doc.fileKey;
     let servedMime = doc.mimeType;
     let servedName = doc.fileName;
-    if (preferredFormat === 'pdf' && doc.pdfKey) {
-      key = doc.pdfKey;
-      servedMime = 'application/pdf';
-      const base = doc.fileName.replace(/\.[^.]+$/, '');
-      servedName = `${base}.pdf`;
+    if (preferredFormat === 'pdf') {
+      if (doc.pdfKey) {
+        key = doc.pdfKey;
+        servedMime = 'application/pdf';
+        const base = doc.fileName.replace(/\.[^.]+$/, '');
+        servedName = `${base}.pdf`;
+      } else if (/^image\//i.test(doc.mimeType) && this.imageToPdf.supports(doc.mimeType)) {
+        try {
+          const orig = await this.storage.getBuffer(doc.fileKey);
+          let oriented = orig.buffer;
+          let enhancedMime = doc.mimeType;
+          if (this.imageEnhancer && this.imageEnhancer.isAvailable()) {
+            oriented = await this.imageEnhancer.processDocumentImage(orig.buffer, doc.mimeType);
+            enhancedMime = 'image/jpeg';
+          }
+          const pdfBuffer = await this.imageToPdf.convert(oriented, enhancedMime);
+          const pdfKey = this.buildPdfKeyFromImageKey(doc.fileKey);
+          await this.storage.put(pdfKey, pdfBuffer, { contentType: 'application/pdf' });
+          await this.prisma.document.update({
+            where: { id },
+            data: { pdfKey },
+          });
+          key = pdfKey;
+          servedMime = 'application/pdf';
+          const base = doc.fileName.replace(/\.[^.]+$/, '');
+          servedName = `${base}.pdf`;
+          this.logger.log(`[getFileBuffer] generated missing PDF derivative on-the-fly for doc=${id}`);
+        } catch (err) {
+          this.logger.warn(`[getFileBuffer] on-the-fly PDF generation failed for doc=${id}: ${(err as Error).message}`);
+        }
+      }
+    }
+
+    const isRawName =
+      !servedName ||
+      /^178\d{10}/.test(servedName) ||
+      /^[0-9a-f]{8}-/.test(servedName) ||
+      /^doc_/.test(servedName);
+    if (isRawName && (doc.supplier || doc.docNumber)) {
+      const generated = this.buildDocumentFileName({
+        docId: doc.id,
+        supplier: doc.supplier,
+        docNumber: doc.docNumber,
+        docDate: doc.docDate,
+        fallbackDate: doc.docDate ?? new Date(),
+        mimeType: servedMime,
+        currentFileName: servedName,
+      });
+      if (generated) {
+        servedName = generated;
+        this.prisma.document
+          .update({
+            where: { id },
+            data: { fileName: generated },
+          })
+          .catch(() => undefined);
+      }
     }
 
     const obj = await this.storage.getBuffer(key);
@@ -1184,6 +1333,17 @@ export class DocumentsService {
     };
   }
 
+  /**
+   * Sanitizes a filename so that it contains only alphanumeric chars, dots, dashes, and underscores.
+   */
+  sanitizeFilename(name: string): string {
+    if (typeof name !== 'string' || name.length === 0) return 'file';
+    if (name.includes('\0') || name.includes('..')) {
+      return 'file';
+    }
+    return name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 200);
+  }
+
   /** Signed URL helper (currently returns the local route — S3 driver returns presigned). */
   async getFileUrl(tenantId: string, id: string) {
     const doc = await this.prisma.document.findFirst({
@@ -1191,12 +1351,9 @@ export class DocumentsService {
       select: { id: true, fileName: true, mimeType: true, fileKey: true, pdfKey: true },
     });
     if (!doc) throw new NotFoundException('Document not found');
-    // Sprint H security-audit M-14 — local driver returns an empty
-    // string (with a WARN log inside the driver) because no signed URL
-    // exists. We fall back to the controller's download route. S3/
-    // MinIO drivers will return a real presigned URL here.
+    const cleanName = encodeURIComponent(this.sanitizeFilename(doc.fileName));
     const signedUrl = await this.storage.getSignedUrl(doc.fileKey, 300);
-    const url = signedUrl || `/api/v1/documents/${doc.id}/download`;
+    const url = signedUrl || `/api/v1/documents/${doc.id}/download/${cleanName}`;
     return { url, fileName: doc.fileName, mimeType: doc.mimeType };
   }
 
@@ -1237,6 +1394,8 @@ export class DocumentsService {
         deletedAt,
       },
     });
+
+    await this.syncPayableForDocument(tenantId, id).catch(() => {});
 
     await this.audit.log({
       tenantId,
@@ -1279,6 +1438,8 @@ export class DocumentsService {
       where: { id, tenantId },
       data: { deletedAt: null },
     });
+
+    await this.syncPayableForDocument(tenantId, id).catch(() => {});
 
     await this.audit.log({
       tenantId,
@@ -1482,7 +1643,7 @@ export class DocumentsService {
     if (!existing) throw new NotFoundException('Document not found');
 
     if (existing.status === DocumentStatus.APROVADO) {
-      await this.createPaymentEventIfMissing(tenantId, existing);
+      await this.syncPayableForDocument(tenantId, id).catch(() => {});
       const approved = await this.prisma.document.findFirst({ where: { id, tenantId } });
       return this.sanitize(approved);
     }
@@ -1520,7 +1681,7 @@ export class DocumentsService {
       } as Prisma.InputJsonValue,
     });
 
-    await this.createPaymentEventIfMissing(tenantId, existing);
+    await this.syncPayableForDocument(tenantId, id).catch(() => {});
 
     // Sprint E: now that the row is APPROVADO, move the bytes from the
     // `_inbox/` staging path into the deterministic party/category folder.
@@ -2883,6 +3044,100 @@ export class DocumentsService {
     }
   }
 
+  async syncPayableForDocument(tenantId: string, documentId: string): Promise<void> {
+    const doc = await this.prisma.document.findFirst({
+      where: { id: documentId, tenantId },
+      select: {
+        id: true,
+        tenantId: true,
+        partyId: true,
+        supplier: true,
+        docNumber: true,
+        fileName: true,
+        total: true,
+        netAmount: true,
+        dueDate: true,
+        paymentDueDate: true,
+        paymentStatus: true,
+        status: true,
+        type: true,
+        metadata: true,
+        deletedAt: true,
+      },
+    });
+    if (!doc) return;
+
+    if (doc.deletedAt || doc.status === DocumentStatus.REJEITADO || doc.status === DocumentStatus.ARQUIVADO) {
+      await this.prisma.payableItem.updateMany({
+        where: { tenantId, documentId: doc.id, status: { not: PaymentStatus.PAID } },
+        data: { status: PaymentStatus.CANCELLED },
+      });
+      return;
+    }
+
+    const effectiveDueDate = doc.dueDate ?? doc.paymentDueDate;
+    const effectiveAmount = doc.total ?? doc.netAmount;
+    if (!effectiveDueDate && (!effectiveAmount || Number(effectiveAmount) <= 0)) {
+      return;
+    }
+
+    const amountNum = effectiveAmount ? Number(effectiveAmount) : 0;
+    let payableStatus: PaymentStatus = PaymentStatus.TO_PAY;
+    if (doc.paymentStatus === PaymentStatus.PAID) {
+      payableStatus = PaymentStatus.PAID;
+    } else if (doc.paymentStatus === PaymentStatus.SCHEDULED) {
+      payableStatus = PaymentStatus.SCHEDULED;
+    } else if (doc.paymentStatus === PaymentStatus.CANCELLED) {
+      payableStatus = PaymentStatus.CANCELLED;
+    } else if (effectiveDueDate && new Date(effectiveDueDate) < new Date() && payableStatus === PaymentStatus.TO_PAY) {
+      payableStatus = PaymentStatus.OVERDUE;
+    }
+
+    const description = `${doc.supplier ?? 'Fornecedor'} — ${doc.docNumber ?? doc.fileName}`;
+    const metaPaymentMethod = (doc.metadata && typeof doc.metadata === 'object' && (doc.metadata as any).paymentMethod) || null;
+
+    const existing = await this.prisma.payableItem.findFirst({
+      where: { tenantId, documentId: doc.id },
+    });
+
+    if (existing) {
+      await this.prisma.payableItem.update({
+        where: { id: existing.id },
+        data: {
+          partyId: doc.partyId ?? existing.partyId,
+          description: description || existing.description,
+          amount: new Prisma.Decimal(amountNum > 0 ? amountNum : Number(existing.amount)),
+          dueDate: effectiveDueDate ?? existing.dueDate,
+          status: existing.status === PaymentStatus.PAID ? PaymentStatus.PAID : payableStatus,
+          paymentMethod: metaPaymentMethod ?? existing.paymentMethod,
+          approvedAt: doc.status === DocumentStatus.APROVADO ? (existing.approvedAt ?? new Date()) : existing.approvedAt,
+        },
+      });
+    } else {
+      await this.prisma.payableItem.create({
+        data: {
+          tenantId,
+          documentId: doc.id,
+          partyId: doc.partyId ?? null,
+          description,
+          amount: new Prisma.Decimal(amountNum > 0 ? amountNum : 0),
+          dueDate: effectiveDueDate ?? new Date(),
+          status: payableStatus,
+          paymentMethod: metaPaymentMethod ?? null,
+          approvedAt: doc.status === DocumentStatus.APROVADO ? new Date() : null,
+        },
+      });
+    }
+
+    await this.createPaymentEventIfMissing(tenantId, {
+      id: doc.id,
+      dueDate: doc.dueDate,
+      paymentDueDate: doc.paymentDueDate,
+      total: doc.total,
+      netAmount: doc.netAmount,
+    });
+  }
+
   private async createPaymentEventIfMissing(
     tenantId: string,
     document: {
@@ -3335,7 +3590,11 @@ export class DocumentsService {
       status: { not: DocumentStatus.ARQUIVADO },
     };
     if (query.status) where.status = query.status;
-    if (query.type) where.type = query.type;
+    if (query.type) {
+      where.type = query.type;
+    } else if (query.excludeType) {
+      where.type = { not: query.excludeType };
+    }
     if (query.fiscalStatus) {
       where.fiscalStatus = query.fiscalStatus;
     } else {
@@ -3391,11 +3650,13 @@ export class DocumentsService {
   private sanitize(doc: any) {
     if (!doc) return doc;
     const { fileKey: _fileKey, fileHash: _fileHash, ...rest } = doc;
+    const meta = doc.metadata && typeof doc.metadata === 'object' && !Array.isArray(doc.metadata) ? doc.metadata : {};
     return {
       ...rest,
       total: rest.total != null ? Number(rest.total) : null,
       taxAmount: rest.taxAmount != null ? Number(rest.taxAmount) : null,
       netAmount: rest.netAmount != null ? Number(rest.netAmount) : null,
+      paymentMethod: rest.paymentMethod ?? (meta as any).paymentMethod ?? null,
       // Fase 4.2 (P2) — o frontend espera `debitAccount`/`creditAccount`
       // como o código SNC (string), não o objeto Account inteiro — é o
       // mesmo formato que envia em `PATCH .../accounting`.
@@ -3473,9 +3734,10 @@ export class DocumentsService {
     mimeType?: string | null;
     currentFileName?: string | null;
   }): string {
-    const ext = this.deriveExtensionFromMime(args.mimeType)
+    let ext = this.deriveExtensionFromMime(args.mimeType)
       || this.extractExtension(args.currentFileName ?? '')
       || '.bin';
+    if (!ext.startsWith('.')) ext = `.${ext}`;
 
     const supplierSlug = this.slugifySegment(args.supplier);
     const docNumberSlug = this.slugifySegment(args.docNumber);
@@ -3530,6 +3792,7 @@ export class DocumentsService {
         supplier: true,
         docNumber: true,
         docDate: true,
+        pdfKey: true,
       },
     });
     if (!doc) {
@@ -3547,20 +3810,17 @@ export class DocumentsService {
     const docDate = fields.docDate ?? doc.docDate ?? null;
 
     if (!supplier || !docNumber) {
-      // No usable fields yet — keep the original upload-time name.
-      // Don't fall back to `doc_<id>` here; the user might still
-      // re-extract later. Leaving the original preserves audit until
-      // the rename can produce a real slug.
       return null;
     }
 
+    const hasPdfDerivative = !!(doc as any).pdfKey || (doc.mimeType && doc.mimeType.startsWith('image/'));
     const slug = this.buildDocumentFileName({
       docId: doc.id,
       supplier,
       docNumber,
       docDate,
       fallbackDate: doc.docDate ?? new Date(),
-      mimeType: doc.mimeType,
+      mimeType: hasPdfDerivative ? 'application/pdf' : doc.mimeType,
       currentFileName: doc.fileName,
     });
 

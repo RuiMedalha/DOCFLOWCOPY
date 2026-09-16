@@ -673,4 +673,36 @@ describe("SupplierResolver", () => {
     expect((party as any).city).toBe("Madrid");
     expect((party as any).postalCode).toBe("28013");
   });
+
+  it("preserves invoice supplierName when Spanish VIES returns no name ('---')", async () => {
+    const prisma = buildPrismaStub();
+    const mockVies = {
+      fetch: jest.fn().mockResolvedValue({
+        ok: true,
+        source: "vies",
+        fields: {
+          name: null, // VIES Spain suppresses trader name
+          address: "Carrer del Castanyet, 132, 08430 Santa Coloma de Farners",
+          city: "Santa Coloma de Farners",
+          postalCode: "08430",
+        },
+      }),
+    };
+
+    const resolver = new SupplierResolver(prisma as any, undefined, mockVies as any);
+
+    const result = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "ES",
+      supplierName: "GARCIA DE POU S.A.",
+      supplierVatId: "ESA08242851",
+      aiConfidence: 0.95,
+    });
+
+    expect(result.party).toBeDefined();
+    const party = Array.from(prisma.dbParties.values())[0];
+    expect(party.name).toBe("GARCIA DE POU S.A.");
+    expect(party.address).toBe("Carrer del Castanyet, 132");
+    expect((party as any).city).toBe("Santa Coloma de Farners");
+  });
 });

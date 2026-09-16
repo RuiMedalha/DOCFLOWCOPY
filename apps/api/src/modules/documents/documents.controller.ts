@@ -481,7 +481,7 @@ export class DocumentsController {
 
   // ─────────────────────────────────────────── download ─────────────────
 
-  @Get(':id/download')
+  @Get([':id/download', ':id/download/:fileName', ':id/file/:fileName'])
   @ApiOperation({
     summary: 'Download the document file',
     description:
@@ -492,6 +492,7 @@ export class DocumentsController {
   async download(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id') id: string,
+    @Param('fileName') routeFileName: string | undefined,
     @Query('format') format: string | undefined,
     @Res({ passthrough: false }) res: Response,
   ): Promise<void> {
@@ -509,9 +510,12 @@ export class DocumentsController {
     if (res.headersSent || res.writableEnded) {
       return;
     }
+    const finalName = routeFileName || fileName;
+    const cleanName = this.sanitizeFilename(finalName);
+    const encodedName = encodeURIComponent(finalName);
     res.set({
       'Content-Type': mimeType,
-      'Content-Disposition': `inline; filename="${this.sanitizeFilename(fileName)}"`,
+      'Content-Disposition': `inline; filename="${cleanName}"; filename*=UTF-8''${encodedName}`,
       'Content-Length': buffer.length.toString(),
     });
     res.end(buffer);

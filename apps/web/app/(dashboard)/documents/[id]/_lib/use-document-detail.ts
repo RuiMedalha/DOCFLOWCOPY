@@ -232,8 +232,17 @@ export function useDocumentBundle(id: string): UseQueryResult<DocumentDetailBund
   });
 }
 
-export function useDownloadUrl(id: string): string {
-  return `${API_BASE}/documents/${id}/download`;
+export function useDownloadUrl(
+  id: string,
+  preferredFormat: 'pdf' | 'original' = 'pdf',
+  fileName?: string | null,
+): string {
+  let effective = fileName?.trim();
+  if (effective && preferredFormat === 'pdf' && !effective.toLowerCase().endsWith('.pdf')) {
+    effective = `${effective.replace(/\.[^.]+$/, '')}.pdf`;
+  }
+  const fileSegment = effective ? `/${encodeURIComponent(effective)}` : '';
+  return `${API_BASE}/documents/${id}/download${fileSegment}?format=${preferredFormat}`;
 }
 
 // ================================================================== mutations
@@ -362,6 +371,8 @@ export function useSaveFields() {
         if (!prev) return prev;
         return { ...prev, document: { ...prev.document, ...doc } };
       });
+      qc.invalidateQueries({ queryKey: ['documents'] });
+      qc.invalidateQueries({ queryKey: ['folder-tree'] });
     },
   });
 }

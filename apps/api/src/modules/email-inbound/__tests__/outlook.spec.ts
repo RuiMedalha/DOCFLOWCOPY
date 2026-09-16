@@ -172,4 +172,92 @@ describe('OutlookService — Client Credentials & Single Channel Policy', () => 
       expect(calls.some((c) => c.includes('POST') && c.includes('/messages/msg-1/move'))).toBe(true);
     });
   });
+
+  describe('Filtering Junk Attachments and Non-Invoice Emails', () => {
+    it('should ignore email signature images, logos, and tiny icons', () => {
+      expect(service.shouldIgnoreAttachment('image001.png', 'image/png', 15000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('image002.jpg', 'image/jpeg', 22000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('logo_company.png', 'image/png', 50000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('signature.png', 'image/png', 45000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('facebook.png', 'image/png', 12000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('linkedin_icon.png', 'image/png', 8000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('banner_rodape.jpg', 'image/jpeg', 80000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('tiny.jpg', 'image/jpeg', 10000).ignore).toBe(true);
+    });
+
+    it('should ignore non-invoice marketing and legal documents', () => {
+      expect(service.shouldIgnoreAttachment('catalogo_2026.pdf', 'application/pdf', 500000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('brochura_produtos.pdf', 'application/pdf', 400000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('termos_e_condicoes.pdf', 'application/pdf', 120000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('politica_privacidade.pdf', 'application/pdf', 90000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('manual_utilizador.pdf', 'application/pdf', 850000).ignore).toBe(true);
+      expect(service.shouldIgnoreAttachment('newsletter_setembro.pdf', 'application/pdf', 300000).ignore).toBe(true);
+    });
+
+    it('should accept valid invoice and receipt documents', () => {
+      expect(service.shouldIgnoreAttachment('FT_2026_123.pdf', 'application/pdf', 120000).ignore).toBe(false);
+      expect(service.shouldIgnoreAttachment('fatura_fornecedor.pdf', 'application/pdf', 250000).ignore).toBe(false);
+      expect(service.shouldIgnoreAttachment('scan_documento.pdf', 'application/pdf', 150000).ignore).toBe(false);
+      expect(service.shouldIgnoreAttachment('foto_recibo.jpg', 'image/jpeg', 350000).ignore).toBe(false);
+    });
+
+    it('should identify spam and marketing email subjects', () => {
+      expect(service.shouldIgnoreEmailSubject('Newsletter Semanal Setembro')).toBe(true);
+      expect(service.shouldIgnoreEmailSubject('Boas Festas e Feliz Ano Novo')).toBe(true);
+      expect(service.shouldIgnoreEmailSubject('Aviso de Férias da Empresa')).toBe(true);
+      expect(service.shouldIgnoreEmailSubject('Pesquisa de Satisfação de Clientes')).toBe(true);
+    });
+
+    it('should never ignore emails with invoice signals', () => {
+      expect(service.shouldIgnoreEmailSubject('Envio de Fatura FT 2026/001')).toBe(false);
+      expect(service.shouldIgnoreEmailSubject('Factura e Recibo de Pagamento')).toBe(false);
+      expect(service.shouldIgnoreEmailSubject('Invoice INV-2026-999')).toBe(false);
+      expect(service.shouldIgnoreEmailSubject('Nota de Crédito NC 12')).toBe(false);
+      expect(service.shouldIgnoreEmailSubject('Aviso de Vencimento de Fatura')).toBe(false);
+    });
+  });
+
+  describe('Sender Whitelist and Blacklist Filtering', () => {
+    const originalEnv = process.env;
+
+    beforeEach(() => {
+      process.env = { ...originalEnv };
+    });
+
+    afterAll(() => {
+      process.env = originalEnv;
+    });
+
+    it('blocks senders listed in MS_MAIL_BLOCKED_SENDERS', () => {
+      process.env.MS_MAIL_BLOCKED_SENDERS = 'marketing@spam.com, spammer@bad.org, @newsletter.pt';
+
+      expect(service.isSenderBlocked('marketing@spam.com')).toBe(true);
+      expect(service.isSenderBlocked('info@newsletter.pt')).toBe(true);
+      expect(service.isSenderBlocked('spammer@bad.org')).toBe(true);
+      expect(service.isSenderBlocked('fornecedor@bom.pt')).toBe(false);
+      expect(service.isSenderBlocked(null)).toBe(false);
+    });
+
+    it('enforces whitelist when MS_MAIL_ALLOWED_SENDERS is configured', () => {
+      process.env.MS_MAIL_ALLOWED_SENDERS = 'faturas@vodafone.pt, contabilidade@nos.pt';
+
+      expect(service.isSenderAllowed('faturas@vodafone.pt')).toBe(true);
+      expect(service.isSenderAllowed('contabilidade@nos.pt')).toBe(true);
+      expect(service.isSenderAllowed('outro@fornecedor.pt')).toBe(false);
+    });
+
+    it('allows all senders when MS_MAIL_ALLOWED_SENDERS is empty', () => {
+      delete process.env.MS_MAIL_ALLOWED_SENDERS;
+      expect(service.isSenderAllowed('qualquer@fornecedor.pt')).toBe(true);
+    });
+
+    it('respects MS_MAIL_MOVE_ENABLED=false to only mark as read and not move', () => {
+      process.env.MS_MAIL_MOVE_ENABLED = 'false';
+      expect(service.mailMoveEnabled).toBe(false);
+
+      delete process.env.MS_MAIL_MOVE_ENABLED;
+      expect(service.mailMoveEnabled).toBe(true);
+    });
+  });
 });
+

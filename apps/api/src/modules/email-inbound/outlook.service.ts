@@ -16,6 +16,42 @@ const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 const ACCEPTED_EXTS = new Set(['pdf', 'png', 'jpg', 'jpeg', 'docx', 'heic', 'heif']);
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
+/**
+ * Padrões de nomes de ficheiros que correspondem a assinaturas de email,
+ * botões de redes sociais, avatares, logotipos e imagens decorativas.
+ */
+export const JUNK_ATTACHMENT_PATTERNS: RegExp[] = [
+  /^(?:image\d{3,}|img_\d{3,}|outlook-[a-z0-9_-]+)\.[a-z0-9]+$/i,
+  /^(?:inline_image\d*|att_\d+|attachment\d*)\.[a-z0-9]+$/i,
+  // Redes sociais e botões de contacto
+  /^(?:facebook|instagram|linkedin|twitter|youtube|whatsapp|telegram|tiktok|vimeo|skype|social)(?:[-_.\s]|$)/i,
+  // Logotipos, rodapés, cabeçalhos, banners, carimbos de assinatura
+  /^(?:logo|logos|logotipo|signature|assinatura|header|footer|banner|cabecalho|rodape|carimbo|assinatura_email)(?:[-_.\s]|$)/i,
+  // Ícones e espaçadores de layout
+  /^(?:icon|icons|icone|icones|avatar|badge|spacer|pixel|blank|divider|btn|button)(?:[-_.\s]|$)/i,
+];
+
+/**
+ * Padrões de documentos comerciais/operacionais que NÃO são faturas nem comprovativos fiscais
+ * (catálogos, termos e condições, políticas de privacidade, manuais de produto, etc.)
+ */
+export const NON_INVOICE_DOC_PATTERNS: RegExp[] = [
+  /^(?:catalogo|cat[aá]logo|brochura|folheto|flyer|panfleto|prospecto)(?:[-_.\s\d]|$)/i,
+  /^(?:manual|guia[-_]?utilizador|ficha[-_]?t[eé]cnica|especifica[cç][aã]o|user[-_]?guide)(?:[-_.\s\d]|$)/i,
+  /^(?:termos|condi[cç][oõ]es[-_]?gerais|politica[-_]?privacidade|aviso[-_]?legal|rgpd|gdpr|aviso[-_]?privacidade)(?:[-_.\s\d]|$)/i,
+  /^(?:apresenta[cç][aã]o|newsletter|tabela[-_]?pre[cç]os|lista[-_]?pre[cç]os|boas[-_]?festas|comunicado)(?:[-_.\s\d]|$)/i,
+];
+
+/**
+ * Assuntos de email que indicam claramente comunicações gerais, publicidade ou felicitações
+ * sem qualquer relevância para faturação ou compras.
+ */
+export const SPAM_SUBJECT_PATTERNS: RegExp[] = [
+  /\b(newsletter|boas\s+festas|feliz\s+natal|feliz\s+ano|votos\s+de|aviso\s+de\s+f[eé]rias)\b/i,
+  /\b(pesquisa\s+de\s+satisfa[cç][aã]o|inqu[eé]rito|convite\s+para|webinar|participe)\b/i,
+  /\b(atualiza[cç][aã]o\s+de\s+contactos|informa[cç][aã]o\s+importante\s+sobre\s+f[eé]rias)\b/i,
+];
+
 export interface GraphPollerStats {
   lastRunAt: Date | null;
   lastRunStatus: 'idle' | 'running' | 'success' | 'partial' | 'error';
@@ -127,6 +163,44 @@ export class OutlookService {
 
   get mailProcessedFolderName(): string {
     return process.env.MS_MAIL_PROCESSED_FOLDER || 'Faturas/Processado';
+  }
+
+  get mailMoveEnabled(): boolean {
+    return process.env.MS_MAIL_MOVE_ENABLED !== 'false';
+  }
+
+  get oneDriveMoveEnabled(): boolean {
+    // Default to false (copy only) per user requirement: "so quero que faca uma copia e nao mover!"
+    return process.env.ONEDRIVE_MOVE_ENABLED === 'true';
+  }
+
+  get blockedSenders(): string[] {
+    const raw = process.env.MS_MAIL_BLOCKED_SENDERS || '';
+    return raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  get allowedSenders(): string[] {
+    const raw = process.env.MS_MAIL_ALLOWED_SENDERS || '';
+    return raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  isSenderBlocked(fromAddress?: string | null): boolean {
+    if (!fromAddress) return false;
+    const clean = fromAddress.toLowerCase().trim();
+    return this.blockedSenders.some((blocked) => clean.includes(blocked));
+  }
+
+  isSenderAllowed(fromAddress?: string | null): boolean {
+    if (this.allowedSenders.length === 0) return true;
+    if (!fromAddress) return false;
+    const clean = fromAddress.toLowerCase().trim();
+    return this.allowedSenders.some((allowed) => clean.includes(allowed));
   }
 
   get oneDriveEntradaPath(): string {
@@ -324,6 +398,35 @@ export class OutlookService {
 
     for (const msg of messages) {
       try {
+        const senderAddress = msg.from?.emailAddress?.address?.toLowerCase().trim() || '';
+
+        // 1. Verificação de remetente bloqueado (Blacklist)
+        if (this.isSenderBlocked(senderAddress)) {
+          this.logger.log(
+            `[OutlookService] Email '${msg.subject}' from blocked sender '${senderAddress}' — marked as read and ignored`,
+          );
+          await this.markAndMoveMessage(token, userPath, msg.id, processadoId);
+          continue;
+        }
+
+        // 2. Verificação de whitelist (se ativa)
+        if (!this.isSenderAllowed(senderAddress)) {
+          this.logger.log(
+            `[OutlookService] Email '${msg.subject}' from '${senderAddress}' not in allowed senders list — marked as read and ignored`,
+          );
+          await this.markAndMoveMessage(token, userPath, msg.id, processadoId);
+          continue;
+        }
+
+        // 3. Pré-filtro de assunto: ignorar emails manifestamente não-fiscais (marketing, newsletters, etc.)
+        if (this.shouldIgnoreEmailSubject(msg.subject)) {
+          this.logger.log(
+            `[OutlookService] Email '${msg.subject}' ignored by subject heuristic (non-invoice/marketing) — marked as read and moved to Processado`,
+          );
+          await this.markAndMoveMessage(token, userPath, msg.id, processadoId);
+          continue;
+        }
+
         const extracted = await this.extractAttachmentsFromMessage(token, userPath, msg);
 
         if (extracted.attachments.length > 0) {
@@ -365,10 +468,10 @@ export class OutlookService {
           );
           await this.markAndMoveMessage(token, userPath, msg.id, processadoId);
         } else {
-          this.logger.warn(
-            `[OutlookService] Email '${msg.subject}' (id: ${msg.id}) had no valid attachments or links — marked as read without moving`,
+          this.logger.log(
+            `[OutlookService] Email '${msg.subject}' (id: ${msg.id}) had no valid invoice attachments or links — marked as read and moved to Processado`,
           );
-          await this.markAsRead(token, userPath, msg.id);
+          await this.markAndMoveMessage(token, userPath, msg.id, processadoId);
         }
       } catch (err) {
         const msgError = `Message ${msg.id} processing failed: ${(err as Error).message}`;
@@ -420,6 +523,12 @@ export class OutlookService {
         continue;
       }
 
+      const check = this.shouldIgnoreAttachment(item.name || '', item.file?.mimeType || '', item.size || 0);
+      if (check.ignore) {
+        this.logger.log(`[OneDrive] Skipping non-invoice file '${item.name}': ${check.reason}`);
+        continue;
+      }
+
       if (item.size <= 0 || item.size > MAX_FILE_SIZE) {
         continue;
       }
@@ -456,17 +565,29 @@ export class OutlookService {
 
         processed++;
 
-        // Move to /DocFlow/Processados if destination folder exists
+        // Copy or Move to /DocFlow/Processados if destination folder exists
         if (processadosFolderId) {
-          const moveUrl = `${GRAPH_BASE}/${driveBase}/items/${item.id}`;
-          await this.fetchWithAuth(moveUrl, token, {
-            method: 'PATCH',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              parentReference: { id: processadosFolderId },
-              name: item.name,
-            }),
-          });
+          if (this.oneDriveMoveEnabled) {
+            const moveUrl = `${GRAPH_BASE}/${driveBase}/items/${item.id}`;
+            await this.fetchWithAuth(moveUrl, token, {
+              method: 'PATCH',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                parentReference: { id: processadosFolderId },
+                name: item.name,
+              }),
+            });
+          } else {
+            const copyUrl = `${GRAPH_BASE}/${driveBase}/items/${item.id}/copy`;
+            await this.fetchWithAuth(copyUrl, token, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                parentReference: { id: processadosFolderId },
+                name: item.name,
+              }),
+            });
+          }
         }
       } catch (err) {
         const errMsg = `OneDrive file ${item.name} (${item.id}) failed: ${(err as Error).message}`;
@@ -602,11 +723,10 @@ export class OutlookService {
       return;
     }
 
-    // Skip inline images and tiny logos
-    if (att.isInline === true) {
-      return;
-    }
-    if ((att.contentType || '').startsWith('image/') && att.size < 10240 && ext !== 'pdf') {
+    // Skip inline images, signatures, logos, and non-invoice attachments
+    const check = this.shouldIgnoreAttachment(filename, att.contentType || '', att.size || 0, att.isInline);
+    if (check.ignore) {
+      this.logger.log(`[OutlookService] Skipping attachment '${filename}': ${check.reason}`);
       return;
     }
 
@@ -660,8 +780,8 @@ export class OutlookService {
       body: JSON.stringify({ isRead: true }),
     }).catch(() => undefined);
 
-    // 2. Move to Processado folder
-    if (processadoFolderId) {
+    // 2. Move to Processado folder (only if move is enabled)
+    if (this.mailMoveEnabled && processadoFolderId) {
       const moveUrl = `${GRAPH_BASE}/${userPath}/messages/${messageId}/move`;
       await this.fetchWithAuth(moveUrl, token, {
         method: 'POST',
@@ -892,6 +1012,64 @@ export class OutlookService {
         lower.includes('download')
       );
     });
+  }
+
+  /**
+   * Helper que determina se um anexo de email deve ser descartado
+   * por ser assinatura, logotipo, ícone de rede social, catálogo ou documento não fiscal.
+   */
+  shouldIgnoreAttachment(
+    filename: string,
+    contentType: string,
+    size: number,
+    isInline?: boolean,
+  ): { ignore: boolean; reason?: string } {
+    if (isInline === true) {
+      return { ignore: true, reason: 'inline_attachment' };
+    }
+
+    const lowerName = (filename || '').toLowerCase().trim();
+    const isImage =
+      (contentType || '').startsWith('image/') ||
+      /\.(png|jpg|jpeg|gif|webp|bmp)$/i.test(lowerName);
+
+    // Imagens minúsculas (< 25 KB) são invariavelmente ícones de assinatura, pixels ou logos
+    if (isImage && size < 25 * 1024) {
+      return { ignore: true, reason: `image_below_minimum_size:${size}B` };
+    }
+
+    // Nomes típicos de assinaturas, rodapés e redes sociais
+    for (const pattern of JUNK_ATTACHMENT_PATTERNS) {
+      if (pattern.test(lowerName)) {
+        return { ignore: true, reason: `junk_filename_pattern:${pattern}` };
+      }
+    }
+
+    // Documentos que manifestamente não são faturas (catálogos, termos, manuais, newsletters)
+    for (const pattern of NON_INVOICE_DOC_PATTERNS) {
+      if (pattern.test(lowerName)) {
+        return { ignore: true, reason: `non_invoice_document_pattern:${pattern}` };
+      }
+    }
+
+    return { ignore: false };
+  }
+
+  /**
+   * Verifica se o assunto do email é manifestamente não-fatura (ex.: publicidade, boas festas, etc.)
+   */
+  shouldIgnoreEmailSubject(subject: string): boolean {
+    const s = (subject || '').toLowerCase().trim();
+    if (!s) return false;
+
+    // Se tiver palavras fiscais ou de faturação explícitas, nunca ignora
+    const hasInvoiceSignal =
+      /\b(fatura|factura|ft\s*\d|fr\s*\d|nc\s*\d|nd\s*\d|invoice|recibo|vencimento|pagamento|d[eé]bito|cr[eé]dito|conta\s*corrente|encomenda)\b/i.test(
+        s,
+      );
+    if (hasInvoiceSignal) return false;
+
+    return SPAM_SUBJECT_PATTERNS.some((pattern) => pattern.test(s));
   }
 
   private async resolveActiveTenant(): Promise<{ id: string } | null> {

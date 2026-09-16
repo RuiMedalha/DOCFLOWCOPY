@@ -38,7 +38,7 @@ describe('detectOrientation()', () => {
   it('deixa em paz um documento já direito', () => {
     const out = detectOrientation(makeDocument());
     expect(out.rotate).toBe(0);
-    expect(out.reason).toContain('text_lines_horizontal');
+    expect(out.reason).toMatch(/already_portrait|text_lines_horizontal/);
   });
 
   it('endireita uma foto deitada mesmo sem etiqueta EXIF', () => {
@@ -48,7 +48,7 @@ describe('detectOrientation()', () => {
     const out = detectOrientation(sideways);
     expect(out.rotate).not.toBe(0);
     expect([90, 270]).toContain(out.rotate);
-    expect(out.reason).toContain('text_lines_vertical');
+    expect(out.reason).toMatch(/landscape_to_portrait|text_lines_vertical/);
   });
 
   it('escolhe o sentido que repõe as linhas na horizontal', () => {

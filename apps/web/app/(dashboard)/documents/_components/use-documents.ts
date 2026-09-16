@@ -29,6 +29,7 @@ function buildQuery(
   if (filters.search) sp.set('search', filters.search);
   if (filters.status) sp.set('status', filters.status);
   if (filters.type) sp.set('type', filters.type);
+  if (filters.excludeType) sp.set('excludeType', filters.excludeType);
   if (filters.fiscalStatus) sp.set('fiscalStatus', filters.fiscalStatus);
   if (filters.dateFrom) sp.set('dateFrom', filters.dateFrom);
   if (filters.dateTo) sp.set('dateTo', filters.dateTo);

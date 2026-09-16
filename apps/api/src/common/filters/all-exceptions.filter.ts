@@ -88,8 +88,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
       ({ status, message, errorName } = mapPrismaError(exception));
     } else if (exception instanceof Prisma.PrismaClientValidationError) {
       status = HttpStatus.BAD_REQUEST;
-      message = 'Invalid query parameters';
+      message = exception.message.replace(/\n+/g, ' ').trim();
       errorName = 'PrismaValidationError';
+      this.logger.error(`PrismaClientValidationError on ${req.method} ${req.url}: ${message}`);
     } else if (exception instanceof Error) {
       message = exception.message;
       errorName = exception.name;

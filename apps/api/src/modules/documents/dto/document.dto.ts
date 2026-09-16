@@ -13,6 +13,7 @@ import {
   Matches,
   MaxLength,
   Min,
+  ValidateIf,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import {
@@ -64,78 +65,97 @@ export class UpdateDocumentDto {
   @IsEnum(DocumentStatus)
   status?: DocumentStatus;
 
-  @ApiPropertyOptional({ example: 'EDP Comercial' })
+  @ApiPropertyOptional({ example: 'RESTAURANTE-CLIPPER_2026-03-01_FS-A2605-3085.pdf', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(255)
-  supplier?: string;
+  fileName?: string | null;
 
-  @ApiPropertyOptional({ example: '500000001' })
+  @ApiPropertyOptional({ example: 'EDP Comercial', nullable: true })
   @IsOptional()
-  @IsString()
-  @MaxLength(20)
-  supplierNif?: string;
-
-  @ApiPropertyOptional({ example: 'Cliente Demo SA' })
-  @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(255)
-  customer?: string;
+  supplier?: string | null;
 
-  @ApiPropertyOptional({ example: '501000002' })
+  @ApiPropertyOptional({ example: '500000001', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(20)
-  customerNif?: string;
+  supplierNif?: string | null;
 
-  @ApiPropertyOptional({ example: 'FT 2026/1234' })
+  @ApiPropertyOptional({ example: 'Cliente Demo SA', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
+  @IsString()
+  @MaxLength(255)
+  customer?: string | null;
+
+  @ApiPropertyOptional({ example: '501000002', nullable: true })
+  @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
+  @IsString()
+  @MaxLength(20)
+  customerNif?: string | null;
+
+  @ApiPropertyOptional({ example: 'FT 2026/1234', nullable: true })
+  @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(100)
-  docNumber?: string;
+  docNumber?: string | null;
 
-  @ApiPropertyOptional({ example: '2026-08-30' })
+  @ApiPropertyOptional({ example: '2026-08-30', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsDateString()
-  docDate?: string;
+  docDate?: string | null;
 
-  @ApiPropertyOptional({ example: '2026-09-29' })
+  @ApiPropertyOptional({ example: '2026-09-29', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsDateString()
-  dueDate?: string;
+  dueDate?: string | null;
 
-  @ApiPropertyOptional({ example: 123.45 })
+  @ApiPropertyOptional({ example: 123.45, nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @Type(() => Number)
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
-  total?: number;
+  total?: number | null;
 
-  @ApiPropertyOptional({ example: 28.39 })
+  @ApiPropertyOptional({ example: 28.39, nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @Type(() => Number)
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
-  taxAmount?: number;
+  taxAmount?: number | null;
 
-  @ApiPropertyOptional({ example: 95.06 })
+  @ApiPropertyOptional({ example: 95.06, nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @Type(() => Number)
   @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
-  netAmount?: number;
+  netAmount?: number | null;
 
-  @ApiPropertyOptional({ example: 'EUR', default: 'EUR' })
+  @ApiPropertyOptional({ example: 'EUR', default: 'EUR', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(3)
-  currency?: string;
+  currency?: string | null;
 
-  @ApiPropertyOptional({ type: [String], example: ['fatura', 'edp'] })
+  @ApiPropertyOptional({ type: [String], example: ['fatura', 'edp'], nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined)
   @IsArray()
   @IsString({ each: true })
-  tags?: string[];
+  tags?: string[] | null;
 
   @ApiPropertyOptional({
     description:
@@ -144,6 +164,7 @@ export class UpdateDocumentDto {
     type: String,
   })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(50)
   folderId?: string | null;
@@ -155,11 +176,13 @@ export class UpdateDocumentDto {
       '`/Despesas/{Categoria}/{Ano}/{Mes}/` (or /Estrangeiras/... when foreign). ' +
       'Pass an empty string to clear the override and fall back to the AI suggestion.',
     enum: [...EXPENSE_CATEGORIES, ''],
+    nullable: true,
   })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(50)
-  expenseCategory?: string;
+  expenseCategory?: string | null;
 
   /**
    * Fase 4.1 — classificação. O operador escolhe uma Category real
@@ -171,26 +194,30 @@ export class UpdateDocumentDto {
     description:
       'Category.id da classificação. Define também a natureza e recalcula a '
       + 'dedutibilidade do IVA. String vazia limpa a classificação.',
+    nullable: true,
   })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(50)
-  expenseCategoryId?: string;
+  expenseCategoryId?: string | null;
 
-  @ApiPropertyOptional({ enum: CategoryNature })
+  @ApiPropertyOptional({ enum: CategoryNature, nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsEnum(CategoryNature)
-  expenseNature?: CategoryNature;
+  expenseNature?: CategoryNature | null;
 
   /**
    * Fase 4.1 (P2.2) — o operador tem de poder marcar um documento como
    * não fiscal. A correção manual fica registada na auditoria e não é
    * revertida por uma re-extração.
    */
-  @ApiPropertyOptional({ enum: FiscalStatus })
+  @ApiPropertyOptional({ enum: FiscalStatus, nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsEnum(FiscalStatus)
-  fiscalStatus?: FiscalStatus;
+  fiscalStatus?: FiscalStatus | null;
 
   /**
    * Fase 4.1 — desfazer a correção manual.
@@ -213,27 +240,32 @@ export class UpdateDocumentDto {
       'Link the document to a Party.id (supplier/customer). The folder-rules ' +
       'engine reads the party\'s country + isRecurring flag to decide between ' +
       '/Fornecedores/{Nome}/, /Despesas/{Categoria}/, and /Estrangeiras/...',
+    nullable: true,
   })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(50)
-  partyId?: string;
+  partyId?: string | null;
 
-  @ApiPropertyOptional({ enum: PaymentStatus, description: 'Estado do pagamento da fatura' })
+  @ApiPropertyOptional({ enum: PaymentStatus, description: 'Estado do pagamento da fatura', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsEnum(PaymentStatus)
-  paymentStatus?: PaymentStatus;
+  paymentStatus?: PaymentStatus | null;
 
-  @ApiPropertyOptional({ example: 'transfer', description: 'Método de pagamento (débito direto, transferência, etc.)' })
+  @ApiPropertyOptional({ example: 'transfer', description: 'Método de pagamento (débito direto, transferência, etc.)', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsString()
   @MaxLength(50)
-  paymentMethod?: string;
+  paymentMethod?: string | null;
 
-  @ApiPropertyOptional({ example: '2026-09-30', description: 'Data limite ou data de pagamento' })
+  @ApiPropertyOptional({ example: '2026-09-30', description: 'Data limite ou data de pagamento', nullable: true })
   @IsOptional()
+  @ValidateIf((_, val) => val !== null && val !== undefined && val !== '')
   @IsDateString()
-  paymentDueDate?: string;
+  paymentDueDate?: string | null;
 }
 
 /**
@@ -267,6 +299,11 @@ export class DocumentQueryDto {
   @IsOptional()
   @IsEnum(DocumentType)
   type?: DocumentType;
+
+  @ApiPropertyOptional({ enum: DocumentType, description: 'Exclude a specific DocumentType from the results' })
+  @IsOptional()
+  @IsEnum(DocumentType)
+  excludeType?: DocumentType;
 
   @ApiPropertyOptional({
     description: 'Filter by party.id (supplier or customer link)',

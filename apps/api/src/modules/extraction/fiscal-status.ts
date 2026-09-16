@@ -52,8 +52,8 @@ export interface FiscalClassificationInput {
 export interface FiscalClassification {
   fiscalStatus: FiscalStatusValue;
   reason: string;
-  /** Set when the document type should be overridden (non-fiscal kinds, FS, FR, NC, ND). */
-  documentType?: NonFiscalType | 'FATURA_SIMPLIFICADA' | 'FATURA_RECIBO' | 'NOTA_CREDITO' | 'NOTA_DEBITO';
+  /** Set when the document type should be overridden (non-fiscal kinds, FS, FR, NC, ND, FATURA_RECEBIDA). */
+  documentType?: NonFiscalType | 'FATURA_RECEBIDA' | 'FATURA_SIMPLIFICADA' | 'FATURA_RECIBO' | 'NOTA_CREDITO' | 'NOTA_DEBITO';
 }
 
 const NON_FISCAL_RULES: Array<{ type: NonFiscalType; pattern: RegExp }> = [
@@ -64,8 +64,12 @@ const NON_FISCAL_RULES: Array<{ type: NonFiscalType; pattern: RegExp }> = [
   { type: 'ORCAMENTO', pattern: /\b(or[çc]amento|quota(?:tion|ç[ãa]o)|quote|devis|presupuesto|oferta\s+de\s+ven[dt]a|oferta\s+comercial|preventivo|kostenvoranschlag|angebot)\b/i },
   { type: 'AVISO_PAGAMENTO', pattern: /\b(aviso\s+de\s+(?:pagamento|cobran[çc]a|vencimento|d[eé]bito|lan[çc]amento)|payment\s+(?:notice|reminder|advice)|avis\s+de\s+paiement|aviso\s+de\s+pago)\b/i },
   { type: 'EXTRATO_FORNECEDOR', pattern: /\b(extra[ct]o\s+(?:de\s+)?(?:conta|fornecedor|cliente|movimentos)|account\s+statement|statement\s+of\s+account|relev[eé]\s+de\s+compte|extracto\s+de\s+cuenta)\b/i },
-  // Fase 4.1 — uma nota de encomenda não é documento fiscal.
-  { type: 'ENCOMENDA', pattern: /\b(nota\s+de\s+encomenda|purchase\s+order|pedido\s+de\s+compra|bon\s+de\s+commande|bestellung)\b/i },
+  // Fase 4.1 — uma nota de encomenda / confirmação de encomenda não é documento fiscal.
+  {
+    type: 'ENCOMENDA',
+    pattern:
+      /\b(confirma[çc][ãa]o\s*(?:de\s*)?encomenda|confirma[çc][ií]on\s*(?:de\s*)?pedido|order\s*confirmation|nota\s*de\s*encomenda|ordem\s*de\s*encomenda|purchase\s+order|pedido\s+de\s+compra|bon\s+de\s+commande|bestellung|bestellbest[aä]tigung)\b/i,
+  },
 ];
 
 /** Detect a non-fiscal document kind from free text. Order matters (first hit wins). */
@@ -120,11 +124,37 @@ export function classifyFiscalStatus(input: FiscalClassificationInput): FiscalCl
   const qrTrusted = input.qrOrigin !== 'ai' && isValidAtQr(input.qr);
 
   // P0.2 — Se o NIF da empresa (ex: 515208566) for o emitente/vendedor:
-  // trata-se de documento interno/emitido ou encomenda de cliente destinada a nós -> NAO_APLICAVEL
+  // trata-se de documento interno/emitido ou encomenda de cliente destinada a nós -> NAO_APLICAVEL,
+  // A MENOS que seja uma fatura simplificada / talão de despesa onde a empresa é o cliente adquirente!
   const tenantNifClean = (input.tenantNif || '').replace(/\D/g, '');
   const issuerNifClean = (input.qr?.issuerNif || input.supplierNif || '').replace(/\D/g, '');
 
+  const rawQrType = (input.qr?.documentType ?? '').toUpperCase();
+  const isSimplified =
+    rawQrType === 'FS' ||
+    rawQrType === 'FR' ||
+    /\b(?:fatura\s+simplificada|factura\s+simplificada|\bFS\b|\bFR\b|fatura[\s/-]?recibo)\b/i.test(input.text || '');
+
   if (tenantNifClean && issuerNifClean && tenantNifClean === issuerNifClean) {
+    if (isSimplified) {
+      return {
+        fiscalStatus: 'FISCAL',
+        reason: 'simplified_invoice_expense',
+        documentType: rawQrType === 'FR' ? 'FATURA_RECIBO' : 'FATURA_SIMPLIFICADA',
+      };
+    }
+    const isExplicitInvoice =
+      rawQrType === 'FT' ||
+      rawQrType === 'NC' ||
+      rawQrType === 'ND' ||
+      /\b(?:fatura|factura|invoice|nota\s+de\s+cr[eé]dito)\b/i.test(input.text || '');
+    if (isExplicitInvoice && !kind) {
+      return {
+        fiscalStatus: 'INDETERMINADO',
+        reason: 'invoice_tenant_is_buyer_pending_supplier_review',
+        documentType: rawQrType === 'NC' ? 'NOTA_CREDITO' : rawQrType === 'ND' ? 'NOTA_DEBITO' : 'FATURA_RECEBIDA',
+      };
+    }
     const nonFiscalType = kind ?? 'ENCOMENDA';
     return {
       fiscalStatus: 'NAO_APLICAVEL',

@@ -118,7 +118,12 @@ export class ViesProvider implements EnrichmentProvider {
   ): import('./provider.factory').EnrichmentFields {
     const pick = (k: string): string | null => {
       const v = body[k];
-      return typeof v === 'string' && v.trim() ? v.trim() : null;
+      if (typeof v !== 'string') return null;
+      const clean = v.trim();
+      if (!clean || /^[-–—\s/._*#]+$/.test(clean) || clean.toLowerCase() === '---') {
+        return null;
+      }
+      return clean;
     };
     const address = pick('address');
     const name = pick('name');

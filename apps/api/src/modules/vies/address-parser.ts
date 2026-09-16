@@ -99,8 +99,24 @@ export function isGenericPartyName(
 ): boolean {
   const n = (name ?? '').trim();
   if (!n) return true;
-  if (n.toLowerCase() === 'fornecedor por identificar') return true;
-  if (nif && n === nif) return true;
-  if (vatNumber && n === vatNumber) return true;
+  // Apenas traços, pontos, barras ou símbolos (ex.: "---" que a AEAT espanhola devolve no VIES público)
+  if (/^[-–—\s/._*#]+$/.test(n)) return true;
+  const lower = n.toLowerCase();
+  if (
+    lower === 'fornecedor por identificar' ||
+    lower === 'fornecedor' ||
+    lower === 'cliente' ||
+    lower === 'entidade' ||
+    lower === 'desconhecido' ||
+    lower === 'n/a' ||
+    lower === 'na' ||
+    lower === 'null' ||
+    lower === 'undefined'
+  ) {
+    return true;
+  }
+  if (nif && (n === nif || (n.replace(/\D/g, '') === nif.replace(/\D/g, '') && nif.replace(/\D/g, '').length >= 8))) return true;
+  if (vatNumber && (n === vatNumber || n.replace(/[^A-Z0-9]/gi, '').toUpperCase() === vatNumber.replace(/[^A-Z0-9]/gi, '').toUpperCase())) return true;
   return false;
 }
+

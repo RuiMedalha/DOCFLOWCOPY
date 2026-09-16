@@ -50,7 +50,7 @@ describe('ViesProvider', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.source).toBe('vies');
-      expect(result.fields.address).toBe('CALLE MAYOR 1, 28013 MADRID');
+      expect(result.fields.address).toBe('CALLE MAYOR 1');
       expect(result.fields.postalCode).toBe('28013');
       expect(result.fields.city).toBe('MADRID');
       // VIES never exposes email/phone/mobile/website/industry — they
@@ -58,6 +58,28 @@ describe('ViesProvider', () => {
       // manually-entered phone.
       expect(result.fields.email).toBeNull();
       expect(result.fields.phone).toBeNull();
+    }
+  });
+
+  it('converts Spanish VIES "---" name into null so invoice name is preserved', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (global as any).fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        countryCode: 'ES',
+        vatNumber: 'A08242851',
+        valid: true,
+        name: '---',
+        address: 'CARRER DEL CASTANYET, 132, 08430 LA ROCA DEL VALLES',
+      }),
+    });
+    const p = makeProvider();
+    const result = await p.fetch({ nif: 'ESA08242851', country: 'ES', iban: null });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.fields.name).toBeNull();
+      expect(result.fields.city).toBe('LA ROCA DEL VALLES');
     }
   });
 

@@ -785,10 +785,10 @@ describe('DocumentsService', () => {
         docDate: new Date(Date.UTC(2026, 6, 31)),
       });
 
-      expect(out).toBe('AMERICO-ALVES-LDA_2026-07-31_FT-2026-1751.jpg');
+      expect(out).toBe('AMERICO-ALVES-LDA_2026-07-31_FT-2026-1751.pdf');
       expect(prisma.document.update).toHaveBeenCalledTimes(1);
       expect(prisma.document.update.mock.calls[0][0].data.fileName).toBe(
-        'AMERICO-ALVES-LDA_2026-07-31_FT-2026-1751.jpg',
+        'AMERICO-ALVES-LDA_2026-07-31_FT-2026-1751.pdf',
       );
     });
 
@@ -874,7 +874,7 @@ describe('DocumentsService', () => {
       });
 
       // The row already has fields — we should still rename.
-      expect(out).toBe('NOS_2026-06-01_FT-9.jpg');
+      expect(out).toBe('NOS_2026-06-01_FT-9.pdf');
       expect(prisma.document.update).toHaveBeenCalledTimes(1);
     });
 
@@ -899,7 +899,7 @@ describe('DocumentsService', () => {
       // rename is purely a `fileName` column write.
       expect(updateArgs.data).not.toHaveProperty('fileKey');
       expect(updateArgs.data).not.toHaveProperty('pdfKey');
-      expect(updateArgs.data.fileName).toBe('EDP_2026-01-01_FT-1.jpg');
+      expect(updateArgs.data.fileName).toBe('EDP_2026-01-01_FT-1.pdf');
     });
 
     it('logs and returns null when the update throws (does not abort the caller)', async () => {

@@ -269,6 +269,7 @@ export class EnrichmentService {
     const merged = this.applyOnlyFillNulls(party, combinedFields);
     if (
       combinedFields.name &&
+      !isGenericPartyName(combinedFields.name) &&
       isGenericPartyName(party.name, party.nif, party.vatNumber)
     ) {
       merged.push('name');
@@ -347,6 +348,10 @@ export class EnrichmentService {
       }
       const meta = doc.metadata as Record<string, any> | null;
       const ext = meta?.extraction ?? meta;
+      const candidateName = doc.supplier || ext?.supplier || ext?.supplierName;
+      if (!extracted.name && typeof candidateName === 'string' && !isGenericPartyName(candidateName)) {
+        extracted.name = candidateName.trim().slice(0, 200);
+      }
       if (!extracted.phone && typeof ext?.supplierPhone === 'string' && ext.supplierPhone.trim()) {
         extracted.phone = ext.supplierPhone.trim();
       }

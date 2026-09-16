@@ -108,6 +108,7 @@ export interface DocumentFiltersState {
   search: string;
   status: '' | DocumentStatus;
   type: '' | DocumentType;
+  excludeType?: '' | DocumentType;
   fiscalStatus: '' | FiscalStatus;
   dateFrom: string;
   dateTo: string;

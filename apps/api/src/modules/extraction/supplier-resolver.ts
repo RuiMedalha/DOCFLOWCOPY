@@ -7,7 +7,7 @@ import { ViesProvider } from "../enrichment/providers/vies.provider";
 import { normalizePartyName } from "../parties/party-identity";
 import { getTenantIdentity } from "../ai/tenant-identity";
 import { PartyMergeService } from "../parties/party-merge.service";
-import { parsePostalAddress } from "../vies/address-parser";
+import { isGenericPartyName, parsePostalAddress } from "../vies/address-parser";
 import { EU_COUNTRY_CODES } from "./field-validation";
 
 /**
@@ -274,14 +274,21 @@ export class SupplierResolver {
         }
       }
 
+
       if (!partyRow) {
         // Create the Party row. Preenchemos com os dados oficiais validados caso obtidos,
         // ou fallback para o nome extraído.
         const ibanToStore = iban && this.isIbanValid(iban) ? normalizeIban(iban) : null;
-        const nameToStore =
-          officialData?.officialName?.trim()?.slice(0, 200) ||
-          supplierName?.trim()?.slice(0, 200) ||
-          "Fornecedor por identificar";
+        const validOfficial =
+          officialData?.officialName && !isGenericPartyName(officialData.officialName)
+            ? officialData.officialName.trim().slice(0, 200)
+            : null;
+        const validSupplier =
+          supplierName && !isGenericPartyName(supplierName)
+            ? supplierName.trim().slice(0, 200)
+            : null;
+        const nameToStore = validOfficial || validSupplier || "Fornecedor por identificar";
+
 
         const isEu = countryCode !== "PT" && EU_COUNTRY_CODES.has(countryCode);
         const defaultVatRegime = countryCode === "PT" ? "PT" : (isEu ? "UE_REVERSE_CHARGE" : "EXTRA_UE");
@@ -391,12 +398,20 @@ export class SupplierResolver {
             updates.country = officialData.country;
           }
           if (
-            officialData?.officialName &&
-            (partyRow.name === 'Fornecedor por identificar' ||
-              partyRow.name.toLowerCase().startsWith('fornecedor') ||
-              partyRow.name === partyRow.nif)
+            (officialData?.officialName || supplierName) &&
+            isGenericPartyName(partyRow.name, partyRow.nif, (partyRow as any).vatNumber)
           ) {
-            updates.name = officialData.officialName.slice(0, 200);
+            const candidate =
+              (officialData?.officialName && !isGenericPartyName(officialData.officialName)
+                ? officialData.officialName.trim().slice(0, 200)
+                : null) ||
+              (supplierName && !isGenericPartyName(supplierName)
+                ? supplierName.trim().slice(0, 200)
+                : null);
+            if (candidate) {
+              updates.name = candidate;
+              partyRow.name = candidate;
+            }
           }
           if (officialData?.source) {
             updates.enrichedAt = new Date();

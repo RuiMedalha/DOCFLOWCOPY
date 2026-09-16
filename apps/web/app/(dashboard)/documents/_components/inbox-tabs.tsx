@@ -7,11 +7,11 @@
  * filter mismatch between tab and list cannot get out of sync.
  */
 
-import { FileText, ScanLine, Mail, Cloud, MessageSquare, ShoppingCart } from 'lucide-react';
-import type { DocumentFiltersState, DocumentOrigin, FiscalStatus } from './types';
+import { FileText, ScanLine, Mail, Cloud, MessageSquare, ShoppingCart, AlertCircle, Layers } from 'lucide-react';
+import type { DocumentFiltersState, DocumentOrigin, DocumentType, FiscalStatus } from './types';
 import { useDocumentsList } from './use-documents';
 
-export type InboxTabKey = 'pdf' | 'scanner' | 'email' | 'onedrive' | 'whatsapp' | 'nao_aplicavel';
+export type InboxTabKey = 'todas' | 'encomendas' | 'email' | 'onedrive' | 'scanner' | 'pdf' | 'whatsapp' | 'nao_aplicavel';
 
 const TAB_DEFS: Array<{
   key: InboxTabKey;
@@ -19,21 +19,60 @@ const TAB_DEFS: Array<{
   icon: typeof FileText;
   origins?: DocumentOrigin[];
   fiscalStatus?: FiscalStatus;
+  type?: DocumentType;
+  excludeType?: DocumentType;
 }> = [
-  { key: 'pdf', label: 'PDF / Upload', icon: FileText, origins: ['UPLOAD'] },
-  { key: 'scanner', label: 'Scanner', icon: ScanLine, origins: ['SCANNER'] },
+  {
+    key: 'todas',
+    label: 'Todas as Faturas (Fiscais)',
+    icon: FileText,
+    excludeType: 'ENCOMENDA',
+  },
+  {
+    key: 'encomendas',
+    label: 'Encomendas / Pedidos',
+    icon: ShoppingCart,
+    type: 'ENCOMENDA',
+  },
   {
     key: 'email',
     label: 'Email',
     icon: Mail,
     origins: ['EMAIL', 'GMAIL', 'OUTLOOK', 'INBOUND_WEBHOOK'],
+    excludeType: 'ENCOMENDA',
   },
-  { key: 'onedrive', label: 'OneDrive', icon: Cloud, origins: ['ONEDRIVE'] },
-  { key: 'whatsapp', label: 'WhatsApp', icon: MessageSquare, origins: ['WHATSAPP'] },
+  {
+    key: 'onedrive',
+    label: 'OneDrive',
+    icon: Cloud,
+    origins: ['ONEDRIVE'],
+    excludeType: 'ENCOMENDA',
+  },
+  {
+    key: 'scanner',
+    label: 'Scanner',
+    icon: ScanLine,
+    origins: ['SCANNER'],
+    excludeType: 'ENCOMENDA',
+  },
+  {
+    key: 'pdf',
+    label: 'Upload Manual',
+    icon: Layers,
+    origins: ['UPLOAD'],
+    excludeType: 'ENCOMENDA',
+  },
+  {
+    key: 'whatsapp',
+    label: 'WhatsApp',
+    icon: MessageSquare,
+    origins: ['WHATSAPP'],
+    excludeType: 'ENCOMENDA',
+  },
   {
     key: 'nao_aplicavel',
-    label: 'Encomendas Cliente',
-    icon: ShoppingCart,
+    label: 'Não Fiscais / Outros',
+    icon: AlertCircle,
     fiscalStatus: 'NAO_APLICAVEL',
   },
 ];
@@ -42,6 +81,7 @@ const EMPTY_FILTERS: DocumentFiltersState = {
   search: '',
   status: '',
   type: '',
+  excludeType: '',
   fiscalStatus: '',
   dateFrom: '',
   dateTo: '',
@@ -68,6 +108,8 @@ export function InboxTabs({
           active={active === tab.key}
           origins={tab.origins}
           fiscalStatus={tab.fiscalStatus}
+          type={tab.type}
+          excludeType={tab.excludeType}
           onClick={() => onChange(tab.key)}
         />
       ))}
@@ -81,6 +123,8 @@ function TabButton({
   active,
   origins,
   fiscalStatus,
+  type,
+  excludeType,
   onClick,
 }: {
   label: string;
@@ -88,6 +132,8 @@ function TabButton({
   active: boolean;
   origins?: DocumentOrigin[];
   fiscalStatus?: FiscalStatus;
+  type?: DocumentType;
+  excludeType?: DocumentType;
   onClick: () => void;
 }) {
   // Per-tab count query. We only ask for `limit: 1` so the network cost
@@ -97,6 +143,8 @@ function TabButton({
     ...EMPTY_FILTERS,
     origin: origins,
     fiscalStatus: fiscalStatus ?? '',
+    type: type ?? '',
+    excludeType: excludeType ?? '',
   };
   const { data } = useDocumentsList(filters, 1, 1);
   const count = data?.meta?.total ?? 0;

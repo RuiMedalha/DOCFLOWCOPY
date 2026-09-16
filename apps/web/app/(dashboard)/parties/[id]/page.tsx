@@ -72,7 +72,7 @@ export default function PartyDetailPage() {
     type: party.type,
     name: party.name,
     nif: nifLooksPortuguese ? party.nif ?? '' : '',
-    vatNumber: party.vatNumber ?? '',
+    vatNumber: party.vatNumber || (!nifLooksPortuguese && party.nif ? party.nif : ''),
     vatRegime: party.vatRegime ?? 'PT',
     email: party.email ?? '',
     website: (party as any).website ?? '',

@@ -117,6 +117,19 @@ describe("Fase 3 — fiscal status rules (deterministic)", () => {
     });
     expect(out.fiscalStatus).toBe("FISCAL");
   });
+
+  it("classifies simplified invoice as FISCAL even if supplierNif matches tenant NIF", () => {
+    const out = classifyFiscalStatus({
+      text: "Fatura Simplificada FS A2605/3085 Restaurante Clipper",
+      supplierNif: "515208566",
+      tenantNif: "515208566",
+      docNumber: "FS A2605/3085",
+      docDate: "2026-03-01",
+    });
+    expect(out.fiscalStatus).toBe("FISCAL");
+    expect(out.documentType).toBe("FATURA_SIMPLIFICADA");
+    expect(out.reason).toBe("simplified_invoice_expense");
+  });
 });
 
 describe("Fase 3 — normalizeDocNumber (fiscal key)", () => {

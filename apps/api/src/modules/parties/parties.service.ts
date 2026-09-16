@@ -11,6 +11,7 @@ import { isValidIban, isValidNif, normalizeIban, normalizeNif } from '@docflow/s
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { PartyCategoriesService } from '../party-categories/party-categories.service';
+import { isGenericPartyName } from '../vies/address-parser';
 import { slugify } from '../../common/storage/slug';
 import {
   AccountQueryDto,
@@ -159,6 +160,37 @@ export class PartiesService {
       },
     });
     if (!p) throw new NotFoundException('Party not found');
+
+    // Auto-recuperação de nome genérico (ex.: "---" vindo do VIES de Espanha ou "Fornecedor por identificar")
+    // a partir do fornecedor extraído dos documentos já processados desta entidade.
+    if (isGenericPartyName(p.name, p.nif, p.vatNumber)) {
+      try {
+        const linkedDoc = await this.prisma.document.findFirst({
+          where: {
+            tenantId,
+            OR: [
+              { partyId: p.id },
+              ...(p.nif ? [{ supplierNif: p.nif }] : []),
+              ...(p.vatNumber ? [{ supplierNif: p.vatNumber }] : []),
+            ],
+            supplier: { not: null },
+          },
+          select: { supplier: true },
+          orderBy: { createdAt: 'desc' },
+        });
+        if (linkedDoc?.supplier && !isGenericPartyName(linkedDoc.supplier)) {
+          const healedName = linkedDoc.supplier.trim().slice(0, 200);
+          await this.prisma.party.update({
+            where: { id: p.id },
+            data: { name: healedName },
+          });
+          p.name = healedName;
+          this.logger.log(`[findOne] auto-healed generic party=${p.id} name to "${healedName}" from linked document`);
+        }
+      } catch (healErr) {
+        this.logger.warn(`[findOne] auto-heal failed for party=${p.id}: ${(healErr as Error).message}`);
+      }
+    }
 
     const accountIds = [p.defaultDebitAccountId, p.defaultCreditAccountId].filter(
       Boolean,
