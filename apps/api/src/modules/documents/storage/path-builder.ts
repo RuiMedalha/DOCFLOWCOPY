@@ -121,3 +121,87 @@ export function buildDocumentPath(input: BuildPathInput): string {
     : '';
   return `${root}/${input.partySlug}/${categorySegment}${dateFolder}/${filename}`;
 }
+
+export interface EnterpriseFilingInput {
+  isPaid: boolean;
+  supplierName?: string | null;
+  partySlug?: string | null;
+  partyType?: PartyTypeInput;
+  categoryName?: string | null;
+  natureza?: string | null;
+  docType?: string | null;
+  docNumber?: string | null;
+  docDate?: Date | null;
+  dueDate?: Date | null;
+  amount?: number | string | null;
+  extension?: string | null;
+}
+
+/**
+ * Mapeia naturezas e categorias para as pastas reais da empresa (Regina):
+ * FORNECEDORES/ | DESPESA/ | RENDA/ | FUNCIONÁRIOS/ | PAGAMENTOS AO ESTADO/ | DONATIVOS/ | MAKRO/ | SEGURO ...
+ */
+export function resolveEnterpriseFolder(input: EnterpriseFilingInput): string {
+  const cat = (input.categoryName ?? '').toUpperCase();
+  const nat = (input.natureza ?? '').toUpperCase();
+  const supp = (input.supplierName ?? '').toUpperCase();
+  const year = input.docDate ? formatYear(input.docDate) : formatYear(new Date());
+
+  // Fornecedor específico Makro
+  if (supp.includes('MAKRO')) {
+    return `MAKRO/${year}`;
+  }
+
+  // Pastas não-fornecedor com mapeamento direto
+  if (cat.includes('RENDA') || nat.includes('RENDA')) {
+    return `RENDA/${year}`;
+  }
+  if (cat.includes('DONATIVO') || nat.includes('DONATIVO')) {
+    return `DONATIVOS/${year}`;
+  }
+  if (cat.includes('ESTADO') || cat.includes('IMPOSTO') || nat.includes('PAGAMENTOS_AO_ESTADO') || nat.includes('ESTADO')) {
+    return `PAGAMENTOS AO ESTADO/${year}`;
+  }
+  if (cat.includes('FUNCIONARIO') || cat.includes('SALARIO') || cat.includes('REMUNERACAO') || nat.includes('FUNCIONARIOS')) {
+    return `FUNCIONARIOS/${year}`;
+  }
+  if (cat.includes('SEGURO') || nat.includes('SEGURO')) {
+    if (cat.includes('SAUDE') || cat.includes('SAÚDE')) return `SEGURO DE SAUDE/${year}`;
+    if (cat.includes('TRABALHO')) return `SEGURO DE TRABALHO/${year}`;
+    if (cat.includes('VIDA')) return `SEGURO DE VIDA/${year}`;
+    if (cat.includes('IMOVEL') || cat.includes('IMÓVEL') || cat.includes('IMOVEIS')) return `SEGURO DE IMOVEIS/${year}`;
+    if (cat.includes('VIATURA') || cat.includes('AUTO') || cat.includes('CARRO')) return `SEGURO DE VIATURAS/${year}`;
+    return `SEGURO DE TRABALHO/${year}`;
+  }
+
+  // Fornecedores de Compras/Mercadorias/Serviços (padrão principal)
+  const cleanSupplier = (input.supplierName ?? input.partySlug ?? 'Geral')
+    .replace(/[^a-zA-Z0-9._ -]/g, '')
+    .trim() || 'Fornecedor';
+
+  if (input.isPaid) {
+    return `FORNECEDORES/COMPRAS/${cleanSupplier}/${year}`;
+  } else {
+    return `FORNECEDORES/FATURAS A PAGAR/${cleanSupplier}`;
+  }
+}
+
+/**
+ * Constrói o caminho completo oficial na estrutura real da empresa:
+ * Ao aprovar: FORNECEDORES/FATURAS A PAGAR/<FORNECEDOR>/<FILENAME>
+ * Ao pagar:   FORNECEDORES/COMPRAS/<FORNECEDOR>/<ANO>/<FILENAME>
+ */
+export function buildEnterpriseFilingPath(input: EnterpriseFilingInput): string {
+  const folder = resolveEnterpriseFolder(input);
+  const filename = generateStandardFileName({
+    type: input.docType,
+    supplier: input.supplierName ?? input.partySlug,
+    docNumber: input.docNumber,
+    docDate: input.docDate,
+    dueDate: input.dueDate,
+    amount: input.amount,
+    extension: input.extension ?? 'pdf',
+  });
+
+  return `${folder}/${filename}`;
+}

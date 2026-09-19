@@ -601,6 +601,108 @@ export class OutlookService {
   }
 
   /**
+   * Fase 4.6 (P1) — Envia ficheiro para o espelho do OneDrive na estrutura de pastas da empresa.
+   * Path relativo, ex: "FORNECEDORES/FATURAS A PAGAR/EDP/FT_123_EDP_250EUR_2026-10-15.pdf"
+   */
+  async mirrorFileToOneDrive(
+    relativePath: string,
+    buffer: Buffer,
+    contentType: string = 'application/pdf',
+  ): Promise<{ success: boolean; path?: string; error?: string }> {
+    try {
+      const token = await this.getAccessToken();
+      const userPath = await this.resolveUserPath(token);
+      const driveBase = await this.resolveDriveBasePath(token, userPath);
+
+      const cleanPath = relativePath.startsWith('/') ? relativePath.slice(1) : relativePath;
+      const uploadUrl = `${GRAPH_BASE}/${driveBase}/root:/${encodeURI(cleanPath)}:/content`;
+
+      const res = await this.fetchWithAuth(uploadUrl, token, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': contentType,
+        },
+        body: new Uint8Array(buffer),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        this.logger.warn(`[mirrorFileToOneDrive] Falha HTTP ${res.status} ao enviar para ${cleanPath}: ${errBody}`);
+        return { success: false, error: `HTTP ${res.status}: ${errBody}` };
+      }
+
+      this.logger.log(`[mirrorFileToOneDrive] Ficheiro sincronizado no OneDrive: ${cleanPath}`);
+      return { success: true, path: cleanPath };
+    } catch (err) {
+      this.logger.warn(`[mirrorFileToOneDrive] Erro de ligação OneDrive: ${(err as Error).message}`);
+      return { success: false, error: (err as Error).message };
+    }
+  }
+
+  /**
+   * Move ficheiro no OneDrive (ex: de FATURAS A PAGAR para COMPRAS/<ANO> ao marcar como pago).
+   */
+  async moveOneDriveFile(
+    fromPath: string,
+    toPath: string,
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const token = await this.getAccessToken();
+      const userPath = await this.resolveUserPath(token);
+      const driveBase = await this.resolveDriveBasePath(token, userPath);
+
+      const cleanFrom = fromPath.startsWith('/') ? fromPath.slice(1) : fromPath;
+      const cleanTo = toPath.startsWith('/') ? toPath.slice(1) : toPath;
+
+      // 1. Obter metadata do ficheiro de origem
+      const itemUrl = `${GRAPH_BASE}/${driveBase}/root:/${encodeURI(cleanFrom)}`;
+      const itemRes = await this.fetchWithAuth(itemUrl, token);
+      if (!itemRes.ok) {
+        return { success: false, error: `Origem não encontrada: ${cleanFrom}` };
+      }
+      const itemData = (await itemRes.json()) as { id: string };
+
+      // 2. Extrair diretório de destino e novo nome
+      const lastSlash = cleanTo.lastIndexOf('/');
+      const destFolder = lastSlash >= 0 ? cleanTo.slice(0, lastSlash) : '';
+      const newName = lastSlash >= 0 ? cleanTo.slice(lastSlash + 1) : cleanTo;
+
+      let parentReference: any = undefined;
+      if (destFolder) {
+        // Obter ou criar pasta de destino
+        const folderUrl = `${GRAPH_BASE}/${driveBase}/root:/${encodeURI(destFolder)}`;
+        const folderRes = await this.fetchWithAuth(folderUrl, token);
+        if (folderRes.ok) {
+          const folderData = (await folderRes.json()) as { id: string };
+          parentReference = { id: folderData.id };
+        }
+      }
+
+      // 3. Mover/renomear item no Graph
+      const patchUrl = `${GRAPH_BASE}/${driveBase}/items/${itemData.id}`;
+      const patchRes = await this.fetchWithAuth(patchUrl, token, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          ...(parentReference ? { parentReference } : {}),
+          name: newName,
+        }),
+      });
+
+      if (!patchRes.ok) {
+        const errBody = await patchRes.text().catch(() => '');
+        return { success: false, error: errBody };
+      }
+
+      this.logger.log(`[moveOneDriveFile] Movido com sucesso no OneDrive de ${cleanFrom} para ${cleanTo}`);
+      return { success: true };
+    } catch (err) {
+      this.logger.warn(`[moveOneDriveFile] Erro ao mover ficheiro no OneDrive: ${(err as Error).message}`);
+      return { success: false, error: (err as Error).message };
+    }
+  }
+
+  /**
    * Recursively unpacks message attachments.
    * If an attachment is an itemAttachment (#microsoft.graph.itemAttachment / message/rfc822),
    * it fetches the item with attachments expanded and recurses, preserving original provenance.
@@ -878,8 +980,13 @@ export class OutlookService {
       return this.cachedDriveBasePath;
     }
 
-    if (process.env.ONEDRIVE_USER) {
-      this.cachedDriveBasePath = `users/${encodeURIComponent(process.env.ONEDRIVE_USER)}/drive`;
+    const reginaUpn = process.env.ONEDRIVE_REGINA_UPN || process.env.ONEDRIVE_USER;
+    if (reginaUpn) {
+      this.cachedDriveBasePath = `users/${encodeURIComponent(reginaUpn)}/drive`;
+      return this.cachedDriveBasePath;
+    }
+    if (process.env.ONEDRIVE_DRIVE_ID) {
+      this.cachedDriveBasePath = `drives/${encodeURIComponent(process.env.ONEDRIVE_DRIVE_ID)}`;
       return this.cachedDriveBasePath;
     }
 

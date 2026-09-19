@@ -9,7 +9,9 @@ import { ImageToPdfService } from './image-to-pdf/image-to-pdf.service';
 import { ArchiveImageService } from './image-to-pdf/archive-image.service';
 import { OcrmypdfService } from '../extraction/ocrmypdf.service';
 import { ImageEnhancerService } from '../extraction/image-enhancer.service';
+import { DocumentImagePipelineService } from './image-pipeline/document-image-pipeline.service';
 import { NifLookupModule } from '../nif-lookup/nif-lookup.module';
+import { EmailInboundModule } from '../email-inbound/email-inbound.module';
 
 /**
  * DocumentsModule — inbox + folder-rules + storage.
@@ -37,6 +39,7 @@ import { NifLookupModule } from '../nif-lookup/nif-lookup.module';
   imports: [
     StorageModule,
     forwardRef(() => ExtractionModule),
+    forwardRef(() => EmailInboundModule),
     // Sprint 1.C — supplier re-extract enriches with the
     // Portal das Finanças base when the AI left fields at
     // low confidence. The import is forward-safe: NifLookupModule
@@ -44,7 +47,7 @@ import { NifLookupModule } from '../nif-lookup/nif-lookup.module';
     NifLookupModule,
   ],
   controllers: [DocumentsController, SupplierController],
-  providers: [DocumentsService, FolderRulesEngine, ImageToPdfService, ArchiveImageService, OcrmypdfService, ImageEnhancerService],
-  exports: [DocumentsService, FolderRulesEngine, ImageToPdfService, ArchiveImageService, OcrmypdfService, ImageEnhancerService],
+  providers: [DocumentsService, FolderRulesEngine, ImageToPdfService, ArchiveImageService, OcrmypdfService, ImageEnhancerService, DocumentImagePipelineService],
+  exports: [DocumentsService, FolderRulesEngine, ImageToPdfService, ArchiveImageService, OcrmypdfService, ImageEnhancerService, DocumentImagePipelineService],
 })
 export class DocumentsModule {}

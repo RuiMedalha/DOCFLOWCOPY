@@ -365,6 +365,10 @@ export class AiManagementService {
   getAvailableModels(): AiModelInfo[] {
     const map = new Map<string, AiModelInfo>();
     for (const m of BUILTIN_MODELS) {
+      // P3: Faturista só aparece se FATURISTA_URL estiver definida
+      if (m.provider === 'faturista' && !this.faturista.isAvailable) {
+        continue;
+      }
       map.set(m.id, m);
     }
     for (const m of this.cachedOpenRouterModels) {

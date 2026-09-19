@@ -361,6 +361,27 @@ arranca com OK explícito, e preciso de saber quais os bancos usados
 
 ---
 
+## Fase 4.6 — PDF como documento principal, recorte de perspetiva, arquivo nas pastas reais, Faturista — 2026-09-19
+
+- **P0.1 (PDF por defeito em todo o lado):** Atualizado `preferredFormat` com default em `pdf` nas rotas de download e URLs assinadas (`DocumentsService.getFileUrl`, `DocumentsController.getFileUrl`, `DocumentsController.download`). Se `pdfKey` existir, o sistema assina e serve o PDF A4 gerado com `mimeType: application/pdf` e extensão `.pdf`; só serve o `fileKey` original se solicitado explicitamente `?format=original`. Visualizador do detalhe abre sempre o PDF diretamente.
+- **P0.2 (Ingestão multicanal gera PDF oficial):** Criado serviço unificado `DocumentImagePipelineService` consumido tanto pelo upload manual (`DocumentsService.upload`) como pela ingestão multicanal (`InboundService.createFromInbound` para email, scanner, whatsapp, OneDrive). Documentos de imagem recebidos por qualquer canal passam pela mesma cadeia completa (normalização HEIC, rotação EXIF, recorte de perspetiva, geração de PDF A4 vertical oficial e armazenamento de `fileKey` e `pdfKey`).
+- **P0.3 (Recorte de perspetiva inteligente):** Criado motor matemático `perspective-crop.ts` com deteção dos 4 cantos de quadrilátero de papel e projeção inversa de homografia 3x3 com interpolação bilinear. Integrado em `ImageEnhancerService.processDocumentImageWithDetails`. Salvaguarda de segurança: se a deteção tiver confiança < 0.65 ou fundo confuso, mantém a imagem original intacta para não arriscar cortar texto. Telemetria gravada em `metadata.perspective` (applied, confidence, corners).
+- **P1 (Arquivo na estrutura real da empresa — Regina / OneDrive):** Criado `buildEnterpriseFilingPath` e `resolveEnterpriseFolder` em `path-builder.ts` mapeando para a hierarquia oficial:
+  - Ao aprovar compra: `FORNECEDORES/FATURAS A PAGAR/<FORNECEDOR>/<FILENAME>.pdf`
+  - Ao pagar (manual ou conciliação): move para `FORNECEDORES/COMPRAS/<FORNECEDOR>/<ANO>/<FILENAME>.pdf` no MinIO e no espelho do OneDrive (`PaymentsService.relocatePaidDocumentToPurchases` e `OutlookService.mirrorFileToOneDrive` / `moveOneDriveFile`).
+  - Nome normalizado: `FT_<nº>_<FORNECEDOR>_<valor>EUR_<vencimento:AAAA-MM-DD>.pdf`.
+  - Resolução do OneDrive pessoal da Regina via `ONEDRIVE_REGINA_UPN` / `ONEDRIVE_USER` (`users/{upn}/drive`).
+- **P2 (Categorias e naturezas alinhadas):** Adicionadas categorias em `categories.service.ts`: `Seguros — Saúde`, `Seguros — Trabalho`, `Seguros — Vida`, `Seguros — Imóveis`, `Seguros — Viaturas`, `Remunerações / Funcionários`, `Pagamentos ao Estado / Impostos`, `Donativos`. Auto-classificação após 3 aprovações mantida e testada.
+- **P3 (Faturista Provider):**
+  - `faturista.provider.ts` configurado para aceitar `FATURISTA_URL` ou `FATURISTA_API_URL`.
+  - Seletor de modelos de IA omite o Faturista quando `FATURISTA_URL` não estiver definida.
+  - Encadeamento inteligente no `VisionService.analyze`: faturas identificadas como portuguesas tentam primeiro o Faturista (se ativo); em caso de baixa confiança (< 0.70) ou falta de campos obrigatórios, cai suavemente para o provider generalista (OpenRouter/Gemini/MiniMax).
+  - **AVISO CRÍTICO DE INFRAESTRUTURA (VPS):** O container do Faturista NÃO deve ser iniciado no VPS de produção sem confirmação prévia do Rui. O servidor partilha 11 GB de RAM com ~50 containers (incluindo Supabase). 4 GB residentes de modelo local podem despoletar o Linux OOM-killer e derrubar serviços críticos.
+
+Testes: 34 suites e 370+ testes unitários verdes (documents, extraction, inbound, payments, ai). Build api ✅.
+
+---
+
 ## Próxima fase
 
 **Fase 5 — Conciliação bancária (CSV)** — NÃO iniciar sem OK do Rui. Precisa de: bancos usados pela HotelEquip (para os templates CSV) e um extrato real de um mês.

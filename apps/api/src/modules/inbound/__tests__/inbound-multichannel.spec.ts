@@ -171,6 +171,45 @@ describe('InboundService — Multichannel, WhatsApp Evolution API & Deduplicatio
         }),
       );
     });
+
+    it('generates pdfKey for image files ingested via inbound pipeline (P0.2)', async () => {
+      const pipelineMock = {
+        processAndStore: jest.fn().mockResolvedValue({
+          fileKey: '_inbox/tenant-demo/2026/09/photo.jpg',
+          fileHash: 'dummy-hash',
+          fileName: 'email_photo.jpg',
+          mimeType: 'image/jpeg',
+          fileSize: 1024,
+          pdfKey: '_inbox/tenant-demo/2026/09/photo.pdf',
+        }),
+      };
+
+      const serviceWithPipeline = new InboundService(
+        prismaMock as any,
+        storageMock as any,
+        null,
+        pipelineMock as any,
+      );
+
+      const file = {
+        buffer: Buffer.from('jpg-bytes'),
+        originalname: 'email_photo.jpg',
+        mimetype: 'image/jpeg',
+        size: 1024,
+      } as unknown as Express.Multer.File;
+
+      await serviceWithPipeline.ingestDirectUpload('tenant-demo', [file], DocumentOrigin.EMAIL, {});
+
+      expect(pipelineMock.processAndStore).toHaveBeenCalled();
+      expect(prismaMock.document.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            origin: DocumentOrigin.EMAIL,
+            pdfKey: '_inbox/tenant-demo/2026/09/photo.pdf',
+          }),
+        }),
+      );
+    });
   });
 
   describe('Inbound Status', () => {

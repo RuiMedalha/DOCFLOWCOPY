@@ -31,6 +31,14 @@ const SEED_CATEGORIES: Array<{
   { name: 'Serviços / FSE',    slug: 'servicos-fse',      color: '#6366F1', nature: 'SERVICOS_EXTERNOS', defaultIvaDeductibilityPct: 100 },
   { name: 'Comunicações',      slug: 'comunicacoes',      color: '#14B8A6', nature: 'SERVICOS_EXTERNOS', defaultIvaDeductibilityPct: 100 },
   { name: 'Rendas',            slug: 'rendas',            color: '#A855F7', nature: 'SERVICOS_EXTERNOS', defaultIvaDeductibilityPct: 100 },
+  { name: 'Seguros — Saúde',   slug: 'seguros-saude',     color: '#EC4899', nature: 'SERVICOS_EXTERNOS', defaultIvaDeductibilityPct: 0 },
+  { name: 'Seguros — Trabalho', slug: 'seguros-trabalho', color: '#F43F5E', nature: 'SERVICOS_EXTERNOS', defaultIvaDeductibilityPct: 100 },
+  { name: 'Seguros — Vida',    slug: 'seguros-vida',      color: '#FB7185', nature: 'SERVICOS_EXTERNOS', defaultIvaDeductibilityPct: 0 },
+  { name: 'Seguros — Imóveis', slug: 'seguros-imoveis',   color: '#E11D48', nature: 'SERVICOS_EXTERNOS', defaultIvaDeductibilityPct: 100 },
+  { name: 'Seguros — Viaturas', slug: 'seguros-viaturas', color: '#BE123C', nature: 'SERVICOS_EXTERNOS', defaultIvaDeductibilityPct: 100 },
+  { name: 'Remunerações / Funcionários', slug: 'funcionarios-remuneracoes', color: '#10B981', nature: 'DESPESA_OPERACIONAL', defaultIvaDeductibilityPct: 0 },
+  { name: 'Pagamentos ao Estado / Impostos', slug: 'pagamentos-estado', color: '#6366F1', nature: 'DESPESA_OPERACIONAL', defaultIvaDeductibilityPct: 0 },
+  { name: 'Donativos',         slug: 'donativos',         color: '#8B5CF6', nature: 'DESPESA_OPERACIONAL', defaultIvaDeductibilityPct: 0 },
   { name: 'Outras',            slug: 'outras',            color: '#64748B', nature: 'DESPESA_OPERACIONAL', defaultIvaDeductibilityPct: 100 },
 ];
 

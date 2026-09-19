@@ -17,6 +17,8 @@ export interface StandardFileNameInput {
   supplier?: string | null;
   docNumber?: string | null;
   docDate?: Date | string | null;
+  dueDate?: Date | string | null;
+  amount?: number | string | null;
   extension?: string | null;
 }
 
@@ -114,8 +116,17 @@ export function generateStandardFileName(input: StandardFileNameInput): string {
   const sigla = mapDocTypeToSigla(input.type);
   const fornecedor = sanitizeSupplierForFileName(input.supplier);
   const numero = sanitizeDocNumberForFileName(input.docNumber);
-  const data = formatDateForFileName(input.docDate);
   const ext = (input.extension ?? 'pdf').replace(/^\.+/, '').toLowerCase() || 'pdf';
 
+  // Convenção oficial da empresa (Fase 4.6 P1):
+  // FT_<nº>_<FORNECEDOR>_<valor>EUR_<vencimento:AAAA-MM-DD>.pdf
+  if (input.amount !== undefined && input.amount !== null && input.dueDate) {
+    const valorNum = typeof input.amount === 'number' ? input.amount : parseFloat(String(input.amount));
+    const valorFormatted = !isNaN(valorNum) ? valorNum.toFixed(2) : '0.00';
+    const vencimento = formatDateForFileName(input.dueDate);
+    return `${sigla}_${numero}_${fornecedor}_${valorFormatted}EUR_${vencimento}.${ext}`;
+  }
+
+  const data = formatDateForFileName(input.docDate);
   return `${sigla}_${fornecedor}_${numero}_${data}.${ext}`;
 }

@@ -525,13 +525,15 @@ export class DocumentsController {
   @ApiOperation({
     summary: 'Get a URL the client can use to fetch the file',
     description:
-      'Local driver returns the controller download route. S3/MinIO driver returns a presigned URL with TTL.',
+      'Local driver returns the controller download route. S3/MinIO driver returns a presigned URL with TTL. Defaults to PDF when available; pass ?format=original for the raw uploaded bytes.',
   })
+  @ApiQuery({ name: 'format', required: false, enum: ['pdf', 'original'] })
   getFileUrl(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id') id: string,
+    @Query('format') format?: 'pdf' | 'original',
   ) {
-    return this.documents.getFileUrl(user.tenantId, id);
+    return this.documents.getFileUrl(user.tenantId, id, format ?? 'pdf');
   }
 
   // ────────────────────────────────────── iban-history ───────────────────

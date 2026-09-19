@@ -577,6 +577,26 @@ export class VisionService {
       return null;
     }
 
+    // Fase 4.6 (P3): Encadeamento Faturista para faturas portuguesas com fallback suave para generalista
+    if (this.faturista?.isAvailable && this.isLikelyPortugueseInvoice(request)) {
+      try {
+        const faturistaResult = await this.faturista.extract(request);
+        if (faturistaResult && isUsableForFallback(faturistaResult) && faturistaResult.confidence >= 0.70) {
+          this.logger.log(
+            `[vision.analyze] Faturista especializado PT processou com sucesso: conf=${faturistaResult.confidence.toFixed(2)}`,
+          );
+          return faturistaResult;
+        }
+        this.logger.log(
+          '[vision.analyze] Faturista com confiança baixa ou campos insuficientes — caindo para provider generalista',
+        );
+      } catch (faturistaErr) {
+        this.logger.warn(
+          `[vision.analyze] Faturista falhou: ${(faturistaErr as Error).message} — caindo para provider generalista`,
+        );
+      }
+    }
+
     const timeoutMs = request.timeoutMs ?? 30_000;
     const started = Date.now();
 
@@ -721,6 +741,22 @@ export class VisionService {
         `Returning null so caller marks needs_review.`,
     );
     return null;
+  }
+
+  /**
+   * Deteta se o documento apresenta fortes sinais fiscais portugueses
+   * (ATCUD, formato de QR-AT, NIF PT de 9 dígitos ou terminologia fiscal PT).
+   */
+  private isLikelyPortugueseInvoice(request: VisionAnalysisRequest): boolean {
+    const text = (request.text ?? '').toLowerCase();
+    const name = (request.fileName ?? '').toLowerCase();
+
+    if (text.includes('atcud') || /\b[a-z0-9]+-[0-9]+\b/i.test(text)) return true;
+    if (/a:\d{9}\*b:/i.test(text)) return true;
+    if (/(fatura|fatura-recibo|recibo|nota de crédito|contribuinte|iva)/i.test(text)) return true;
+    if (/(\bpt\d{9}\b|\b\d{9}\b)/i.test(text) && /(iva|total|retencao|continente|madeira|acores)/i.test(text)) return true;
+    if (name.includes('pt') || name.includes('fatura') || name.includes('recibo')) return true;
+    return false;
   }
 
   /**

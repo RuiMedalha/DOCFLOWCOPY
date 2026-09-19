@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import sharp from 'sharp';
+import { cropPerspectiveIfConfident, PerspectiveCropResult } from './perspective-crop';
 
 export interface ImageEnhanceOptions {
   autoRotate?: boolean;
@@ -11,12 +12,18 @@ export interface ImageEnhanceOptions {
 
 export interface ProcessDocumentImageOptions {
   autoRotate?: boolean;
+  perspectiveCrop?: boolean;
   forcePortrait?: boolean;
   trim?: boolean;
   normalizeContrast?: boolean;
   sharpen?: boolean;
   quality?: number;
   maxDimension?: number;
+}
+
+export interface ProcessDocumentImageResult {
+  buffer: Buffer;
+  perspective: PerspectiveCropResult;
 }
 
 export interface VisionPreparationResult {
@@ -69,6 +76,7 @@ export class ImageEnhancerService {
   ): Promise<Buffer> {
     const {
       autoRotate = true,
+      perspectiveCrop = true,
       forcePortrait = true,
       trim = true,
       normalizeContrast = true,
@@ -86,9 +94,18 @@ export class ImageEnhancerService {
       }
 
       let intermediate = await pipeline.toBuffer();
+
+      // 2. Deteção dos 4 cantos e correção de perspetiva (Fase 4.6 P0.3)
+      if (perspectiveCrop) {
+        const perspectiveRes = await cropPerspectiveIfConfident(intermediate, mime, 0.65);
+        if (perspectiveRes.applied) {
+          intermediate = Buffer.from(perspectiveRes.buffer);
+        }
+      }
+
       let meta = await sharp(intermediate).metadata();
 
-      // 2. Deteção inteligente de limites de papel e recorte (trim de mesa / fundo de suporte)
+      // 3. Deteção de limites de papel e recorte se ainda houver borda retangular (trim complementar)
       if (trim && meta.width && meta.height) {
         const cropBounds = await this.detectPaperCropBounds(intermediate, meta.width, meta.height);
         if (cropBounds) {
@@ -152,6 +169,49 @@ export class ImageEnhancerService {
       );
       return buffer;
     }
+  }
+
+  /**
+   * Versão com detalhes de telemetria de perspetiva para gravação em metadata do documento.
+   */
+  async processDocumentImageWithDetails(
+    buffer: Buffer,
+    mime: string,
+    options: ProcessDocumentImageOptions = {},
+  ): Promise<ProcessDocumentImageResult> {
+    let perspectiveRes: PerspectiveCropResult = {
+      buffer,
+      applied: false,
+      confidence: 0,
+      reason: 'not_attempted',
+    };
+
+    const { autoRotate = true, perspectiveCrop = true, ...rest } = options;
+
+    let intermediate = buffer;
+    if (autoRotate) {
+      try {
+        intermediate = await sharp(buffer).rotate().toBuffer();
+      } catch {}
+    }
+
+    if (perspectiveCrop && /^image\/(jpeg|jpg|png|webp)/i.test(mime)) {
+      perspectiveRes = await cropPerspectiveIfConfident(intermediate, mime, 0.65);
+      if (perspectiveRes.applied) {
+        intermediate = Buffer.from(perspectiveRes.buffer);
+      }
+    }
+
+    const finalBuffer = await this.processDocumentImage(intermediate, mime, {
+      ...rest,
+      autoRotate: false,
+      perspectiveCrop: false,
+    });
+
+    return {
+      buffer: finalBuffer,
+      perspective: perspectiveRes,
+    };
   }
 
   /**

@@ -152,7 +152,7 @@ describe('DocumentsController.download — double-send regression', () => {
     const ctrl = new DocumentsController(svc as unknown as DocumentsService);
     const res = buildResponseMock();
 
-    await ctrl.download(USER, 'doc-1', undefined, res);
+    await ctrl.download(USER, 'doc-1', undefined, undefined, res);
 
     expect(svc.getFileBuffer).toHaveBeenCalledTimes(1);
     expect(svc.getFileBuffer).toHaveBeenCalledWith('tenant-1', 'doc-1', 'pdf');
@@ -172,7 +172,7 @@ describe('DocumentsController.download — double-send regression', () => {
     const res = buildResponseMock();
 
     await expect(
-      ctrl.download(USER, 'doc-other-tenant', undefined, res),
+      ctrl.download(USER, 'doc-other-tenant', undefined, undefined, res),
     ).rejects.toBeInstanceOf(NotFoundException);
     // The controller must NOT have written anything — NotFoundException
     // bubbles to the global filter, which is the only component
@@ -198,7 +198,7 @@ describe('DocumentsController.download — double-send regression', () => {
     (res as any).__finish();
 
     await expect(
-      ctrl.download(USER, 'doc-1', undefined, res),
+      ctrl.download(USER, 'doc-1', undefined, undefined, res),
     ).resolves.toBeUndefined();
     expect((res as any).__stats().endCount).toBe(0);
     expect((res as any).__stats().setCount).toBe(0);
@@ -214,9 +214,39 @@ describe('DocumentsController.download — double-send regression', () => {
     const ctrl = new DocumentsController(svc as unknown as DocumentsService);
     const res = buildResponseMock();
 
-    await ctrl.download(USER, 'doc-1', 'original', res);
+    await ctrl.download(USER, 'doc-1', undefined, 'original', res);
 
     expect(svc.getFileBuffer).toHaveBeenCalledWith('tenant-1', 'doc-1', 'original');
     expect((res as any).__stats().endCount).toBe(1);
+  });
+
+  it('DocumentsController.getFileUrl defaults to pdf format when not specified', async () => {
+    const svc = buildServiceStub();
+    svc.getFileUrl.mockResolvedValueOnce({
+      url: 'https://minio/pdf-key.pdf',
+      fileName: 'fatura.pdf',
+      mimeType: 'application/pdf',
+    });
+    const ctrl = new DocumentsController(svc as unknown as DocumentsService);
+
+    const result = await ctrl.getFileUrl(USER, 'doc-1', undefined);
+
+    expect(svc.getFileUrl).toHaveBeenCalledWith('tenant-1', 'doc-1', 'pdf');
+    expect(result.mimeType).toBe('application/pdf');
+  });
+
+  it('DocumentsController.getFileUrl forwards original format when requested', async () => {
+    const svc = buildServiceStub();
+    svc.getFileUrl.mockResolvedValueOnce({
+      url: 'https://minio/photo.jpg',
+      fileName: 'photo.jpg',
+      mimeType: 'image/jpeg',
+    });
+    const ctrl = new DocumentsController(svc as unknown as DocumentsService);
+
+    const result = await ctrl.getFileUrl(USER, 'doc-1', 'original');
+
+    expect(svc.getFileUrl).toHaveBeenCalledWith('tenant-1', 'doc-1', 'original');
+    expect(result.mimeType).toBe('image/jpeg');
   });
 });

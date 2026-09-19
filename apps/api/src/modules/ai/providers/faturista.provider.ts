@@ -20,13 +20,14 @@ export class FaturistaProvider {
   private readonly apiKey: string | null;
 
   constructor(config: ConfigService) {
-    this.enabled = config.get<string>('FATURISTA_ENABLED') === 'true';
-    this.apiUrl = config.get<string>('FATURISTA_API_URL') || null;
+    this.apiUrl = config.get<string>('FATURISTA_URL') || config.get<string>('FATURISTA_API_URL') || null;
+    const explicitlyDisabled = config.get<string>('FATURISTA_ENABLED') === 'false';
+    this.enabled = Boolean(this.apiUrl) && !explicitlyDisabled;
     this.apiKey = config.get<string>('FATURISTA_API_KEY') || null;
   }
 
   get isAvailable(): boolean {
-    return this.enabled && Boolean(this.apiUrl);
+    return this.enabled && Boolean(this.apiUrl && this.apiUrl.trim().length > 0);
   }
 
   async testConnection(): Promise<{ success: boolean; message: string; latencyMs: number }> {

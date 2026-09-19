@@ -6,6 +6,7 @@ import {
   Logger,
   NotFoundException,
   Optional,
+  forwardRef,
 } from '@nestjs/common';
 import {
   AuditAction,
@@ -63,6 +64,8 @@ import {
 } from './folder-rules/folder-rules.types';
 import { StorageService } from './storage/storage-service.interface';
 import { buildDocumentPath } from './storage/path-builder';
+import { DocumentImagePipelineService } from './image-pipeline/document-image-pipeline.service';
+import { OutlookService } from '../email-inbound/outlook.service';
 import { slugify } from '../../common/storage/slug';
 import { docLockKey } from '../../common/locks';
 import {
@@ -162,6 +165,8 @@ export class DocumentsService {
     @Inject(QUEUE_ADAPTER) private readonly queue: QueueAdapter,
     @Optional() private readonly ocrmypdf?: OcrmypdfService,
     @Optional() private readonly imageEnhancer?: ImageEnhancerService,
+    @Optional() private readonly pipeline?: DocumentImagePipelineService,
+    @Optional() @Inject(forwardRef(() => OutlookService)) private readonly outlook?: OutlookService,
   ) {
     if (!extraction) {
       this.logger.error(
@@ -251,76 +256,49 @@ export class DocumentsService {
       });
     }
 
-    // Key shape: _inbox/<tenantId>/<yyyy>/<mm>/<random>.<ext>
-    // Every upload lands in `_inbox/`; `relocateAfterApprove()` moves the
-    // bytes into the deterministic party/category folder once the row is
-    // approved. Year/month groups keep the inbox listings manageable at scale.
     const now = new Date();
-    const fileKey = this.buildStorageKey(tenantId, file.originalname, now);
-
-    // Persist the ORIGINAL file FIRST. The Document row references this
-    // key, so a write failure here aborts the upload — never let a
-    // Document exist without its original file on disk.
-    await this.storage.put(fileKey, file.buffer, { contentType: file.mimetype });
-
-    // Image uploads also get a single-page PDF derivative so the UI /
-    // download route can serve a PDF the user can preview without
-    // needing the original photo viewer. pdfKey is null for PDFs (no
-    // point double-storing the same bytes). Best-effort: if the PDF
-    // builder fails (rare — pdf-lib is pure JS), we log and continue
-    // with just the original.
+    let fileKey: string;
     let pdfKey: string | null = null;
-    if (this.imageToPdf.supports(file.mimetype)) {
-      try {
-        pdfKey = this.buildPdfKeyFromImageKey(fileKey);
-        // Fase 4.2 (P1.5) — a fotografia continuava a aparecer deitada
-        // no detalhe. A correção completa (pelo conteúdo, sem EXIF) só
-        // corria mais tarde, dentro da extração — havia uma janela em
-        // que o PDF de arquivo já existia mas ainda deitado (mostrado
-        // no visualizador até a extração terminar), e este caminho de
-        // upload é o mesmo para TODAS as origens (web, câmara, scanner,
-        // email, WhatsApp — todas passam por este `create()`). A
-        // correção por EXIF é imediata e cobre a maioria das fotos de
-        // telemóvel; a correção pelo conteúdo (fotos sem EXIF) continua
-        // a correr na extração, que também usa esta mesma orientação.
-        let oriented = file.buffer;
-        let enhancedMime = file.mimetype;
-        let finalFileSize = file.size;
-
-        if (this.imageEnhancer && this.imageEnhancer.isAvailable()) {
-          oriented = await this.imageEnhancer.processDocumentImage(file.buffer, file.mimetype);
-          enhancedMime = 'image/jpeg';
-        } else {
-          oriented = await autoOrientImage(file.buffer, file.mimetype, this.logger);
-        }
-
-        if (oriented !== file.buffer) {
-          await this.storage.put(fileKey, oriented, { contentType: enhancedMime });
-          finalFileSize = oriented.length;
-        }
-
-        // Converte para PDF A4 vertical oficial (art. 52.º CIVA)
-        const pdfBuffer = await this.imageToPdf.convert(oriented, enhancedMime);
-        await this.storage.put(pdfKey, pdfBuffer, { contentType: 'application/pdf' });
-        if (pdfBuffer && pdfBuffer.length) {
-          finalFileSize = pdfBuffer.length;
-        }
-      } catch (err) {
-        // DO NOT block the upload — the original image is already on
-        // disk and we can re-derive the PDF later (e.g. on-demand
-        // download) without losing the user's invoice.
-        this.logger.warn(
-          `[upload] PDF derivative failed for tenant=${tenantId} ` +
-            `key=${fileKey}: ${(err as Error).message}`,
-        );
-        pdfKey = null;
-      }
-    }
-
+    let storedMime = file.mimetype;
     let finalFileSizeToStore = file.size;
-    if (pdfKey && this.imageToPdf.supports(file.mimetype)) {
-      // Se foi gerado PDF derivado optimizado, reflecte o tamanho real optimizado
-      finalFileSizeToStore = Math.min(file.size, 650 * 1024);
+    let perspectiveTelemetry: any = null;
+
+    if (this.pipeline) {
+      // Fase 4.6 (P0.2 / P0.3): Cadeia unificada de ingestão (orientação + perspetiva + PDF A4)
+      const stored = await this.pipeline.processAndStore(tenantId, file, '_inbox');
+      fileKey = stored.fileKey;
+      pdfKey = stored.pdfKey;
+      storedMime = stored.mimeType;
+      finalFileSizeToStore = stored.fileSize;
+      perspectiveTelemetry = stored.perspective;
+    } else {
+      fileKey = this.buildStorageKey(tenantId, file.originalname, now);
+      await this.storage.put(fileKey, file.buffer, { contentType: file.mimetype });
+
+      if (this.imageToPdf.supports(file.mimetype)) {
+        try {
+          pdfKey = this.buildPdfKeyFromImageKey(fileKey);
+          let oriented = file.buffer;
+          let enhancedMime = file.mimetype;
+          if (this.imageEnhancer && this.imageEnhancer.isAvailable()) {
+            oriented = await this.imageEnhancer.processDocumentImage(file.buffer, file.mimetype);
+            enhancedMime = 'image/jpeg';
+          } else {
+            oriented = await autoOrientImage(file.buffer, file.mimetype, this.logger);
+          }
+          if (oriented !== file.buffer) {
+            await this.storage.put(fileKey, oriented, { contentType: enhancedMime });
+          }
+          const pdfBuffer = await this.imageToPdf.convert(oriented, enhancedMime);
+          await this.storage.put(pdfKey, pdfBuffer, { contentType: 'application/pdf' });
+        } catch (err) {
+          this.logger.warn(`[upload] PDF derivative failed: ${(err as Error).message}`);
+          pdfKey = null;
+        }
+      }
+      if (pdfKey && this.imageToPdf.supports(file.mimetype)) {
+        finalFileSizeToStore = Math.min(file.size, 650 * 1024);
+      }
     }
 
     // First-pass folder suggestion: the upload only knows the (optional)
@@ -366,6 +344,7 @@ export class DocumentsService {
           // for audit/traceability.
           metadata: {
             originalFilename: file.originalname,
+            ...(perspectiveTelemetry ? { perspective: perspectiveTelemetry } : {}),
           } as Prisma.InputJsonValue,
         },
       });
@@ -1345,16 +1324,28 @@ export class DocumentsService {
   }
 
   /** Signed URL helper (currently returns the local route — S3 driver returns presigned). */
-  async getFileUrl(tenantId: string, id: string) {
+  async getFileUrl(tenantId: string, id: string, preferredFormat: 'pdf' | 'original' = 'pdf') {
     const doc = await this.prisma.document.findFirst({
       where: { id, tenantId },
       select: { id: true, fileName: true, mimeType: true, fileKey: true, pdfKey: true },
     });
     if (!doc) throw new NotFoundException('Document not found');
-    const cleanName = encodeURIComponent(this.sanitizeFilename(doc.fileName));
-    const signedUrl = await this.storage.getSignedUrl(doc.fileKey, 300);
-    const url = signedUrl || `/api/v1/documents/${doc.id}/download/${cleanName}`;
-    return { url, fileName: doc.fileName, mimeType: doc.mimeType };
+
+    let targetKey = doc.fileKey;
+    let servedMime = doc.mimeType;
+    let servedName = doc.fileName;
+
+    if (preferredFormat !== 'original' && doc.pdfKey) {
+      targetKey = doc.pdfKey;
+      servedMime = 'application/pdf';
+      const base = doc.fileName.replace(/\.[^.]+$/, '');
+      servedName = `${base}.pdf`;
+    }
+
+    const cleanName = encodeURIComponent(this.sanitizeFilename(servedName));
+    const signedUrl = await this.storage.getSignedUrl(targetKey, 300);
+    const url = signedUrl || `/api/v1/documents/${doc.id}/download/${cleanName}?format=${preferredFormat}`;
+    return { url, fileName: servedName, mimeType: servedMime };
   }
 
   // ─────────────────────────────────────────── soft delete ──────────────
@@ -1643,9 +1634,7 @@ export class DocumentsService {
     if (!existing) throw new NotFoundException('Document not found');
 
     if (existing.status === DocumentStatus.APROVADO) {
-      await this.syncPayableForDocument(tenantId, id).catch(() => {});
-      const approved = await this.prisma.document.findFirst({ where: { id, tenantId } });
-      return this.sanitize(approved);
+      return this.sanitize(existing);
     }
     if (
       existing.status !== DocumentStatus.NOVO &&
@@ -1681,8 +1670,6 @@ export class DocumentsService {
       } as Prisma.InputJsonValue,
     });
 
-    await this.syncPayableForDocument(tenantId, id).catch(() => {});
-
     // Sprint E: now that the row is APPROVADO, move the bytes from the
     // `_inbox/` staging path into the deterministic party/category folder.
     // Skip silently when the document has no linked party — operator
@@ -1694,6 +1681,8 @@ export class DocumentsService {
     const statCategoryId = existing.expenseCategoryId ?? (await this.resolveCategoryIdByName(tenantId, filingCategory));
     await this.bumpPartyCategoryStat(tenantId, existing.partyId ?? null, statCategoryId);
     await this.relocateAfterApprove(tenantId, id, userId);
+
+    await this.syncPayableForDocument(tenantId, id).catch(() => {});
 
     return this.sanitize(updated);
   }
@@ -3045,6 +3034,9 @@ export class DocumentsService {
   }
 
   async syncPayableForDocument(tenantId: string, documentId: string): Promise<void> {
+    const client = this.prisma as any;
+    if (!client?.payableItem) return;
+
     const doc = await this.prisma.document.findFirst({
       where: { id: documentId, tenantId },
       select: {
@@ -3207,6 +3199,8 @@ export class DocumentsService {
           fileKey: true,
           pdfKey: true,
           docDate: true,
+          dueDate: true,
+          total: true,
           docNumber: true,
           partyId: true,
           party: {
@@ -3231,12 +3225,14 @@ export class DocumentsService {
       const extension = this.extractExtension(doc.fileKey) || 'pdf';
       const docDateSafe = doc.docDate ?? new Date();
 
-      // Formato de ficheiro padronizado: {TIPO}_{FORNECEDOR}_{NUMERO}_{DATA}.pdf
+      // Formato de ficheiro padronizado: FT_<nº>_<FORNECEDOR>_<valor>EUR_<vencimento>.pdf
       const standardFileName = generateStandardFileName({
         type: doc.type,
         supplier: doc.party.name,
         docNumber: doc.docNumber,
         docDate: docDateSafe,
+        dueDate: doc.dueDate,
+        amount: doc.total ? Number(doc.total) : undefined,
         extension,
       });
 
@@ -3345,6 +3341,19 @@ export class DocumentsService {
         partyCategorySlug: plan.partyCategorySlug,
       } as Prisma.InputJsonValue,
     });
+
+    // Fase 4.6 (P1) — Sincronizar espelho no OneDrive da empresa quando disponível
+    if (this.outlook) {
+      try {
+        const fileToMirror = newPdfKey ?? plan.to;
+        const fileObj = await this.storage.getBuffer(fileToMirror);
+        if (fileObj?.buffer) {
+          await this.outlook.mirrorFileToOneDrive(fileToMirror, fileObj.buffer, 'application/pdf');
+        }
+      } catch (err) {
+        this.logger.warn(`[relocateAfterApprove] Falha ao espelhar no OneDrive: ${(err as Error).message}`);
+      }
+    }
   }
 
   /**

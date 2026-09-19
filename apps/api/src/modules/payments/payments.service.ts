@@ -4,7 +4,12 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
+import { StorageService } from '../documents/storage/storage-service.interface';
+import { OutlookService } from '../email-inbound/outlook.service';
 import { randomUUID } from 'crypto';
 import {
   AuditAction,
@@ -62,6 +67,8 @@ export class PaymentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    @Optional() @Inject(StorageService) private readonly storage?: StorageService,
+    @Optional() @Inject(forwardRef(() => OutlookService)) private readonly outlook?: OutlookService,
   ) {}
 
   async calendarEvents(tenantId: string, from: string, to: string) {
@@ -591,6 +598,11 @@ export class PaymentsService {
         data: { paymentStatus: PaymentStatus.PAID },
       }).catch((err) => {
         this.logger.warn(`Failed updating document status on mark-paid: ${err.message}`);
+      });
+
+      // Fase 4.6 (P1): Ao pagar, mover de FATURAS A PAGAR para COMPRAS/<ANO> no MinIO e no OneDrive
+      await this.relocatePaidDocumentToPurchases(tenantId, existing.documentId).catch((err) => {
+        this.logger.warn(`[markPaid] Falha ao relocalizar documento pago: ${err.message}`);
       });
     }
 
@@ -1339,5 +1351,52 @@ export class PaymentsService {
       amount: Number(event.amount),
       paidAmount: event.paidAmount === null ? null : Number(event.paidAmount),
     };
+  }
+
+  /**
+   * Fase 4.6 (P1): Move o documento pago de FATURAS A PAGAR para COMPRAS/<ANO>
+   * no MinIO / Storage e no espelho do OneDrive.
+   */
+  private async relocatePaidDocumentToPurchases(tenantId: string, documentId: string): Promise<void> {
+    if (!this.storage) return;
+
+    const doc = await this.prisma.document.findFirst({
+      where: { id: documentId, tenantId },
+      select: {
+        id: true,
+        fileKey: true,
+        pdfKey: true,
+        docDate: true,
+        supplier: true,
+        fileName: true,
+      },
+    });
+    if (!doc || !doc.fileKey) return;
+
+    const targetKey = doc.pdfKey ?? doc.fileKey;
+    if (targetKey.includes('FATURAS A PAGAR') || targetKey.includes('FATURAS_A_PAGAR')) {
+      const year = doc.docDate ? doc.docDate.getUTCFullYear() : new Date().getUTCFullYear();
+      const cleanSupplier = (doc.supplier ?? 'Fornecedor').replace(/[^a-zA-Z0-9._ -]/g, '').trim();
+      const filename = doc.fileName;
+
+      const newKey = `FORNECEDORES/COMPRAS/${cleanSupplier}/${year}/${filename}`;
+      try {
+        await this.storage.move(targetKey, newKey);
+        await this.prisma.document.update({
+          where: { id: documentId },
+          data: {
+            fileKey: doc.pdfKey ? doc.fileKey : newKey,
+            pdfKey: doc.pdfKey ? newKey : null,
+          },
+        });
+
+        if (this.outlook) {
+          await this.outlook.moveOneDriveFile(targetKey, newKey).catch(() => undefined);
+        }
+        this.logger.log(`[relocatePaidDocumentToPurchases] Documento ${documentId} movido para compras: ${newKey}`);
+      } catch (err) {
+        this.logger.warn(`[relocatePaidDocumentToPurchases] Falha ao mover ${targetKey} -> ${newKey}: ${(err as Error).message}`);
+      }
+    }
   }
 }

@@ -21,6 +21,7 @@ import { simpleParser } from 'mailparser';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ExtractionService } from '../extraction/extraction.service';
 import { StorageService } from '../documents/storage/storage-service.interface';
+import { DocumentImagePipelineService } from '../documents/image-pipeline/document-image-pipeline.service';
 import type { ImapConfigDto } from './dto/imap-config.dto';
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -58,6 +59,7 @@ class PrismaInboundDocumentsAdapter implements InboundDocumentsPort {
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
+    private readonly pipeline?: DocumentImagePipelineService,
   ) {}
 
   async createFromInbound(input: {
@@ -80,26 +82,47 @@ class PrismaInboundDocumentsAdapter implements InboundDocumentsPort {
       return { id: existing.id, fileName: existing.fileName, isDuplicate: true };
     }
 
-    const safeName = input.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const fileKey = `inbound/${input.tenantId}/${fileHash}-${safeName}`;
-    await this.storage.put(fileKey, input.file.buffer, {
-      contentType: input.file.mimetype,
-    });
+    let fileKey: string;
+    let storedMime = input.file.mimetype;
+    let storedSize = input.file.size;
+    let storedName = input.file.originalname;
+    let pdfKey: string | null = null;
+    let mergedMeta = (input.metadata && typeof input.metadata === 'object') ? { ...(input.metadata as Record<string, any>) } : {};
+
+    if (this.pipeline) {
+      // Fase 4.6 (P0.2/P0.3): Cadeia unificada para imagens multicanal
+      const stored = await this.pipeline.processAndStore(input.tenantId, input.file, '_inbox');
+      fileKey = stored.fileKey;
+      storedMime = stored.mimeType;
+      storedSize = stored.fileSize;
+      storedName = stored.fileName;
+      pdfKey = stored.pdfKey;
+      if (stored.perspective) {
+        mergedMeta.perspective = stored.perspective;
+      }
+    } else {
+      const safeName = input.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+      fileKey = `inbound/${input.tenantId}/${fileHash}-${safeName}`;
+      await this.storage.put(fileKey, input.file.buffer, {
+        contentType: input.file.mimetype,
+      });
+    }
 
     try {
       const doc = await this.prisma.document.create({
         data: {
           tenantId: input.tenantId,
-          fileName: input.file.originalname,
+          fileName: storedName,
           fileKey,
           fileHash,
-          mimeType: input.file.mimetype,
-          fileSize: input.file.size,
+          mimeType: storedMime,
+          fileSize: storedSize,
+          pdfKey,
           origin: input.origin,
           status: DocumentStatus.NOVO,
           processingStatus: DocumentProcessingStatus.RECEIVED,
           processingStartedAt: new Date(),
-          metadata: input.metadata,
+          metadata: Object.keys(mergedMeta).length > 0 ? mergedMeta : input.metadata,
         },
         select: { id: true, fileName: true },
       });
@@ -130,8 +153,11 @@ export class InboundService {
     @Optional()
     @Inject(forwardRef(() => ExtractionService))
     private readonly extraction: ExtractionService | null,
+    @Optional()
+    @Inject(forwardRef(() => DocumentImagePipelineService))
+    private readonly pipeline?: DocumentImagePipelineService,
   ) {
-    this.documents = new PrismaInboundDocumentsAdapter(prisma, storage);
+    this.documents = new PrismaInboundDocumentsAdapter(prisma, storage, pipeline);
   }
 
   async saveImapConfig(tenantId: string, config: ImapConfigDto) {

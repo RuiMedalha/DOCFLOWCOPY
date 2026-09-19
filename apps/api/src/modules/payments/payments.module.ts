@@ -1,4 +1,6 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
+import { StorageModule } from '../documents/storage/storage.module';
+import { EmailInboundModule } from '../email-inbound/email-inbound.module';
 import { PaymentsController } from './payments.controller';
 import { PaymentsService } from './payments.service';
 
@@ -17,6 +19,7 @@ import { PaymentsService } from './payments.service';
  * it without re-implementing the IBAN validation + audit plumbing.
  */
 @Module({
+  imports: [StorageModule, forwardRef(() => EmailInboundModule)],
   controllers: [PaymentsController],
   providers: [PaymentsService],
   exports: [PaymentsService],
