@@ -18,6 +18,13 @@ export interface IngestFileInput {
   size: number;
 }
 
+export interface PerspectiveTelemetry {
+  applied: boolean;
+  confidence: number;
+  corners?: [import('../../extraction/perspective-crop').Point, import('../../extraction/perspective-crop').Point, import('../../extraction/perspective-crop').Point, import('../../extraction/perspective-crop').Point];
+  reason?: string;
+}
+
 export interface IngestFileResult {
   fileKey: string;
   fileHash: string;
@@ -25,7 +32,7 @@ export interface IngestFileResult {
   mimeType: string;
   fileSize: number;
   pdfKey: string | null;
-  perspective?: PerspectiveCropResult;
+  perspective?: PerspectiveTelemetry;
 }
 
 @Injectable()
@@ -85,7 +92,7 @@ export class DocumentImagePipelineService {
     const fileKey = `${basePrefix}/${tenantId}/${yyyy}/${mm}/${Date.now()}-${rand}-${safeName}`;
 
     let pdfKey: string | null = null;
-    let perspectiveResult: PerspectiveCropResult | undefined;
+    let perspectiveResult: PerspectiveTelemetry | undefined;
     let finalStoreSize = currentSize;
 
     // 2. Se for imagem suportada, aplicar pipeline completa de melhoramento + perspetiva + PDF A4
@@ -109,7 +116,14 @@ export class DocumentImagePipelineService {
           );
           orientedBuffer = enhanced.buffer;
           enhancedMime = 'image/jpeg';
-          perspectiveResult = enhanced.perspective;
+          if (enhanced.perspective) {
+            perspectiveResult = {
+              applied: enhanced.perspective.applied,
+              confidence: enhanced.perspective.confidence,
+              corners: enhanced.perspective.corners,
+              reason: enhanced.perspective.reason,
+            };
+          }
         }
 
         // Se a imagem melhorada for diferente, atualizamos os bytes originais a gravar
