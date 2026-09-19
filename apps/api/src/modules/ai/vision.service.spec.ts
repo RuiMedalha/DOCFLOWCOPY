@@ -34,7 +34,7 @@ describe("VisionService — provider routing", () => {
     expect(result).toBeNull();
   });
 
-  it("detects OPENROUTER_API_KEY as a fallback (only used when MiniMax is unavailable)", () => {
+  it("detects OPENROUTER_API_KEY as the PRIMARY vision provider (Gemini via OpenRouter)", () => {
     const svc = new VisionService(
       makeConfig({ OPENROUTER_API_KEY: "sk-or" }),
     );
@@ -43,7 +43,7 @@ describe("VisionService — provider routing", () => {
     expect(svc.hasOpenrouter).toBe(true);
   });
 
-  it("detects MINIMAX_API_KEY as the PRIMARY vision provider", () => {
+  it("detects MINIMAX_API_KEY (third in the Fase 2 auto order)", () => {
     const svc = new VisionService(
       makeConfig({ MINIMAX_API_KEY: "sk-cp-minimax" }),
     );
@@ -52,7 +52,7 @@ describe("VisionService — provider routing", () => {
     expect(svc.hasMinimax).toBe(true);
   });
 
-  it("detects GEMINI_API_KEY as a last-resort fallback (only used when MiniMax + OpenRouter are unavailable)", () => {
+  it("detects GEMINI_API_KEY (direct Google gateway) as an optional provider", () => {
     const svc = new VisionService(
       makeConfig({ GEMINI_API_KEY: "gem-key" }),
     );
@@ -60,11 +60,42 @@ describe("VisionService — provider routing", () => {
     expect(svc.resolveProvider()).toBe("gemini");
   });
 
-  it("prefers MiniMax over OpenRouter in auto routing (per 2026-09-01 user decision)", () => {
+  it("prefers OpenRouter over MiniMax in auto routing (order: openrouter > gemini > minimax)", () => {
     const svc = new VisionService(
       makeConfig({ MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
     );
-    expect(svc.resolveProvider()).toBe("minimax");
+    expect(svc.resolveProvider()).toBe("openrouter");
+  });
+
+  it("prefers OpenRouter over a direct Gemini key when both exist (Gemini é acedido via OpenRouter)", () => {
+    const svc = new VisionService(
+      makeConfig({ GEMINI_API_KEY: "gem", OPENROUTER_API_KEY: "sk-or", MINIMAX_API_KEY: "sk-cp" }),
+    );
+    expect(svc.resolveProvider()).toBe("openrouter");
+  });
+
+  it("honours VISION_PROVIDER_ORDER and appends unmentioned providers in default order", () => {
+    const svc = new VisionService(
+      makeConfig({ GEMINI_API_KEY: "gem", OPENROUTER_API_KEY: "sk-or", VISION_PROVIDER_ORDER: "openrouter" }),
+    );
+    expect(svc.resolveProvider()).toBe("openrouter");
+    expect(VisionService.parseProviderOrder("minimax, bogus ,gemini")).toEqual([
+      "minimax", "gemini", "openrouter", "openai", "anthropic",
+    ]);
+    expect(VisionService.parseProviderOrder(undefined)[0]).toBe("openrouter");
+    expect(VisionService.parseProviderOrder(undefined)[0]).toBe("openrouter");
+    expect(VisionService.parseProviderOrder(undefined)).toEqual(VisionService.DEFAULT_PROVIDER_ORDER);
+  });
+
+  it("treats empty-string env values as unset (docker-compose passes unset vars as \"\")", () => {
+    const svc = new VisionService(
+      makeConfig({ GEMINI_API_KEY: "gem", GEMINI_VISION_MODEL: "", OPENROUTER_API_KEY: "" }),
+    );
+    expect(svc.hasOpenrouter).toBe(false);
+    expect(svc.resolveProvider()).toBe("gemini");
+    expect(VisionService.parseThreshold("")).toBe(0.7);
+    expect(VisionService.parseThreshold("0.55")).toBe(0.55);
+    expect(VisionService.parseThreshold("7")).toBe(0.7);
   });
 
   it("honours preferredProvider=minimax even when other keys are set", () => {
@@ -108,7 +139,7 @@ describe("VisionService — provider routing", () => {
       makeConfig({ GOOGLE_API_KEY: "goog-key" }),
     );
     expect(svc.resolveProvider("gemini")).toBe("gemini");
-    // Auto routing → falls back to direct Gemini only when no MiniMax key.
+    // Auto routing → Gemini is primary (Fase 2).
     expect(svc.resolveProvider()).toBe("gemini");
   });
 
@@ -127,8 +158,8 @@ describe("VisionService — provider routing", () => {
     expect(svc.resolveProvider("gemini")).toBe("gemini");
     expect(svc.resolveProvider("openrouter")).toBe("openrouter");
     expect(svc.resolveProvider("minimax")).toBe("minimax");
-    // Auto → MiniMax primary (per 2026-09-01 user decision).
-    expect(svc.resolveProvider("auto")).toBe("minimax");
+    // Auto → OpenRouter primary (Gemini via OpenRouter).
+    expect(svc.resolveProvider("auto")).toBe("openrouter");
   });
 
   it("returns null when preferredProvider has no matching key", () => {
@@ -726,6 +757,7 @@ describe("VisionService — provider transport (mocked)", () => {
 
     const svc = new VisionService(
       makeConfig({
+        VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", // legacy order: these tests exercise the chain mechanics, not the Fase 2 default
         GEMINI_API_KEY: "g",
         OPENROUTER_API_KEY: "sk-or",
       }),
@@ -1112,7 +1144,7 @@ describe("VisionService — MiniMax (PRIMARY) transport", () => {
       }),
     });
     const svc = new VisionService(
-      makeConfig({ MINIMAX_API_KEY: "sk-cp-test" }),
+      makeConfig({ VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", MINIMAX_API_KEY: "sk-cp-test" }),
     );
     const out = await svc.analyze({
       mimeType: "image/jpeg",
@@ -1185,7 +1217,7 @@ describe("VisionService — MiniMax (PRIMARY) transport", () => {
       }),
     });
     const svc = new VisionService(
-      makeConfig({ MINIMAX_API_KEY: 'sk-cp-test' }),
+      makeConfig({ VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", MINIMAX_API_KEY: 'sk-cp-test' }),
     );
     const out = await svc.analyze({
       mimeType: 'image/jpeg',
@@ -1219,6 +1251,7 @@ describe("VisionService — MiniMax (PRIMARY) transport", () => {
     });
     const svc = new VisionService(
       makeConfig({
+        VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", // legacy order: these tests exercise the chain mechanics, not the Fase 2 default
         MINIMAX_API_KEY: "sk-cp",
         MINIMAX_URL: "https://minimax-proxy.example.com/v1/chat/completions",
       }),
@@ -1272,6 +1305,7 @@ describe("VisionService — MiniMax (PRIMARY) transport", () => {
       });
     const svc = new VisionService(
       makeConfig({
+        VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", // legacy order: these tests exercise the chain mechanics, not the Fase 2 default
         MINIMAX_API_KEY: "sk-cp",
         OPENROUTER_API_KEY: "sk-or",
       }),
@@ -1334,7 +1368,7 @@ describe("VisionService — MiniMax (PRIMARY) transport", () => {
         }),
       });
     const svc = new VisionService(
-      makeConfig({ MINIMAX_API_KEY: "sk-cp" }),
+      makeConfig({ VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", MINIMAX_API_KEY: "sk-cp" }),
     );
     const out = await svc.analyze({
       mimeType: "image/jpeg",
@@ -1382,6 +1416,7 @@ describe("VisionService — MiniMax (PRIMARY) transport", () => {
       });
     const svc = new VisionService(
       makeConfig({
+        VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", // legacy order: these tests exercise the chain mechanics, not the Fase 2 default
         MINIMAX_API_KEY: "sk-cp",
         OPENROUTER_API_KEY: "sk-or",
         OPENROUTER_URL: "https://openrouter-proxy.example.com/api/v1/chat/completions",
@@ -1456,7 +1491,7 @@ describe("VisionService — gap-fix shared fallback chain (2026-09-01)", () => {
       }),
     });
     const svc = new VisionService(
-      makeConfig({ MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
+      makeConfig({ VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
     );
     const out = await svc.analyze({
       mimeType: "image/jpeg",
@@ -1527,7 +1562,7 @@ describe("VisionService — gap-fix shared fallback chain (2026-09-01)", () => {
         }),
       });
     const svc = new VisionService(
-      makeConfig({ MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
+      makeConfig({ VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
     );
     const out = await svc.analyze({
       mimeType: "image/jpeg",
@@ -1615,7 +1650,7 @@ describe("VisionService — gap-fix shared fallback chain (2026-09-01)", () => {
         }),
       });
     const svc = new VisionService(
-      makeConfig({ MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
+      makeConfig({ VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
     );
     const out = await svc.analyze({
       mimeType: "image/jpeg",
@@ -1662,7 +1697,7 @@ describe("VisionService — gap-fix shared fallback chain (2026-09-01)", () => {
         }),
       });
     const svc = new VisionService(
-      makeConfig({ MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
+      makeConfig({ VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
     );
     const out = await svc.analyze({
       mimeType: "image/jpeg",
@@ -1763,6 +1798,7 @@ describe("VisionService — gap-fix shared fallback chain (2026-09-01)", () => {
       });
     const svc = new VisionService(
       makeConfig({
+        VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", // legacy order: these tests exercise the chain mechanics, not the Fase 2 default
         MINIMAX_API_KEY: "sk-cp",
         OPENROUTER_API_KEY: "sk-or",
         GEMINI_API_KEY: "gem-key",
@@ -1831,6 +1867,7 @@ describe("VisionService — gap-fix shared fallback chain (2026-09-01)", () => {
       });
     const svc = new VisionService(
       makeConfig({
+        VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", // legacy order: these tests exercise the chain mechanics, not the Fase 2 default
         MINIMAX_API_KEY: "sk-cp",
         OPENROUTER_API_KEY: "sk-or",
         GEMINI_API_KEY: "gem",
@@ -1920,7 +1957,7 @@ describe("VisionService — gap-fix shared fallback chain (2026-09-01)", () => {
         }),
       });
     const svc = new VisionService(
-      makeConfig({ MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
+      makeConfig({ VISION_PROVIDER_ORDER: "minimax,openrouter,gemini", MINIMAX_API_KEY: "sk-cp", OPENROUTER_API_KEY: "sk-or" }),
     );
     const out = await svc.analyze({
       mimeType: "image/jpeg",

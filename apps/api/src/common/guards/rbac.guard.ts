@@ -19,6 +19,7 @@ export enum Role {
   GESTOR_RH = 'GESTOR_RH',
   OPERADOR = 'OPERADOR',
   APPROVER = 'APPROVER',
+  ACCOUNTANT = 'ACCOUNTANT',
 }
 
 /**

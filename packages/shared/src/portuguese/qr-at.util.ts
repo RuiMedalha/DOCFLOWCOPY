@@ -142,8 +142,15 @@ export function parseAtQr(raw: string): AtQrParsed | null {
     documentDate: parseDateAt(fields['F']),
     uniqueDocId: fields['G'],
     atcud: fields['H'],
-    total: parseMoney(fields['O']),
-    totalTax: parseMoney(fields['N']) ?? (taxFromRegions || undefined),
+    total:
+      parseMoney(fields['O']) ??
+      parseMoney(fields['L']) ??
+      parseMoney(fields['J']) ??
+      parseMoney(fields['P']),
+    totalTax:
+      parseMoney(fields['N']) ??
+      parseMoney(fields['K']) ??
+      (taxFromRegions || undefined),
     withholding: parseMoney(fields['P']),
     stampDuty: parseMoney(fields['M']),
     other: parseMoney(fields['L']),

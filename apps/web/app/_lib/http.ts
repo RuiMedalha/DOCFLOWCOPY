@@ -140,6 +140,17 @@ export const http = {
     return unwrap<T>(await res.json());
   },
 
+  async put<T>(path: string, body?: unknown): Promise<T> {
+    const res = await fetchWithAuthRetry(`${API_BASE}${path}`, {
+      method: 'PUT',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) throw await parseError(res);
+    if (res.status === 204) return undefined as T;
+    return unwrap<T>(await res.json());
+  },
+
   async del<T>(path: string): Promise<T> {
     const res = await fetchWithAuthRetry(`${API_BASE}${path}`, {
       method: 'DELETE',

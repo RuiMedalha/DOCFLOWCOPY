@@ -3214,7 +3214,13 @@ describe("ExtractionService", () => {
       expect(out.hints?.find((h) => h.startsWith("partySwap:"))).toBeUndefined();
     });
 
-    it("DOES NOT swap when there's no customer data (would lose information)", async () => {
+    it("Fase 4.2 (P0.1): DISCARDS the supplier name+NIF when no customer data exists — nunca somos o fornecedor", async () => {
+      // Antes da Fase 4.2 este caso não tocava em nada: sem bloco de
+      // cliente não há "para onde trocar", por isso o nome errado
+      // ("NOV OUSADO" — nós próprios) e o NIF ficavam gravados como
+      // fornecedor. Agora sabemos por definição que nunca somos o
+      // fornecedor, por isso descartamos ambos em vez de os deixar
+      // criar uma Party errada.
       const fields: ExtractedFields = {
         source: "ai",
         confidence: 0.5,
@@ -3224,8 +3230,51 @@ describe("ExtractionService", () => {
         supplierNif: "515208566",
       };
       const out = await invoke(fields);
-      expect(out.supplier).toBe("NOV OUSADO UNIPESSOAL LDA");
-      // No swap because there's nothing to swap into.
+      expect(out.supplier).toBeUndefined();
+      expect(out.supplierNif).toBeUndefined();
+      expect(out.hints?.some((h) => h.startsWith("partySwap:"))).toBe(true);
+    });
+
+    // ── Fase 4.2 (P0.1) — bug real: ONNERA/Edenox (fatura espanhola).
+    // O sistema entregou supplier="NOV OUSADO LDA" (o nosso nome) com
+    // supplierNif="ESA14219836" (o CIF real da ONNERA) — nome de um
+    // bloco colado ao número de outro. A IA nem devolveu um bloco de
+    // cliente distinto, por isso as condições de swap antigas nunca
+    // disparavam. O nome tem de ser descartado; o NIF estrangeiro (que
+    // não é o nosso) sobrevive para ser reresolvido.
+    it("Fase 4.2 (P0.1): ONNERA/Edenox — descarta o nome mas mantém o CIF estrangeiro genuíno", async () => {
+      const fields: ExtractedFields = {
+        source: "ai",
+        confidence: 0.85,
+        currency: "EUR",
+        supplier: "NOV OUSADO UNIPESSOAL LDA", // ERRADO — é o nosso nome
+        supplierNif: "ESA14219836", // CIF real da ONNERA/Edenox (ES)
+        // sem bloco de cliente
+      };
+      const out = await invoke(fields);
+      expect(out.supplier).toBeUndefined();
+      expect(out.supplierNif).toBe("ESA14219836");
+      expect(out.hints?.some((h) => h.startsWith("partySwap:name_nif_mismatch_discarded"))).toBe(true);
+    });
+
+    // ── Fase 4.2 (P0.1) — SAMMIC também imprime o nosso NIF no corpo
+    // (autoliquidação intra-UE cita o NIF do adquirente). Confirma que
+    // uma fatura normal (bloco de cliente presente, nomes corretos) não
+    // é afetada por esta nova regra.
+    it("Fase 4.2 (P0.1): SAMMIC — não mexe quando os blocos já estão corretos", async () => {
+      const fields: ExtractedFields = {
+        source: "ai",
+        confidence: 0.9,
+        currency: "EUR",
+        supplier: "SAMMIC EQUIP. DE HOTELARIA LDA",
+        customer: "NOV OUSADO UNIPESSOAL LDA",
+        supplierNif: "ESB20869152",
+        customerNif: "515208566",
+      };
+      const out = await invoke(fields);
+      expect(out.supplier).toBe("SAMMIC EQUIP. DE HOTELARIA LDA");
+      expect(out.customer).toBe("NOV OUSADO UNIPESSOAL LDA");
+      expect(out.supplierNif).toBe("ESB20869152");
       expect(out.hints?.find((h) => h.startsWith("partySwap:"))).toBeUndefined();
     });
   });

@@ -1,4 +1,4 @@
-﻿'use client';
+'use client';
 
 /**
  * DocFlow â€” Settings Â· Integrations panel.
@@ -21,7 +21,8 @@ import { PROVIDER_PRESETS, getProviderPreset, type ProviderSpec } from '../_lib/
 const API_BASE = (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, '')) || 'http://localhost:4000/api/v1';
 
 export function IntegrationsPanel() {
-  const { data: integrations, isLoading } = useIntegrations();
+  const { data: rawIntegrations, isLoading } = useIntegrations();
+  const integrations = (rawIntegrations ?? []).filter((i) => (i.provider as string) !== 'ai_settings');
   const [activeProvider, setActiveProvider] = useState<string | null>(null);
 
   return (

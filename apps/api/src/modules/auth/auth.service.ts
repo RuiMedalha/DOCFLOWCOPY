@@ -17,6 +17,10 @@ import { InviteUserDto } from './dto/invite-user.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { TwoFactorService } from './two-factor.service';
+import {
+  getLoginLockout,
+  LockedException,
+} from '../../common/auth/login-lockout';
 
 const BCRYPT_ROUNDS = 12;
 /** 7 days in ms — refresh token TTL. Read JWT_REFRESH_EXPIRES_IN if you want to override. */
@@ -141,17 +145,58 @@ export class AuthService {
   /**
    * Returns either full tokens, or a `Pending2FAResponse` when 2FA is on and
    * no code was supplied (the client must call /auth/login again with the code).
+   *
+   * AUDIT §4.1 / §5.3: per-account lockout (5 fails / 15 min → 30 min lock)
+   * runs BEFORE bcrypt so a locked account pays zero CPU cost. Locked
+   * attempts share the same `'Invalid credentials'` response as wrong-
+   * password attempts so the API cannot be used to enumerate accounts.
    */
   async login(
     dto: LoginDto,
     meta?: { ip?: string; userAgent?: string },
   ): Promise<AuthenticatedResponse | Pending2FAResponse> {
+    const lockout = getLoginLockout();
+    const accountKey = { tenantSlug: dto.tenantSlug, email: dto.email };
+
+    // 1) Pre-bcrypt lock check — the cheapest possible rejection.
+    try {
+      lockout.assertNotLocked(accountKey);
+    } catch (err) {
+      if (err instanceof LockedException) {
+        // Structured log separate from auth failures — SIEM-friendly.
+        // We do NOT count a locked attempt as a fresh failure (the
+        // account is already locked; counting would extend the lock
+        // indefinitely under continuous attempts).
+        this.logger.warn({
+          event: 'login.locked',
+          tenantSlug: dto.tenantSlug,
+          email: dto.email,
+          ip: meta?.ip ?? null,
+          userAgent: meta?.userAgent ?? null,
+          lockedUntil: new Date(err.lockedUntil).toISOString(),
+        });
+        throw new UnauthorizedException('Invalid credentials');
+      }
+      throw err;
+    }
+
     const tenant = await this.prisma.tenant.findUnique({
       where: { slug: dto.tenantSlug },
       select: { id: true, name: true, slug: true, active: true },
     });
     if (!tenant || !tenant.active) {
       // Same message as bad creds — don't reveal that the slug exists.
+      // We DO record a failure here so a brute-force enumeration of
+      // slugs is also rate-limited. The cost is a tiny in-memory map
+      // write — no DB hit, no bcrypt.
+      lockout.recordFailure(accountKey);
+      this.logger.warn({
+        event: 'login.fail',
+        reason: 'tenant_unknown_or_inactive',
+        tenantSlug: dto.tenantSlug,
+        email: dto.email,
+        ip: meta?.ip ?? null,
+      });
       throw new UnauthorizedException('Invalid credentials');
     }
 
@@ -171,16 +216,41 @@ export class AuthService {
       },
     });
     if (!user || !user.isActive || user.deletedAt) {
+      // Account-inactive gets a failure recorded so the lockout covers
+      // attempts at disabled / deleted users too. Same generic message.
+      lockout.recordFailure(accountKey);
+      this.logger.warn({
+        event: 'login.fail',
+        reason: 'user_unknown_or_inactive',
+        tenantSlug: dto.tenantSlug,
+        email: dto.email,
+        ip: meta?.ip ?? null,
+      });
       throw new UnauthorizedException('Invalid credentials');
     }
 
     const passwordOk = await bcrypt.compare(dto.password, user.passwordHash);
     if (!passwordOk) {
+      const entry = lockout.recordFailure(accountKey);
+      this.logger.warn({
+        event: 'login.fail',
+        reason: 'bad_password',
+        tenantSlug: dto.tenantSlug,
+        email: dto.email,
+        ip: meta?.ip ?? null,
+        failures: entry.failures,
+        locked: entry.lockedUntil !== null,
+      });
       throw new UnauthorizedException('Invalid credentials');
     }
 
     // 2FA gate: if on and no code supplied, hand back a marker; the client must
     // re-call /auth/login with the TOTP code to complete the sign-in.
+    //
+    // NOTE: a 2FA-challenge return (no code supplied yet) is NEITHER a
+    // success NOR a failure — we leave the counter alone so an attacker
+    // can't push the user's account into lockout by spamming 2FA
+    // challenges.
     if (user.twoFactorEnabled) {
       if (!dto.twoFactorCode) {
         return {
@@ -190,9 +260,25 @@ export class AuthService {
         };
       }
       if (!user.twoFactorSecret || !this.twoFactor.verifyToken(user.twoFactorSecret, dto.twoFactorCode)) {
-        throw new UnauthorizedException('Invalid 2FA code');
+        // Bad TOTP counts as a failure too — same lockout discipline.
+        const entry = lockout.recordFailure(accountKey);
+        this.logger.warn({
+          event: 'login.fail',
+          reason: 'bad_2fa',
+          tenantSlug: dto.tenantSlug,
+          email: dto.email,
+          ip: meta?.ip ?? null,
+          failures: entry.failures,
+          locked: entry.lockedUntil !== null,
+        });
+        throw new UnauthorizedException('Invalid credentials');
       }
     }
+
+    // Successful login (bcrypt passed AND any required TOTP passed).
+    // Reset the per-account counter — the audit §4.1 spec calls this
+    // out explicitly.
+    lockout.reset(accountKey);
 
     const tokens = await this.generateTokens(user);
 

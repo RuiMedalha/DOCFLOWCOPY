@@ -1,24 +1,27 @@
 'use client';
 
 import { useState } from 'react';
-import { Link2, User2, Building2, Cog } from 'lucide-react';
+import { Link2, User2, Building2, Cog, Cpu } from 'lucide-react';
 import { PageHeader } from '../_components/page-header';
 import { IntegrationsPanel } from './_components/integrations-panel';
 import { ProfilePanel } from './_components/profile-panel';
+import { AiPanel } from './_components/ai-panel';
 
-type Tab = 'integrations' | 'profile' | 'tenant';
+type Tab = 'integrations' | 'ai' | 'profile' | 'tenant';
 
 export default function SettingsPage() {
   const [tab, setTab] = useState<Tab>('integrations');
   return (
     <>
-      <PageHeader title="Definições" subtitle="Integrações, perfil e configuração do tenant." />
+      <PageHeader title="Definições" subtitle="Integrações, modelos de IA, perfil e configuração do tenant." />
       <div className="flex items-center gap-1 mb-5 overflow-x-auto">
         <TabBtn id="integrations" current={tab} setTab={setTab} icon={<Link2 size={14} />}>Integrações</TabBtn>
+        <TabBtn id="ai" current={tab} setTab={setTab} icon={<Cpu size={14} />}>Modelos de IA</TabBtn>
         <TabBtn id="profile" current={tab} setTab={setTab} icon={<User2 size={14} />}>Perfil</TabBtn>
         <TabBtn id="tenant" current={tab} setTab={setTab} icon={<Building2 size={14} />}>Tenant</TabBtn>
       </div>
       {tab === 'integrations' && <IntegrationsPanel />}
+      {tab === 'ai' && <AiPanel />}
       {tab === 'profile' && <ProfilePanel />}
       {tab === 'tenant' && <TenantPanel />}
     </>

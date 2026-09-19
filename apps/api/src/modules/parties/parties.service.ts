@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -9,6 +10,9 @@ import { AuditAction, PartyType, Prisma } from '@prisma/client';
 import { isValidIban, isValidNif, normalizeIban, normalizeNif } from '@docflow/shared';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { PartyCategoriesService } from '../party-categories/party-categories.service';
+import { isGenericPartyName } from '../vies/address-parser';
+import { slugify } from '../../common/storage/slug';
 import {
   AccountQueryDto,
   CreateAccountDto,
@@ -65,6 +69,7 @@ export class PartiesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly partyCategories: PartyCategoriesService,
   ) {}
 
   // ════════════════════════════════ PARTIES — CRUD ══════════════════════════
@@ -97,9 +102,19 @@ export class PartiesService {
         orderBy: { name: 'asc' },
         skip,
         take: limit,
+        include: {
+          partyCategory: {
+            select: { id: true, slug: true, name: true, color: true, sortOrder: true },
+          },
+        },
       }),
       this.prisma.party.count({ where }),
     ]);
+    // Note: `findAll` deliberately does NOT eager-load contacts /
+    // addresses — the list view does not display them and the extra
+    // round-trip would balloon page weight on tenants with hundreds
+    // of parties. `findOne` (party detail) DOES load them for the
+    // 360° file.
 
     // The Party schema carries FK columns (`defaultDebitAccountId`,
     // `defaultCreditAccountId`) but no Prisma relation lines — so we
@@ -125,8 +140,57 @@ export class PartiesService {
   }
 
   async findOne(tenantId: string, id: string) {
-    const p = await this.prisma.party.findFirst({ where: { id, tenantId } });
+    const p = await this.prisma.party.findFirst({
+      where: { id, tenantId },
+      include: {
+        partyCategory: {
+          select: { id: true, slug: true, name: true, color: true, sortOrder: true },
+        },
+        defaultCategory: { select: { id: true, name: true, slug: true } },
+        // Sprint G: eager-load the 360° sub-resources so the detail page
+        // can render without a waterfall of follow-up GETs. Tenant scope
+        // is already enforced by `where: { tenantId }` above — the
+        // contacts/addresses relations are 1:N on the same tenant.
+        contacts: {
+          orderBy: [{ createdAt: 'desc' }],
+        },
+        addresses: {
+          orderBy: [{ isPrimary: 'desc' }, { type: 'asc' }, { createdAt: 'desc' }],
+        },
+      },
+    });
     if (!p) throw new NotFoundException('Party not found');
+
+    // Auto-recuperação de nome genérico (ex.: "---" vindo do VIES de Espanha ou "Fornecedor por identificar")
+    // a partir do fornecedor extraído dos documentos já processados desta entidade.
+    if (isGenericPartyName(p.name, p.nif, p.vatNumber)) {
+      try {
+        const linkedDoc = await this.prisma.document.findFirst({
+          where: {
+            tenantId,
+            OR: [
+              { partyId: p.id },
+              ...(p.nif ? [{ supplierNif: p.nif }] : []),
+              ...(p.vatNumber ? [{ supplierNif: p.vatNumber }] : []),
+            ],
+            supplier: { not: null },
+          },
+          select: { supplier: true },
+          orderBy: { createdAt: 'desc' },
+        });
+        if (linkedDoc?.supplier && !isGenericPartyName(linkedDoc.supplier)) {
+          const healedName = linkedDoc.supplier.trim().slice(0, 200);
+          await this.prisma.party.update({
+            where: { id: p.id },
+            data: { name: healedName },
+          });
+          p.name = healedName;
+          this.logger.log(`[findOne] auto-healed generic party=${p.id} name to "${healedName}" from linked document`);
+        }
+      } catch (healErr) {
+        this.logger.warn(`[findOne] auto-heal failed for party=${p.id}: ${(healErr as Error).message}`);
+      }
+    }
 
     const accountIds = [p.defaultDebitAccountId, p.defaultCreditAccountId].filter(
       Boolean,
@@ -179,11 +243,20 @@ export class PartiesService {
       defaultCreditAccountId: dto.defaultCreditAccountId,
     });
 
+    // Validate category FK if supplied.
+    if (dto.partyCategoryId) {
+      await this.partyCategories.assertCategoryInTenant(tenantId, dto.partyCategoryId);
+    }
+
     const party = await this.prisma.party.create({
       data: {
         tenantId,
         type: dto.type ?? PartyType.FORNECEDOR,
         name: dto.name,
+        slug: await this.generateUniqueSlug(tenantId, dto.name),
+        // Scalar FK to keep the create consistent with the rest of the
+        // party-create path (which uses unchecked scalars like tenantId).
+        partyCategoryId: dto.partyCategoryId ?? null,
         nif: nif ?? null,
         email: dto.email,
         phone: dto.phone,
@@ -197,6 +270,13 @@ export class PartiesService {
         website: dto.website,
         industry: dto.industry,
         notes: dto.notes,
+        // Fase 4
+        vatNumber: dto.vatNumber ? dto.vatNumber.replace(/[\s.-]/g, '').toUpperCase() : null,
+        vatRegime: dto.vatRegime ?? ((dto.country ?? 'PT').toUpperCase() === 'PT' ? 'PT' : dto.vatNumber ? 'UE_REVERSE_CHARGE' : 'EXTRA_UE'),
+        currency: (dto.currency ?? 'EUR').toUpperCase(),
+        directDebit: dto.directDebit ?? false,
+        billingEmail: dto.billingEmail,
+        defaultCategoryId: dto.defaultCategoryId ?? null,
         tags: dto.tags ?? [],
         paymentTermDays: dto.paymentTermDays ?? 30,
         defaultDebitAccountId: dto.defaultDebitAccountId,
@@ -245,6 +325,7 @@ export class PartiesService {
     userId: string,
     id: string,
     dto: UpdatePartyDto,
+    userRole?: string,
   ) {
     const existing = await this.prisma.party.findFirst({
       where: { id, tenantId },
@@ -255,9 +336,26 @@ export class PartiesService {
         nif: true,
         type: true,
         isActive: true,
+        isRecurring: true,
+        isRecurringManualOverride: true,
+        // Sprint E fix-up (audit §9 LOW-5 / MEDIUM-5): the recurring-toggle
+        // pattern emits a per-field audit row; the same per-field audit
+        // discipline must apply to `partyCategoryId` so a compliance
+        // review can answer "who moved party X from category A to B".
+        partyCategoryId: true,
       },
     });
     if (!existing) throw new NotFoundException('Party not found');
+
+    // Defense-in-depth RBAC: even though the route is gated by @Roles(Role.ADMIN),
+    // a direct service caller (queue, cron, test) could still try to flip
+    // isRecurring. Reject early here too.
+    if (
+      (dto.isRecurring !== undefined || dto.isRecurringManualOverride !== undefined) &&
+      userRole !== 'ADMIN'
+    ) {
+      throw new ForbiddenException('Only ADMIN may override isRecurring');
+    }
 
     const newNif = dto.nif !== undefined ? this.coerceNif(dto.nif) : undefined;
     if (newNif !== undefined && newNif !== null && newNif !== existing.nif) {
@@ -297,6 +395,19 @@ export class PartiesService {
       defaultCreditAccountId: dto.defaultCreditAccountId,
     });
 
+    // Sprint E: validate the optional partyCategoryId FK. Passing null
+    // (undefined → null) clears the classification; passing a string
+    // requires the category to belong to this tenant.
+    if (dto.partyCategoryId !== undefined && dto.partyCategoryId !== null) {
+      await this.partyCategories.assertCategoryInTenant(tenantId, dto.partyCategoryId);
+    }
+
+    // Sprint E: when the name changes, regenerate the slug. The slug
+    // is otherwise immutable — renames do NOT move the existing folder
+    // (that would be unsafe + expensive); the slug is just a display
+    // hint in URLs.
+    const nameChanged = dto.name !== undefined && dto.name !== existing.name;
+
     const ibanChanged =
       newIban !== undefined &&
       newIban !== null &&
@@ -311,6 +422,18 @@ export class PartiesService {
     const data: Prisma.PartyUpdateInput = {};
     if (dto.type !== undefined) data.type = dto.type;
     if (dto.name !== undefined) data.name = dto.name;
+    if (nameChanged) {
+      data.slug = await this.generateUniqueSlug(tenantId, dto.name as string, id);
+    }
+    if (dto.partyCategoryId !== undefined) {
+      // The data builder above mixes scalar (tenantId) and relation
+      // (partyCategory) shapes, which forces the inferred input type to
+      // be the checked `PartyUpdateInput` (no scalar FK exposed).
+      // Cast to the unchecked variant just for this assignment — it
+      // accepts both `partyCategoryId` and the relation form.
+      (data as Prisma.PartyUncheckedUpdateInput).partyCategoryId =
+        dto.partyCategoryId ?? null;
+    }
     if (sanitizedNif !== undefined) data.nif = sanitizedNif;
     if (dto.email !== undefined) data.email = dto.email;
     if (dto.phone !== undefined) data.phone = dto.phone;
@@ -324,6 +447,15 @@ export class PartiesService {
     if (dto.website !== undefined) data.website = dto.website;
     if (dto.industry !== undefined) data.industry = dto.industry;
     if (dto.notes !== undefined) data.notes = dto.notes;
+    // Fase 4
+    if (dto.vatNumber !== undefined)
+      data.vatNumber = dto.vatNumber ? dto.vatNumber.replace(/[\s.-]/g, '').toUpperCase() : null;
+    if (dto.vatRegime !== undefined) data.vatRegime = dto.vatRegime;
+    if (dto.currency !== undefined) data.currency = (dto.currency || 'EUR').toUpperCase();
+    if (dto.directDebit !== undefined) data.directDebit = dto.directDebit;
+    if (dto.billingEmail !== undefined) data.billingEmail = dto.billingEmail || null;
+    if (dto.defaultCategoryId !== undefined)
+      data.defaultCategory = dto.defaultCategoryId ? { connect: { id: dto.defaultCategoryId } } : { disconnect: true };
     if (dto.tags !== undefined) data.tags = dto.tags;
     if (dto.paymentTermDays !== undefined) data.paymentTermDays = dto.paymentTermDays;
     if (dto.defaultDebitAccountId !== undefined)
@@ -334,6 +466,9 @@ export class PartiesService {
       data.externalIds = (dto.externalIds ?? null) as Prisma.InputJsonValue;
     }
     if (dto.isActive !== undefined) data.isActive = dto.isActive;
+    if (dto.isRecurring !== undefined) data.isRecurring = dto.isRecurring;
+    if (dto.isRecurringManualOverride !== undefined)
+      data.isRecurringManualOverride = dto.isRecurringManualOverride;
 
     // H-05 fix: when the IBAN changes, BOTH the party row update AND the
     // IbanHistory row write must be in a single transaction — the audit
@@ -378,6 +513,67 @@ export class PartiesService {
         newIban: ibanChanged ? (sanitizedIban as string) : null,
       },
     });
+
+    // Security fix (audit §4): the EDIT row above only carried IBAN metadata.
+    // When an ADMIN toggles isRecurring or isRecurringManualOverride there was
+    // no audit trail at all. Emit a dedicated 'party.update.recurring' row
+    // PER changed field so accountability is preserved (who flipped it, when,
+    // old vs new value). We re-use AuditAction.EDIT to stay within the
+    // existing enum and filter by `metadata.field` for downstream queries.
+    const recurringFields: Array<'isRecurring' | 'isRecurringManualOverride'> = [
+      'isRecurring',
+      'isRecurringManualOverride',
+    ];
+    for (const field of recurringFields) {
+      const next = dto[field];
+      if (next === undefined) continue;
+      const prev = existing[field];
+      if (prev === next) continue;
+      await this.audit.log({
+        tenantId,
+        userId,
+        action: AuditAction.EDIT,
+        entityType: 'party',
+        entityId: id,
+        metadata: {
+          subAction: 'party.update.recurring',
+          field,
+          oldValue: prev,
+          newValue: next,
+        },
+      });
+    }
+
+    // Sprint E fix-up (audit §9 LOW-5 / MEDIUM-5): per-field audit row
+    // for `partyCategoryId`. The general EDIT row above only carries
+    // IBAN metadata; without this row a compliance review can't answer
+    // "who moved party X from category A to category B". Same per-field
+    // pattern as the recurring toggle — `subAction: 'party.update.partyCategory'`,
+    // `field: 'partyCategoryId'`, oldValue/newValue carry the IDs (or null
+    // when the category was cleared by passing `null` in the DTO).
+    //
+    // The "changed" check uses strict `!==` so undefined-vs-null is a real
+    // change (user is clearing a previously-set category), but undefined
+    // alone means "field was not in the PATCH" — skip those.
+    if (dto.partyCategoryId !== undefined) {
+      const prevCategory = existing.partyCategoryId ?? null;
+      const nextCategory = dto.partyCategoryId ?? null;
+      if (prevCategory !== nextCategory) {
+        await this.audit.log({
+          tenantId,
+          userId,
+          action: AuditAction.EDIT,
+          entityType: 'party',
+          entityId: id,
+          metadata: {
+            subAction: 'party.update.partyCategory',
+            field: 'partyCategoryId',
+            oldValue: prevCategory,
+            newValue: nextCategory,
+          },
+        });
+      }
+    }
 
     return this.findOne(tenantId, id);
   }
@@ -980,11 +1176,18 @@ export class PartiesService {
   /**
    * Drop internal-only columns from the Party response. `externalIds` is
    * opaque JSON to the caller — keep it but no other sensitive fields.
+   *
+   * Sprint G: the 360° sub-resources (contacts / addresses) come back
+   * from Prisma with their `tenantId` field exposed. We strip it here
+   * so the response never leaks the internal tenancy column — same
+   * discipline as `sanitizePartyContact` / `sanitizePartyAddress` in
+   * the dedicated services.
    */
   private sanitizeParty(p: any, accountById?: Map<string, { id: string; code: string; name: string }>) {
     if (!p) return p;
+    const { contacts, addresses, ...rest } = p;
     return {
-      ...p,
+      ...rest,
       iban: p.iban ?? null,
       ibanMasked: p.iban
         ? `${(p.iban as string).slice(0, 4)}••••${(p.iban as string).slice(-4)}`
@@ -995,7 +1198,59 @@ export class PartiesService {
       defaultCreditAccount: p.defaultCreditAccountId && accountById
         ? accountById.get(p.defaultCreditAccountId) ?? null
         : null,
+      contacts: Array.isArray(contacts)
+        ? contacts.map((c: any) => ({
+            id: c.id,
+            partyId: c.partyId,
+            name: c.name,
+            role: c.role,
+            email: c.email,
+            phone: c.phone,
+            notes: c.notes,
+            createdAt: c.createdAt,
+            updatedAt: c.updatedAt,
+          }))
+        : [],
+      addresses: Array.isArray(addresses)
+        ? addresses.map((a: any) => ({
+            id: a.id,
+            partyId: a.partyId,
+            type: a.type,
+            line1: a.line1,
+            line2: a.line2,
+            postalCode: a.postalCode,
+            city: a.city,
+            country: a.country,
+            isPrimary: a.isPrimary,
+            createdAt: a.createdAt,
+            updatedAt: a.updatedAt,
+          }))
+        : [],
     };
+  }
+
+  /**
+   * Sprint E: slugify(name) and de-collide against existing rows in the
+   * tenant. On collision append `<base>-<first4 of id>` (from the row
+   * being created or the row being updated) so the on-disk folder name
+   * is human-readable AND stable across renames. When the base slug is
+   * unique the suffix is omitted entirely.
+   *
+   * Async because we have to read existing rows; called from both
+   * `create()` (no `excludeId`) and `update()` (with `excludeId` to
+   * ignore the row being renamed).
+   */
+  private async generateUniqueSlug(
+    tenantId: string,
+    name: string,
+    excludeId?: string,
+  ): Promise<string> {
+    const base = slugify(name) ?? 'party';
+    const where: Prisma.PartyWhereInput = { tenantId, slug: base };
+    if (excludeId) where.NOT = { id: excludeId };
+    const collision = await this.prisma.party.findFirst({ where, select: { id: true } });
+    if (!collision) return base;
+    return `${base}-${(excludeId ?? collision.id).slice(0, 4)}`;
   }
 
   /** Strip anything we don't want to leak to the client from an Account row. */

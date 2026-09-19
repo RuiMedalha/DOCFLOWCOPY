@@ -44,6 +44,37 @@ type AuditCapableClient = Pick<PrismaClient, 'auditLog'>;
  * hand and forgot the REQUIRED `rowHash` column, producing tsc errors and
  * silently broken chains. Injecting `AuditService` makes it impossible to
  * write a row without a valid hash.
+ *
+ * --------------------------------------------------------------------------
+ * subAction catalogue (security-audit M-18)
+ *
+ * Every sensitive mutation logs `action: AuditAction.EDIT` with a
+ * `metadata.subAction` string that disambiguates which mutation fired.
+ * The catalog below is the SINGLE SOURCE OF TRUTH for these values;
+ * grep over the codebase for any of these strings to find every call site.
+ *
+ *   Pipeline (Sprint H):
+ *     processing.started            — RECEIVED → EXTRACTING (stage 1 begin)
+ *     processing.stage.advanced     — EXTRACTING → ENRICHING / ENRICHING → ROUTING
+ *     processing.completed          — ROUTING → COMPLETED (terminal success)
+ *     processing.failed             — handler caught an error; doc → FAILED
+ *     processing.auto_approved      — pipeline called documents.approve() and it succeeded
+ *
+ *   Tenant settings:
+ *     tenant.settings.update        — generic patch (PATCH /tenants/me/settings)
+ *
+ *   Existing categories (covered by other sprints; kept here for grep):
+ *     storage.relocate              — Sprint E: cross-tenant-safe move
+ *     party.update.recurring        — Sprint F: financial exposure flag
+ *     party.update.category         — Sprint F: tax-category change
+ *     auth.refresh / auth.logout    — Sprint B: token rotation
+ *     oauth.callback                — Sprint B: state-mismatch guard
+ *     inbound.webhook.received      — Sprint B: SendGrid + Stripe + …
+ *
+ * Every site that adds a NEW subAction MUST extend this list (and the
+ * comment in processing.service.ts / tenants.service.ts) so forensic
+ * tooling can rely on the catalog.
+ * --------------------------------------------------------------------------
  */
 @Injectable()
 export class AuditService {

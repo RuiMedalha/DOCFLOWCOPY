@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { Search, Plus, ShieldCheck, ShieldAlert } from 'lucide-react';
+import { Search, Plus, ShieldCheck, ShieldAlert, Repeat } from 'lucide-react';
 import { useParties, useDeleteParty } from './use-parties';
 import type { PartyFilters } from '../_lib/types';
 
@@ -75,6 +75,39 @@ export function PartiesList() {
                       {p.name}
                     </Link>
                     {!p.isActive && <span className="ml-2 text-[10px] uppercase tracking-wide text-red-500">inativo</span>}
+                    {p.isRecurringManualOverride && (
+                      <span
+                        className="ml-2 badge-amber text-[10px] inline-flex items-center"
+                        title="Override ADMIN — isRecurring travado, auto-flip pausado"
+                      >
+                        <Repeat size={9} className="mr-0.5" aria-hidden="true" />
+                        Override ADMIN
+                      </span>
+                    )}
+                    {p.isRecurring && !p.isRecurringManualOverride && (
+                      <span
+                        className="ml-2 badge-emerald text-[10px] inline-flex items-center"
+                        title="Fornecedor recorrente — ≥3 faturas associadas"
+                      >
+                        <Repeat size={9} className="mr-0.5" aria-hidden="true" />
+                        Recorrente
+                      </span>
+                    )}
+                    {p.partyCategory && (
+                      <span
+                        className="ml-2 text-[10px] inline-flex items-center px-2 py-0.5 rounded-full font-medium"
+                        style={{
+                          backgroundColor: p.partyCategory.color
+                            ? `${p.partyCategory.color}20`
+                            : 'rgba(148,163,184,0.15)',
+                          color: p.partyCategory.color ?? 'var(--text-muted)',
+                          border: `1px solid ${p.partyCategory.color ?? 'var(--border)'}`,
+                        }}
+                        title={`PartyCategory: ${p.partyCategory.name}`}
+                      >
+                        {p.partyCategory.name}
+                      </span>
+                    )}
                   </td>
                   <td><span className="badge text-[10px]">{p.type}</span></td>
                   <td className="font-mono text-xs">{p.nif ?? '—'}</td>

@@ -1,4 +1,5 @@
-import { IsString, IsOptional, IsInt, Min, Max, Length, Matches } from 'class-validator';
+import { IsString, IsOptional, IsInt, IsEnum, Min, Max, Length, Matches } from 'class-validator';
+import { CategoryNature } from '@prisma/client';
 
 export class CreateCategoryDto {
   @IsString()
@@ -15,6 +16,11 @@ export class CreateCategoryDto {
   @Length(1, 16)
   color?: string;
 
+  /** Fase 4.1 — eixo contabilístico da categoria. */
+  @IsOptional()
+  @IsEnum(CategoryNature)
+  nature?: CategoryNature;
+
   @IsOptional()
   @IsInt()
   @Min(0)
@@ -30,6 +36,7 @@ export class CreateCategoryDto {
 export class UpdateCategoryDto {
   @IsOptional() @IsString() @Length(1, 80) name?: string;
   @IsOptional() @IsString() @Length(1, 16) color?: string;
+  @IsOptional() @IsEnum(CategoryNature) nature?: CategoryNature;
   @IsOptional() @IsInt() @Min(0) @Max(100) defaultIvaDeductibilityPct?: number;
   @IsOptional() @IsString() @Length(1, 500) notes?: string;
 }

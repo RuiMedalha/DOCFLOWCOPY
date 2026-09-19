@@ -55,43 +55,32 @@ export class ImageToPdfService {
       throw new Error(`Unsupported image MIME for PDF conversion: ${mime}`);
     }
 
-    // Page size = image size, but capped at A4 so a 4032×3024 phone photo
-    // doesn't generate a multi-megabyte PDF. We scale the image to fit
-    // the page and leave a 24-pt margin so the result still prints well.
-    const margin = 24;
-    const maxW = ImageToPdfService.FALLBACK_PAGE_WIDTH - margin * 2;
-    const maxH = ImageToPdfService.FALLBACK_PAGE_HEIGHT - margin * 2;
+    // Página padrão A4 vertical (595.28 × 841.89 pt) para arquivo fiscal oficial (art. 52.º CIVA).
+    const A4_WIDTH = ImageToPdfService.FALLBACK_PAGE_WIDTH;
+    const A4_HEIGHT = ImageToPdfService.FALLBACK_PAGE_HEIGHT;
+    const margin = 20;
+    const maxW = A4_WIDTH - margin * 2;
+    const maxH = A4_HEIGHT - margin * 2;
 
-    let pageWidth = widthPx;
-    let pageHeight = heightPx;
-    if (pageWidth > maxW || pageHeight > maxH) {
-      const scale = Math.min(maxW / pageWidth, maxH / pageHeight);
-      pageWidth = Math.round(pageWidth * scale);
-      pageHeight = Math.round(pageHeight * scale);
-    }
+    const scale = Math.min(maxW / widthPx, maxH / heightPx, 1);
+    const renderW = widthPx * scale;
+    const renderH = heightPx * scale;
 
-    const page = pdf.addPage([pageWidth + margin * 2, pageHeight + margin * 2]);
+    const page = pdf.addPage([A4_WIDTH, A4_HEIGHT]);
 
-    // pdf-lib's drawImage expects the image scaled to fit; we re-scale
-    // the embedded image object via `scale()`.
-    const fitScale = Math.min(
-      pageWidth / widthPx,
-      pageHeight / heightPx,
-    );
-    if (fitScale !== 1) {
-      embedded.scale(fitScale);
-    }
+    const x = Math.round((A4_WIDTH - renderW) / 2);
+    const y = Math.round((A4_HEIGHT - renderH) / 2);
 
     page.drawImage(embedded, {
-      x: margin,
-      y: margin,
-      width: widthPx * fitScale,
-      height: heightPx * fitScale,
+      x,
+      y,
+      width: renderW,
+      height: renderH,
     });
 
     const bytes = await pdf.save();
     this.logger.log(
-      `image-to-pdf: in=${buffer.length}B out=${bytes.length}B mime=${normalized}`,
+      `image-to-pdf: in=${buffer.length}B out=${bytes.length}B mime=${normalized} A4 portrait (${renderW.toFixed(0)}x${renderH.toFixed(0)})`,
     );
     return Buffer.from(bytes);
   }

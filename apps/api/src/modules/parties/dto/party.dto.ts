@@ -1,4 +1,5 @@
-import { ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
+import {
+  ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
 import {
   IsArray,
@@ -11,8 +12,9 @@ import {
   Matches,
   MaxLength,
   Min,
+  IsEmail,
 } from 'class-validator';
-import { PartyType } from '@prisma/client';
+import { PartyType, VatRegime } from '@prisma/client';
 
 /**
  * Body for POST /parties — create a supplier/customer/both.
@@ -154,6 +156,47 @@ export class CreatePartyDto {
   })
   @IsOptional()
   externalIds?: Record<string, string | number | null>;
+
+  @ApiPropertyOptional({
+    description:
+      'Sprint E: PartyCategory.id — operator-defined bucket (Estratégico, Operacional, ...). Null clears the classification.',
+  })
+  @IsOptional()
+  @IsString()
+  partyCategoryId?: string;
+
+  // ── Fase 4 — perfil fiscal/comercial ─────────────────────────────
+  @ApiPropertyOptional({ example: 'ESB06612386', description: 'NIF-IVA UE com prefixo de país (fornecedores estrangeiros). PT usa `nif`.' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(20)
+  vatNumber?: string;
+
+  @ApiPropertyOptional({ enum: VatRegime, description: 'PT | UE_REVERSE_CHARGE (autoliquidação intra-UE) | EXTRA_UE' })
+  @IsOptional()
+  @IsEnum(VatRegime)
+  vatRegime?: VatRegime;
+
+  @ApiPropertyOptional({ example: 'EUR', description: 'Moeda habitual das faturas (ISO 4217)' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(3)
+  currency?: string;
+
+  @ApiPropertyOptional({ description: 'Pagamentos por débito direto (SEPA DD)' })
+  @IsOptional()
+  @IsBoolean()
+  directDebit?: boolean;
+
+  @ApiPropertyOptional({ description: 'Email para onde o fornecedor envia faturas' })
+  @IsOptional()
+  @IsEmail()
+  billingEmail?: string;
+
+  @ApiPropertyOptional({ description: 'Category.id aplicada aos documentos deste fornecedor quando não há histórico suficiente' })
+  @IsOptional()
+  @IsString()
+  defaultCategoryId?: string;
 }
 
 /** PATCH /parties/:id — every field optional. */
@@ -162,6 +205,21 @@ export class UpdatePartyDto extends PartialType(CreatePartyDto) {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+
+  @ApiPropertyOptional({
+    description: 'Marks this party as a recurring supplier (auto-set by extraction).',
+  })
+  @IsOptional()
+  @IsBoolean()
+  isRecurring?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'ADMIN-only. When true, freezes isRecurring so the auto-flip in supplier-resolver pauses.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  isRecurringManualOverride?: boolean;
 }
 
 /** Query string for GET /parties. */
@@ -225,4 +283,18 @@ export class FlagIbanDto {
   @IsNumber()
   @Min(0)
   riskScore?: number;
+}
+
+/**
+ * Fase 4.1 — corpo de POST /parties/:id/merge. O `:id` da rota é o
+ * DESTINO (a entidade que sobrevive); `sourceId` é a que é absorvida.
+ */
+export class MergePartyDto {
+  @ApiProperty({
+    description: 'Id da entidade a absorver. Fica inativa, nunca é apagada.',
+    example: 'cmtwuhdh70041p307tjybmg5t',
+  })
+  @IsString()
+  @MaxLength(50)
+  sourceId!: string;
 }

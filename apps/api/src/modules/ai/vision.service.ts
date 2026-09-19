@@ -18,6 +18,7 @@ import {
   TenantIdentity,
 } from './tenant-identity';
 import { PrismaService } from '../../prisma/prisma.service';
+import { FaturistaProvider } from './providers/faturista.provider';
 
 export interface VisionAnalysisRequest {
   /** Base64-encoded file bytes (PDF first page or rasterized image). */
@@ -42,7 +43,10 @@ export interface VisionAnalysisRequest {
     | 'gemini'
     | 'openrouter'
     | 'minimax'
+    | 'faturista'
     | 'auto';
+  /** Explicit model override chosen by user or task routing. */
+  modelOverride?: string;
   /** Hard timeout for the upstream call. Defaults to 30s. */
   timeoutMs?: number;
   /**
@@ -79,6 +83,12 @@ export interface VisionExtractedFields {
   supplier?: string;
   supplierNif?: string;
   supplierVatId?: string;
+  supplierAddress?: string;
+  supplierPostalCode?: string;
+  supplierCity?: string;
+  supplierPhone?: string;
+  supplierEmail?: string;
+  supplierWebsite?: string;
   customer?: string;
   customerNif?: string;
   docNumber?: string;
@@ -98,6 +108,19 @@ export interface VisionExtractedFields {
    */
   ivaBreakdown?: Array<{ rate: number; base: number; tax: number }>;
   documentType?: string; // FATURA / RECIBO / NOTA_CREDITO / NOTA_DEBITO / FATURA_RECIBO / ...
+  /**
+   * Fase 4.1 — cabeçalho do documento transcrito à letra ("OFERTA DE
+   * VENTA", "PRESUPUESTO", "FACTURA"…). É texto, não é classificação:
+   * quem decide se o documento é fiscal é `detectNonFiscalKind` em
+   * código. Nas fotos, onde o OCR devolve vazio, é a única fonte de
+   * texto que a regra determinística tem.
+   */
+  documentTitle?: string;
+  /**
+   * Fase 4.1 — numa nota de crédito, o número da fatura que retifica,
+   * tal como impresso. Null em qualquer outro tipo de documento.
+   */
+  correctedDocumentNumber?: string;
   /**
    * Invoice-level (global) discount amount — a single line "Desconto
    * global" or "Desconto de cabeçalho" the supplier subtracts from the
@@ -151,7 +174,11 @@ export interface VisionExtractedFields {
   notes?: string[];
 }
 
+export type VisionProviderName = 'gemini' | 'openrouter' | 'minimax' | 'openai' | 'anthropic' | 'faturista';
+
 export interface VisionAnalysisResult {
+  /** Fase 2 — set when a second provider was consulted for a weak result. */
+  secondOpinion?: { provider: string; confidence: number };
   provider:
     | 'anthropic'
     | 'openai'
@@ -160,6 +187,8 @@ export interface VisionAnalysisResult {
     | `openrouter/${string}`
     | 'minimax'
     | `minimax/${string}`
+    | 'faturista'
+    | 'zerox'
     | 'local-fallback';
   model: string;
   /** Aggregate confidence in [0,1]. */
@@ -171,6 +200,9 @@ export interface VisionAnalysisResult {
   processingTimeMs: number;
   /** True when the call hit a hard error and we degraded to regex. */
   fallbackUsed: boolean;
+  tokensIn?: number;
+  tokensOut?: number;
+  estimatedCostEur?: number;
 }
 
 /** Strict JSON shape we ask every provider to return. */
@@ -179,6 +211,12 @@ const VISION_JSON_SCHEMA_DESCRIPTION = `Return ONLY a valid JSON object (no mark
   "supplier": string|null,            // supplier/issuer trade name
   "supplierNif": string|null,         // Portuguese NIF if issuer is PT
   "supplierVatId": string|null,       // country-prefixed VAT ID otherwise (e.g. "ESB12345678", "FRXX...", "DE123456789")
+  "supplierAddress": string|null,     // Morada/rua do fornecedor (ex: "Pol. Ind. Oeste, C/ Uruguay, Parc. 11/1", "Av. da Liberdade 100")
+  "supplierPostalCode": string|null,  // Código postal do fornecedor (ex: "30820", "1000-001")
+  "supplierCity": string|null,        // Cidade/localidade do fornecedor (ex: "Alcantarilla", "Lisboa")
+  "supplierPhone": string|null,       // Telefone ou telemóvel de contacto do fornecedor
+  "supplierEmail": string|null,       // Email de contacto do fornecedor
+  "supplierWebsite": string|null,     // Website do fornecedor
   "customer": string|null,
   "customerNif": string|null,
   "docNumber": string|null,           // e.g. "FT 2026/123", "A/2026-45", "INV-UK-2026-15"
@@ -191,9 +229,11 @@ const VISION_JSON_SCHEMA_DESCRIPTION = `Return ONLY a valid JSON object (no mark
   "currency": string|null,            // ISO 4217 (EUR, USD, GBP, CHF, ...)
   "iban": string|null,                // IBAN visivel no documento (espacos sao OK)
   "country": string|null,             // ISO 3166-1 alpha-2 do emitente (PT, ES, FR, ...)
-  "discountAmount": number|null,      // DESCONTO GLOBAL da fatura (cabeçalho), em moeda do documento. Nulo quando não aplicável. DISTINCT from per-line discount which is per line item. null (not 0) when the invoice has no global discount.
+  "discountAmount": number|null,      // DESCONTO GLOBAL da fatura (cabeçalho), em moeda do documento. Nulo quando não aplicável. DISTINCT from per-line discount which is per line item. null (not 0) when the invoice has no global discount. Fase 4.2: this ALSO covers any header-level deduction printed as a currency amount, whatever it's labelled — "Desconto global", "Pronto pago"/"Pronto pagamento", "Desconto financeiro", "Descuento", "Early payment discount", "DPP" — as long as the printed value is a currency amount (not a %). A % value with the same labels goes in cashDiscountRate instead, never here.
   "ivaBreakdown": [{ "rate": number, "base": number, "tax": number }]|null,    // per-rate VAT breakdown — REQUIRED when the invoice has more than one VAT rate. base = sum of net amounts at that rate AFTER line-level discounts (before VAT). tax = base * rate/100. tax values must reconcile with taxAmount.
   "documentType": string|null,        // "FATURA" | "RECIBO" | "NOTA_CREDITO" | "NOTA_DEBITO" | "FACTURA" | "INVOICE" | ...
+  "documentTitle": string|null,       // The document's own heading, TRANSCRIBED VERBATIM, exactly as printed at the top of the page — "FACTURA", "OFERTA DE VENTA", "PRESUPUESTO", "NOTA DE CRÉDITO", "ORÇAMENTO", "PROFORMA", "ALBARÁN", "PURCHASE ORDER", "STATEMENT OF ACCOUNT". Copy the characters you see; do NOT translate, normalise, expand or interpret it. This is raw text for a downstream deterministic rule — an accurate transcription matters far more than a tidy label.
+  "correctedDocumentNumber": string|null, // For a CREDIT NOTE / NOTA DE CRÉDITO only: the number of the invoice it rectifies, as printed ("Ref. FT 2026/123", "Rectifica factura A-4471"). Return just the invoice number. null on every other document type.
   "lineItems": [                      // structured line items (best-effort; null when the document has none)
     {
       "description": string|null,    // product/service description
@@ -201,7 +241,7 @@ const VISION_JSON_SCHEMA_DESCRIPTION = `Return ONLY a valid JSON object (no mark
       "quantity": number|null,        // quantity in the line's unit
       "unitPrice": number|null,       // net unit price (without VAT, BEFORE line discount)
       "vatRate": number|null,         // VAT rate applied, as a percentage (e.g. 23)
-      "discount": number|null,        // per-line discount amount, in document currency. Nulo when none. The lineTotal reported is the gross/net AFTER this discount.
+      "discount": number|null,        // per-line discount COLUMN VALUE, exactly as printed — a currency amount OR a percentage, whichever the supplier's column header says ("Dto." / "Desc." / "Discount" columns are often a PERCENTAGE, e.g. "Dto. 30,00" meaning 30%, not €30). Do NOT decide the unit yourself — just copy the printed number. Nulo when none. The lineTotal reported is the gross/net AFTER this discount is applied, whatever unit it is in — that lineTotal is what downstream code uses to work out whether the printed number was a % or an amount.
       "lineTotal": number|null        // line total (net or gross, whichever the supplier prints)
     }
   ]|null,
@@ -223,11 +263,15 @@ Tenant identity will be supplied below. If for any reason no tenant identity was
 Your job: extract the structured fields from whatever document the user provides (PDF page, image, or raw OCR text — Portuguese, Spanish, French, English, German, Italian). Read the document the way a human auditor would — printed text, tables, AND visual patterns like QR codes. The Portuguese AT QR code printed on every PT-compliant invoice is one of those patterns: look at the QR graphic in the image and read its payload as if it were text (you can OCR the modules visually), then return that payload verbatim in \`atQrRaw\`. Do not skip it.
 
 Accounting framing:
-- Decide \`documentType\` (FATURA / RECIBO / NOTA_CREDITO / NOTA_DEBITO / FATURA_RECIBO / etc.) from the document's own header, not from the file name.
+- Decide \`documentType\` (FATURA / RECIBO / NOTA_CREDITO / NOTA_DEBITO / ENCOMENDA / etc.) from the document's own header, not from the file name. CRITICAL: If the document is a purchase order or order confirmation ("CONFIRMACIÓN DE PEDIDO", "CONFIRMAÇÃO DE ENCOMENDA", "ORDER CONFIRMATION", "PURCHASE ORDER", "NOTA DE ENCOMENDA"), \`documentType\` MUST be "ENCOMENDA" (NEVER "FATURA").
+- ALWAYS fill \`documentTitle\` with the heading exactly as printed, character for character, in the document's own language. This is not a classification — it is a transcription. A downstream deterministic rule reads it to decide whether the document is fiscal at all, so a quotation whose heading reads "OFERTA DE VENTA" must come back as "OFERTA DE VENTA" and not as "FACTURA".
+- A Portuguese ATCUD exists ONLY on Portuguese AT-certified documents. NEVER produce an ATCUD-shaped code for a non-Portuguese document, and never invent one: if you cannot read it from the document, the corresponding field stays null.
+- NEVER invent a tax number. If the NIF / VAT / CIF is not legible, return null. A guessed identifier is far worse than a missing one.
 - Map every expense onto an SNC/PGC account in \`suggestedCategory\`. Common mappings for supplier invoices (FSE — Fornecimentos e Serviços Externos): "62.2.1 — Trabalhos especializados", "62.2.2 — Publicidade e propaganda", "62.2.3 — Vigilância e segurança", "62.2.4 — Honorários", "62.2.5 — Comissões", "62.2.6 — Conservação e reparação", "62.3.1 — Ferramentas e utensílios", "62.3.2 — Livros e documentação técnica", "62.3.3 — Material de escritório", "62.4.1 — Eletricidade", "62.4.2 — Combustíveis", "62.4.3 — Água", "62.4.4 — Gás", "62.5 — Deslocações, estadas e transporte", "62.6 — Serviços diversos". Common mappings for goods (CMVMC): "31.1 — Mercadorias", "31.2 — Matérias-primas". Use the most specific code you can justify. When in doubt pick a generic parent (e.g. "62 — Fornecimentos e serviços externos"). \`suggestedCategory\` is the signal that drives auto-filing into the correct accounting folder — be precise.
 - Set \`isEuIntracommunity\` to true ONLY when the supplier is a non-Portuguese EU entity (any country in the EU except Portugal), the document is a true invoice (not a simplified receipt), and Portuguese VAT is NOT being charged (reverse charge / autoliquidação). A Spanish supplier charging 21% Spanish VAT is NOT intracommunity. A Spanish supplier issuing an invoice with no VAT for an EU B2B customer IS intracommunity.
 - Extract \`lineItems\` from every line of the table — description, quantity, unit price, VAT rate, line total, AND per-line discount when printed ("Desconto" / "Desc" / "Discount" / "Rabatt" / "Remise"). Cap at the most informative 30 rows when the invoice is very long, but never drop the totals rows.
-- ALWAYS extract \`dueDate\` — the payment deadline / "Prazo de pagamento" / "Due date" / "Fälligkeit" / "Échéance". Look near "Vencimento", "A pagar até", "Data limite", or the final payment-terms block. Return null only when truly absent; do NOT confuse with the invoice issue date (\`docDate\`).
+- ALWAYS extract \`dueDate\` — the payment deadline / "Prazo de pagamento" / "Due date" / "Fälligkeit" / "Échéance" / "Vencimiento". Look near "Vencimento", "Vencimiento", "A pagar até", "Data limite", or the final payment-terms block. If the document states payment terms like "Forma de Pago: 30 DÍAS", "30 dias", or "Net 30" without a calendar date, compute \`dueDate\` = \`docDate\` + N days (e.g. 2026-09-15 + 30 days = 2026-10-15). If it says "Pronto pagamento" / "Contado", \`dueDate\` = \`docDate\`. Return null only when truly absent; do NOT confuse with the invoice issue date (\`docDate\`).
+- ALWAYS extract \`supplierPhone\` — phone or mobile number of the issuing supplier (near "Teléfono", "Telefone", "Tel:").
 - \`discountAmount\` is the INVOICE-LEVEL discount ("Desconto global", "Desconto de cabeçalho", "Total desconto") — a single amount subtracted from the subtotal before VAT. Distinct from per-line \`discount\` on each lineItem. Return null (not 0) when neither is present.
 - \`cashDiscountRate\` is the "desconto de pronto pagamento" — only present on PT and ES supplier invoices; null otherwise.
 - \`ivaBreakdown\` MUST be present whenever the invoice carries more than one VAT rate — group line items by \`vatRate\` and emit one entry per rate: { rate, base, tax } where base = sum of net amounts at that rate (AFTER any per-line discounts, BEFORE global discount) and tax = base * rate/100. The sum of \`tax\` across all rates MUST equal \`taxAmount\`. Emit \`ivaBreakdown\` as null when the invoice has only one rate (the UI surfaces taxAmount in that case).
@@ -286,42 +330,107 @@ export class VisionService {
    * phone photos that the 2.5-flash primary misreads).
    */
   private readonly openrouterEscalateModel: string;
+  private readonly geminiUrl: string;
+  private readonly openaiUrl: string;
+  private readonly anthropicUrl: string | null;
+  /** Fase 2 — configurable auto-routing order (VISION_PROVIDER_ORDER). */
+  private readonly providerOrder: VisionProviderName[];
+  /** Fase 2 — below this confidence a second provider is consulted. */
+  private readonly secondOpinionThreshold: number;
+
+  // Gemini is reached THROUGH OpenRouter (OPENROUTER_API_KEY, model
+  // google/gemini-2.5-flash) — there is no direct Google key in this
+  // deployment. A direct `gemini` gateway stays supported as an optional
+  // second provider.
+  static readonly DEFAULT_PROVIDER_ORDER: VisionProviderName[] = [
+    'openrouter',
+    'gemini',
+    'minimax',
+    'openai',
+    'anthropic',
+  ];
+
+  static parseProviderOrder(raw: string | undefined): VisionProviderName[] {
+    const valid = new Set<string>(VisionService.DEFAULT_PROVIDER_ORDER);
+    const parsed = (raw ?? '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter((s): s is VisionProviderName => valid.has(s));
+    const unique = parsed.filter((p, i) => parsed.indexOf(p) === i);
+    // Providers not mentioned keep their default relative order after the
+    // explicit ones, so a partial list like "openrouter" still falls back.
+    for (const p of VisionService.DEFAULT_PROVIDER_ORDER) {
+      if (!unique.includes(p)) unique.push(p);
+    }
+    return unique;
+  }
+
+  static parseThreshold(raw: string | undefined): number {
+    const n = Number(raw);
+    if (!raw || !Number.isFinite(n) || n < 0 || n > 1) return 0.7;
+    return n;
+  }
+
+  /** ConfigService.get that treats "" as unset (docker-compose passes unset vars as ""). */
+  private cfg(name: string): string | undefined {
+    const v = this.config.get<string>(name);
+    return typeof v === 'string' && v.trim().length > 0 ? v.trim() : undefined;
+  }
 
   constructor(
     private config: ConfigService,
     @Optional()
     private readonly prisma?: PrismaService,
+    @Optional()
+    private readonly faturista?: FaturistaProvider,
   ) {
-    this.anthropicKey = this.readKey('ANTHROPIC_API_KEY');
-    this.openaiKey = this.readKey('OPENAI_API_KEY');
-    this.geminiKey = this.readKey(['GOOGLE_API_KEY', 'GEMINI_API_KEY']);
-    this.openrouterKey = this.readKey('OPENROUTER_API_KEY');
-    this.minimaxKey = this.readKey('MINIMAX_API_KEY');
+    // Fase 2 — every provider is a gateway {URL, TOKEN, MODEL}. The
+    // `<PROVIDER>_TOKEN` / `<PROVIDER>_MODEL` / `<PROVIDER>_URL` names are
+    // canonical (docs/LLM_GATEWAY_PLAN.md); the older `*_API_KEY` /
+    // `*_VISION_MODEL` names stay as aliases so no deployment breaks.
+    // Empty strings (docker-compose passes unset vars as "") count as unset.
+    this.anthropicKey = this.readKey(['ANTHROPIC_TOKEN', 'ANTHROPIC_API_KEY']);
+    this.openaiKey = this.readKey(['OPENAI_TOKEN', 'OPENAI_API_KEY']);
+    this.geminiKey = this.readKey(['GEMINI_TOKEN', 'GOOGLE_API_KEY', 'GEMINI_API_KEY']);
+    this.openrouterKey = this.readKey(['OPENROUTER_TOKEN', 'OPENROUTER_API_KEY']);
+    this.minimaxKey = this.readKey(['MINIMAX_TOKEN', 'MINIMAX_API_KEY']);
     this.anthropicModel =
-      this.config.get<string>('ANTHROPIC_VISION_MODEL') ??
-      this.config.get<string>('ANTHROPIC_MODEL') ??
+      this.cfg('ANTHROPIC_MODEL') ??
+      this.cfg('ANTHROPIC_VISION_MODEL') ??
       'claude-3-5-sonnet-20241022';
     this.openaiModel =
-      this.config.get<string>('OPENAI_VISION_MODEL') ?? 'gpt-4o';
+      this.cfg('OPENAI_MODEL') ?? this.cfg('OPENAI_VISION_MODEL') ?? 'gpt-4o';
     this.geminiModel =
-      this.config.get<string>('GEMINI_VISION_MODEL') ?? 'gemini-3.6-flash';
+      this.cfg('GEMINI_MODEL') ?? this.cfg('GEMINI_VISION_MODEL') ?? 'gemini-3.6-flash';
     this.openrouterModel =
-      this.config.get<string>('OPENROUTER_VISION_MODEL') ??
+      this.cfg('OPENROUTER_MODEL') ??
+      this.cfg('OPENROUTER_VISION_MODEL') ??
       'google/gemini-2.5-flash';
     this.minimaxModel =
-      this.config.get<string>('MINIMAX_VISION_MODEL') ?? 'MiniMax-M3';
-    // Gateway-style URL config — defaults are the canonical
-    // OpenAI-compatible chat/completions endpoints but every user can
-    // swap them via .env without code changes.
+      this.cfg('MINIMAX_MODEL') ?? this.cfg('MINIMAX_VISION_MODEL') ?? 'MiniMax-M3';
     this.openrouterUrl =
-      this.config.get<string>('OPENROUTER_URL') ??
+      this.cfg('OPENROUTER_URL') ??
       'https://openrouter.ai/api/v1/chat/completions';
     this.minimaxUrl =
-      this.config.get<string>('MINIMAX_URL') ??
+      this.cfg('MINIMAX_URL') ??
       'https://api.minimax.io/v1/chat/completions';
+    this.geminiUrl = (
+      this.cfg('GEMINI_URL') ??
+      'https://generativelanguage.googleapis.com/v1beta'
+    ).replace(/\/+$/, '');
+    this.openaiUrl =
+      this.cfg('OPENAI_URL') ?? 'https://api.openai.com/v1/chat/completions';
+    this.anthropicUrl = this.cfg('ANTHROPIC_URL') ?? null;
     this.openrouterEscalateModel =
-      this.config.get<string>('OPENROUTER_VISION_MODEL_ESCALATE') ??
+      this.cfg('OPENROUTER_MODEL_ESCALATE') ??
+      this.cfg('OPENROUTER_VISION_MODEL_ESCALATE') ??
       'google/gemini-2.5-pro';
+    this.providerOrder = VisionService.parseProviderOrder(
+      this.cfg('VISION_PROVIDER_ORDER'),
+    );
+    this.secondOpinionThreshold = VisionService.parseThreshold(
+      this.cfg('VISION_SECOND_OPINION_CONFIDENCE'),
+    );
 
     if (this.liveProviderAvailable) {
       this.logger.log(
@@ -344,7 +453,8 @@ export class VisionService {
       this.hasOpenAI ||
       this.hasGemini ||
       this.hasOpenrouter ||
-      this.hasMinimax
+      this.hasMinimax ||
+      Boolean(this.faturista?.isAvailable)
     );
   }
 
@@ -363,6 +473,24 @@ export class VisionService {
   get hasMinimax(): boolean {
     return !!this.minimaxKey;
   }
+  hasProvider(p: VisionProviderName): boolean {
+    switch (p) {
+      case 'gemini':
+        return this.hasGemini;
+      case 'openrouter':
+        return this.hasOpenrouter;
+      case 'minimax':
+        return this.hasMinimax;
+      case 'openai':
+        return this.hasOpenAI;
+      case 'anthropic':
+        return this.hasAnthropic;
+      case 'faturista':
+        return Boolean(this.faturista?.isAvailable);
+      default:
+        return false;
+    }
+  }
 
   /**
    * Which provider we'd use by default given the keys configured.
@@ -374,11 +502,8 @@ export class VisionService {
    *      photo with `MINIMAX_API_KEY` set. OpenAI-compatible response
    *      shape; tolerates a <think> block before the JSON.
    *   2. **OpenRouter** FALLBACK — `google/gemini-2.5-flash` via
-   *      OpenRouter. Kept on because OpenRouter has historically been
-   *      the most reliable path on real phone photos even though it
-   *      intermittently truncates long JSON payloads (the 3-attempt
-   *      retry loop in `callOpenRouterWithModel` mitigates this).
-   *   3. **direct Gemini** LAST-RESORT — only used when both
+   *      OpenRouter. Free, multimodal, fast, returns in 3-8s.
+   *   3. **Direct Gemini** COLD BACKUP — used only when BOTH
    *      MiniMax and OpenRouter are unreachable AND a direct Gemini
    *      key is configured. Direct keys have been quota-exhausted
    *      recently; this is the cold backup.
@@ -389,25 +514,19 @@ export class VisionService {
    */
   resolveProvider(
     preferred: VisionAnalysisRequest['preferredProvider'] = 'auto',
-  ):
-    | 'anthropic'
-    | 'openai'
-    | 'gemini'
-    | 'openrouter'
-    | 'minimax'
-    | null {
+  ): VisionProviderName | null {
     if (preferred === 'anthropic' && this.hasAnthropic) return 'anthropic';
     if (preferred === 'openai' && this.hasOpenAI) return 'openai';
     if (preferred === 'gemini' && this.hasGemini) return 'gemini';
     if (preferred === 'openrouter' && this.hasOpenrouter) return 'openrouter';
     if (preferred === 'minimax' && this.hasMinimax) return 'minimax';
+    if (preferred === 'faturista' && this.faturista?.isAvailable) return 'faturista';
     if (preferred !== 'auto') return null;
-    // Auto routing — MiniMax first (per 2026-09-01 user decision).
-    if (this.hasMinimax) return 'minimax';
-    if (this.hasOpenrouter) return 'openrouter';
-    if (this.hasGemini) return 'gemini';
-    if (this.hasOpenAI) return 'openai';
-    if (this.hasAnthropic) return 'anthropic';
+    // Fase 2 — OpenRouter (Gemini 2.5 Flash via OpenRouter) is the primary
+    // vision provider; the rest follow VISION_PROVIDER_ORDER.
+    for (const p of this.providerOrder) {
+      if (this.hasProvider(p)) return p;
+    }
     return null;
   }
 
@@ -443,6 +562,10 @@ export class VisionService {
     const provider = this.resolveProvider(request.preferredProvider);
     if (!provider) {
       return null;
+    }
+
+    if (provider === 'faturista') {
+      return this.faturista?.extract(request) ?? null;
     }
 
     // If we got neither a multimodal payload nor text, refuse — the caller
@@ -518,6 +641,39 @@ export class VisionService {
       // null payloads, or low-confidence guesses are treated as a
       // failure and we fall through to the next provider in the chain.
       if (isUsableForFallback(result)) {
+        // Fase 2 — second opinion: when the winning result is weak
+        // (confidence < VISION_SECOND_OPINION_CONFIDENCE, default 0.7) and
+        // another provider is configured, ask it too and keep the more
+        // confident answer. Bounded to ONE extra call.
+        if (
+          result.confidence < this.secondOpinionThreshold &&
+          i + 1 < chain.length &&
+          !result.secondOpinion
+        ) {
+          const next = chain[i + 1];
+          this.logger.warn(
+            `Vision: '${current}' returned confidence=${result.confidence.toFixed(2)} ` +
+              `< ${this.secondOpinionThreshold} — asking '${next}' for a second opinion.`,
+          );
+          try {
+            const second = await this.tryProvider(next, request, timeoutMs);
+            second.processingTimeMs = Date.now() - started;
+            if (isUsableForFallback(second) && second.confidence > result.confidence) {
+              this.logger.log(
+                `Vision: second opinion from '${next}' wins ` +
+                  `(${second.confidence.toFixed(2)} > ${result.confidence.toFixed(2)}).`,
+              );
+              second.secondOpinion = { provider: current, confidence: result.confidence };
+              result = second;
+            } else {
+              result.secondOpinion = { provider: next, confidence: second.confidence };
+            }
+          } catch (err) {
+            this.logger.warn(
+              `Vision: second opinion from '${next}' failed: ${(err as Error).message}`,
+            );
+          }
+        }
         if (current !== provider) {
           this.logger.log(
             `Vision: primary '${provider}' returned no usable data; ` +
@@ -581,9 +737,11 @@ export class VisionService {
     primary: 'anthropic' | 'openai' | 'gemini' | 'openrouter' | 'minimax',
   ): Array<'gemini' | 'openrouter' | 'minimax' | 'anthropic' | 'openai'> {
     const canonical: Array<'minimax' | 'openrouter' | 'gemini'> = [];
-    if (this.hasMinimax) canonical.push('minimax');
-    if (this.hasOpenrouter) canonical.push('openrouter');
-    if (this.hasGemini) canonical.push('gemini');
+    for (const p of this.providerOrder) {
+      if ((p === 'gemini' || p === 'openrouter' || p === 'minimax') && this.hasProvider(p)) {
+        canonical.push(p);
+      }
+    }
 
     // For the canonical primaries, dedupe so we don't call the same
     // provider twice when the user pinned a fallback as primary.
@@ -627,18 +785,12 @@ export class VisionService {
       }
       case 'openrouter': {
         const r = await this.callOpenRouter(request, timeoutMs);
-        // Tag with the canonical composite provider string so the
-        // operator can tell which upstream answered (the AI call body
-        // already returns the leaf model name like `gemini-2.5-flash`
-        // via OpenRouter's `model` field).
-        r.provider = 'openrouter/gemini-2.5-flash';
+        r.provider = `openrouter/${r.model}`;
         return r;
       }
       case 'minimax': {
         const r = await this.callMinimax(request, timeoutMs);
-        // Tag with the canonical composite provider string the user
-        // agreed on (2026-09-01).
-        r.provider = `minimax/${this.minimaxModel}`;
+        r.provider = `minimax/${r.model}`;
         return r;
       }
     }
@@ -779,9 +931,9 @@ export class VisionService {
     });
 
     if (provider === 'openrouter') {
-      return this.callOpenRouterRaw(userContent, strippedText, timeoutMs);
+      return this.callOpenRouterRaw(userContent, strippedText, timeoutMs, request2.modelOverride);
     }
-    return this.callGeminiRaw(userContent, strippedText, timeoutMs);
+    return this.callGeminiRaw(userContent, strippedText, timeoutMs, request2.modelOverride);
   }
 
   /**
@@ -793,6 +945,7 @@ export class VisionService {
     userContent: Array<Record<string, unknown>>,
     systemPrompt: string,
     timeoutMs: number,
+    modelOverride?: string,
   ): Promise<VisionAnalysisResult> {
     if (!this.openrouterKey) throw new Error('OPENROUTER_API_KEY not set');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -800,8 +953,9 @@ export class VisionService {
     if (typeof f !== 'function') {
       throw new Error('global fetch() is not available');
     }
+    const model = modelOverride || this.openrouterModel;
     const body = {
-      model: this.openrouterModel,
+      model,
       temperature: 0.0,
       max_tokens: 2048,
       response_format: { type: 'json_object' },
@@ -834,7 +988,7 @@ export class VisionService {
         model?: string;
       };
       const raw = json.choices?.[0]?.message?.content ?? '';
-      const reportedModel = json.model ?? this.openrouterModel;
+      const reportedModel = json.model ?? model;
       const modelForResult = stripVendorPrefix(reportedModel);
       return this.shapeResult('openrouter', modelForResult, raw, json.usage?.prompt_tokens, json.usage?.completion_tokens);
     } finally {
@@ -853,6 +1007,7 @@ export class VisionService {
     userContent: Array<Record<string, unknown>>,
     systemPrompt: string,
     timeoutMs: number,
+    modelOverride?: string,
   ): Promise<VisionAnalysisResult> {
     if (!this.geminiKey) throw new Error('GOOGLE_API_KEY/GEMINI_API_KEY not set');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -860,9 +1015,10 @@ export class VisionService {
     if (typeof f !== 'function') {
       throw new Error('global fetch() is not available');
     }
+    const model = modelOverride || this.geminiModel;
     const url =
-      `https://generativelanguage.googleapis.com/v1beta/models/` +
-      `${encodeURIComponent(this.geminiModel)}:generateContent?key=${encodeURIComponent(this.geminiKey)}`;
+      `${this.geminiUrl}/models/` +
+      `${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.geminiKey)}`;
     const body = {
       contents: [{ role: 'user', parts: userContent }],
       systemInstruction: { parts: [{ text: systemPrompt }] },
@@ -891,7 +1047,7 @@ export class VisionService {
       };
       const raw =
         json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
-      return this.shapeResult('gemini', this.geminiModel, raw, json.usageMetadata?.promptTokenCount, json.usageMetadata?.candidatesTokenCount);
+      return this.shapeResult('gemini', model, raw, json.usageMetadata?.promptTokenCount, json.usageMetadata?.candidatesTokenCount);
     } finally {
       clearTimeout(timer);
     }
@@ -1011,7 +1167,10 @@ export class VisionService {
 
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const Anthropic = require('@anthropic-ai/sdk').default;
-    const client = new Anthropic({ apiKey: this.anthropicKey });
+    const client = new Anthropic({
+      apiKey: this.anthropicKey,
+      ...(this.anthropicUrl ? { baseURL: this.anthropicUrl } : {}),
+    });
 
     const userContent: Array<Record<string, unknown>> = [];
     if (request.fileBase64 && request.mimeType) {
@@ -1042,9 +1201,10 @@ export class VisionService {
         (request.text ?? 'Extract the invoice fields from the attached document.'),
     });
 
+    const model = request.modelOverride || this.anthropicModel;
     const resp = (await this.withTimeout(
       client.messages.create({
-        model: this.anthropicModel,
+        model,
         max_tokens: 2048,
         temperature: 0.1,
         system: this.buildPrompt(request.documentContext),
@@ -1064,7 +1224,7 @@ export class VisionService {
 
     return this.shapeResult(
       'anthropic',
-      this.anthropicModel,
+      model,
       raw,
       resp.usage?.input_tokens,
       resp.usage?.output_tokens,
@@ -1106,8 +1266,9 @@ export class VisionService {
         (request.text ?? 'Extract the invoice fields from the attached document.'),
     });
 
+    const model = request.modelOverride || this.openaiModel;
     const body = {
-      model: this.openaiModel,
+      model,
       temperature: 0.1,
       max_tokens: 4096,
       response_format: { type: 'json_object' },
@@ -1120,7 +1281,7 @@ export class VisionService {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const resp = await f('https://api.openai.com/v1/chat/completions', {
+      const resp = await f(this.openaiUrl, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -1142,7 +1303,7 @@ export class VisionService {
       const raw = json.choices?.[0]?.message?.content ?? '';
       return this.shapeResult(
         'openai',
-        this.openaiModel,
+        model,
         raw,
         json.usage?.prompt_tokens,
         json.usage?.completion_tokens,
@@ -1181,9 +1342,10 @@ export class VisionService {
         (request.text ?? 'Extract the invoice fields from the attached document.'),
     });
 
+    const model = request.modelOverride || this.geminiModel;
     const url =
-      `https://generativelanguage.googleapis.com/v1beta/models/` +
-      `${encodeURIComponent(this.geminiModel)}:generateContent?key=${encodeURIComponent(this.geminiKey)}`;
+      `${this.geminiUrl}/models/` +
+      `${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.geminiKey)}`;
 
     const body = {
       contents: [{ role: 'user', parts }],
@@ -1224,7 +1386,7 @@ export class VisionService {
           .join('') ?? '';
       return this.shapeResult(
         'gemini',
-        this.geminiModel,
+        model,
         raw,
         json.usageMetadata?.promptTokenCount,
         json.usageMetadata?.candidatesTokenCount,
@@ -1251,7 +1413,8 @@ export class VisionService {
     request: VisionAnalysisRequest,
     timeoutMs: number,
   ): Promise<VisionAnalysisResult> {
-    return this.callOpenRouterWithModel(request, timeoutMs, this.openrouterModel);
+    const model = request.modelOverride || this.openrouterModel;
+    return this.callOpenRouterWithModel(request, timeoutMs, model);
   }
 
   /**
@@ -1639,8 +1802,9 @@ export class VisionService {
     // `stripThinkBlock` as a defensive safety net in case Opus 5 ever
     // reintroduces the reasoning block. Verified live against the
     // Américo Alves / 144.22 real-photo fixture.
+    const model = request.modelOverride || this.minimaxModel;
     const baseBody = {
-      model: this.minimaxModel,
+      model,
       temperature: 0.1,
       max_tokens: 8000,
       // Reasoning control — Opus 5 supports `thinking: { type:
@@ -1685,7 +1849,7 @@ export class VisionService {
           model?: string;
         };
         const raw = json.choices?.[0]?.message?.content ?? '';
-        const reportedModel = json.model ?? this.minimaxModel;
+        const reportedModel = json.model ?? model;
         const finishReason = json.choices?.[0]?.finish_reason;
         const shaped = this.shapeResult(
           'minimax',
@@ -1730,7 +1894,7 @@ export class VisionService {
         lastResult = shaped;
       } catch (err) {
         this.logger.warn(
-          `Vision: MiniMax/${this.minimaxModel} attempt ${attempt}/${maxAttempts} THREW: ` +
+          `Vision: MiniMax/${model} attempt ${attempt}/${maxAttempts} THREW: ` +
             `${(err as Error).message}. ${attempt < maxAttempts ? 'Retrying.' : 'Giving up.'}`,
         );
         if (attempt === maxAttempts) {
@@ -1746,7 +1910,7 @@ export class VisionService {
     }
     return {
       provider: 'minimax',
-      model: this.minimaxModel,
+      model,
       confidence: 0,
       extracted: {},
       rawResponse: '',
@@ -1831,6 +1995,28 @@ export class VisionService {
         ? clamp01(extracted.confidence)
         : 0.8;
 
+    const inTokens = tokensIn ?? 0;
+    const outTokens = tokensOut ?? 0;
+    let inRate = 0.2;
+    let outRate = 1.0;
+
+    const lowerModel = model.toLowerCase();
+    if (lowerModel.includes('sonnet')) {
+      inRate = 2.8; outRate = 14.0;
+    } else if (lowerModel.includes('haiku')) {
+      inRate = 0.75; outRate = 3.75;
+    } else if (lowerModel.includes('gpt-4o-mini')) {
+      inRate = 0.14; outRate = 0.56;
+    } else if (lowerModel.includes('gpt-4o')) {
+      inRate = 2.3; outRate = 9.2;
+    } else if (lowerModel.includes('flash')) {
+      inRate = 0.15; outRate = 0.6;
+    } else if (lowerModel.includes('pro')) {
+      inRate = 1.2; outRate = 4.8;
+    }
+
+    const estimatedCostEur = Number(((inTokens * inRate + outTokens * outRate) / 1_000_000).toFixed(6));
+
     return {
       provider,
       model,
@@ -1839,6 +2025,9 @@ export class VisionService {
       rawResponse: raw,
       processingTimeMs: 0, // overwritten by analyze() once the call returns
       fallbackUsed,
+      tokensIn: inTokens,
+      tokensOut: outTokens,
+      estimatedCostEur,
     };
   }
 }
@@ -1909,6 +2098,12 @@ export function normalizeExtractedFields(
     'supplierNif',
     'customerNif',
     'supplierVatId',
+    'supplierAddress',
+    'supplierPostalCode',
+    'supplierCity',
+    'supplierPhone',
+    'supplierEmail',
+    'supplierWebsite',
     'docNumber',
     'atcud',
     'docDate',
@@ -1999,6 +2194,18 @@ export function normalizeExtractedFields(
   // isEuIntracommunity — only set when the model emitted an explicit boolean.
   if (typeof raw['isEuIntracommunity'] === 'boolean') {
     out.isEuIntracommunity = raw['isEuIntracommunity'];
+  }
+  // Fase 4.1 — documentTitle: transcrição literal do cabeçalho. Só texto
+  // (a decisão fiscal/não-fiscal é tomada por código a jusante).
+  if (typeof raw['documentTitle'] === 'string') {
+    const title = raw['documentTitle'].trim();
+    if (title.length > 0) out.documentTitle = title.slice(0, 200);
+  }
+  // Fase 4.1 — correctedDocumentNumber: a fatura que uma nota de crédito
+  // retifica, tal como impressa no documento.
+  if (typeof raw['correctedDocumentNumber'] === 'string') {
+    const ref = raw['correctedDocumentNumber'].trim();
+    if (ref.length > 0) out.correctedDocumentNumber = ref.slice(0, 100);
   }
   // suggestedCategory — single free-form string. Trim and length-cap so a
   // chatty model can't bloat the metadata blob.

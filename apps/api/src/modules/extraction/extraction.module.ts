@@ -14,7 +14,18 @@ import { ExtractionController } from './extraction.controller';
 import { ExtractionProcessor } from './extraction.processor';
 import { ExtractionService } from './extraction.service';
 import { SupplierResolver } from './supplier-resolver';
+// Fase 4.1 — providos aqui directamente (são folhas, sem dependências
+// próprias) para o ExtractionService os receber mesmo com o forwardRef
+// do DocumentsModule pelo meio.
+import { ImageToPdfService } from '../documents/image-to-pdf/image-to-pdf.service';
+import { ArchiveImageService } from '../documents/image-to-pdf/archive-image.service';
+import { OcrmypdfService } from './ocrmypdf.service';
+import { ImageEnhancerService } from './image-enhancer.service';
 import { EXTRACTION_QUEUE, EXTRACTION_QUEUE_OPTIONS } from './extraction.constants';
+import { QueueModule } from '../../common/queue/queue.module';
+import { NifLookupModule } from '../nif-lookup/nif-lookup.module';
+import { EnrichmentModule } from '../enrichment/enrichment.module';
+import { PartiesModule } from '../parties/parties.module';
 
 /**
  * ExtractionModule — owns the AT-QR decode + OCR + IBAN anti-fraud flow.
@@ -43,7 +54,20 @@ import { EXTRACTION_QUEUE, EXTRACTION_QUEUE_OPTIONS } from './extraction.constan
     PrismaModule,
     StorageModule,
     AiModule,
+    NifLookupModule,
+    EnrichmentModule,
+    // QueueModule.forRoot() returns a DynamicModule with `global: true`,
+    // so the QUEUE_ADAPTER provider is reachable from any module in the
+    // app — including ExtractionService, which @Injects the symbol to
+    // publish `document.extracted` at the end of a successful
+    // processDocumentAsync. We import it here explicitly so that the
+    // extraction pipeline can publish pipeline events regardless of the
+    // order in which app.module.ts composes the feature modules, and
+    // so this module's wiring is self-contained — an operator reading
+    // extraction.module.ts can see all of its dependencies at a glance.
+    QueueModule.forRoot(),
     forwardRef(() => DocumentsModule),
+    forwardRef(() => PartiesModule),
     BullModule.registerQueueAsync({
       name: EXTRACTION_QUEUE,
       inject: [ConfigService],
@@ -67,8 +91,8 @@ import { EXTRACTION_QUEUE, EXTRACTION_QUEUE_OPTIONS } from './extraction.constan
     }),
   ],
   controllers: [ExtractionController],
-  providers: [ExtractionService, ExtractionProcessor, SupplierResolver],
-  exports: [ExtractionService, SupplierResolver, BullModule],
+  providers: [ExtractionService, ExtractionProcessor, SupplierResolver, ImageToPdfService, ArchiveImageService, OcrmypdfService, ImageEnhancerService],
+  exports: [ExtractionService, SupplierResolver, BullModule, OcrmypdfService, ImageEnhancerService],
 })
 export class ExtractionModule {
   private readonly logger = new Logger(ExtractionModule.name);

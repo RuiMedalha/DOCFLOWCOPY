@@ -1,4 +1,4 @@
-import { BadRequestException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import { DocumentOrigin, Prisma } from '@prisma/client';
 import { createHmac } from 'node:crypto';
 import { InboundService } from './inbound.service';
@@ -34,6 +34,7 @@ function buildStorageStub(): StorageService {
     getBuffer: jest.fn(async () => ({ buffer: Buffer.from(''), size: 0 })),
     remove: jest.fn(async () => undefined),
     exists: jest.fn(async () => true),
+    move: jest.fn(async () => undefined),
     getSignedUrl: jest.fn(async (k) => `/api/v1/documents/storage/${encodeURIComponent(k)}`),
   };
 }
@@ -81,6 +82,7 @@ describe('InboundService — security mitigations', () => {
 
     it('rejects when no provider headers and no secrets are configured (fail-closed)', async () => {
       delete process.env.SENDGRID_INBOUND_SECRET;
+      delete process.env.SENDGRID_WEBHOOK_PUBLIC_KEY;
       delete process.env.MAILGUN_WEBHOOK_SIGNING_KEY;
       await expect(
         svc.ingestWebhookEmail(
@@ -88,7 +90,7 @@ describe('InboundService — security mitigations', () => {
           [sampleFile],
           {} as any,
         ),
-      ).rejects.toBeInstanceOf(UnauthorizedException);
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
     });
 
     it('accepts a valid Mailgun signature', async () => {
@@ -212,6 +214,87 @@ describe('InboundService — security mitigations', () => {
           mailgunHeaders(token, ts, sig) as any,
         ),
       ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    // ──────── SendGrid ECDSA — AUDIT §5.1 hardening ────────
+    it('accepts a valid SendGrid ECDSA signature when SENDGRID_WEBHOOK_PUBLIC_KEY is configured', async () => {
+      // Generate an ephemeral P-256 key pair, sign the rawBody with the
+      // private key, then verify via the public key the way the service
+      // will. We use WebCrypto for key + sign (P1363 r||s output) and a
+      // manual DER wrapping so the service's verifier path matches.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { webcrypto } = require('node:crypto');
+      const subtle = (webcrypto as unknown as { subtle: SubtleCrypto }).subtle;
+      const pair = await subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign', 'verify'],
+      );
+      const rawBody = Buffer.from(
+        '--xBoundary\r\nContent-Disposition: form-data; name="to"\r\n\r\ninbox@docflow.test\r\n--xBoundary--\r\n',
+      );
+      const sigBuffer = await subtle.sign(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        pair.privateKey,
+        rawBody,
+      );
+      const p1363 = Buffer.from(sigBuffer); // 64 bytes for P-256
+      const pemPublic = await subtle.exportKey('spki', pair.publicKey);
+      const pem = Buffer.from(pemPublic).toString('base64');
+      const publicKeyPem =
+        '-----BEGIN PUBLIC KEY-----\n' +
+        pem.match(/.{1,64}/g)!.join('\n') +
+        '\n-----END PUBLIC KEY-----\n';
+
+      process.env.SENDGRID_WEBHOOK_PUBLIC_KEY = publicKeyPem;
+      delete process.env.SENDGRID_INBOUND_SECRET;
+      // mailgun stays from beforeEach
+      prisma.tenant.findFirst.mockResolvedValue(TENANT);
+      prisma.document.create.mockImplementation(async ({ data }: any) => ({
+        id: 'doc-ecdsa-1',
+        fileName: data.fileName,
+      }));
+
+      const out = await svc.ingestWebhookEmail(
+        { to: TENANT.scanEmail },
+        [sampleFile],
+        { 'x-sendgrid-signature': p1363.toString('base64'), rawBody } as any,
+      );
+      expect(out.processed).toBe(1);
+    });
+
+    it('rejects a forged SendGrid ECDSA signature when SENDGRID_WEBHOOK_PUBLIC_KEY is configured', async () => {
+      // Set a fake public key (any RSA key works as long as the verify
+      // step fails — the implementation should reject any present-but-
+      // invalid signature rather than fall through).
+      process.env.SENDGRID_WEBHOOK_PUBLIC_KEY =
+        '-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfaketpubkey==\n-----END PUBLIC KEY-----\n';
+      delete process.env.SENDGRID_INBOUND_SECRET;
+      const rawBody = Buffer.from('forged body bytes');
+
+      await expect(
+        svc.ingestWebhookEmail(
+          { to: TENANT.scanEmail },
+          [sampleFile],
+          {
+            'x-sendgrid-signature': Buffer.alloc(64, 0xab).toString('base64'),
+            rawBody,
+          } as any,
+        ),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('returns 503 fail-closed when NEITHER SendGrid nor Mailgun env is configured', async () => {
+      delete process.env.SENDGRID_INBOUND_SECRET;
+      delete process.env.SENDGRID_WEBHOOK_PUBLIC_KEY;
+      delete process.env.MAILGUN_WEBHOOK_SIGNING_KEY;
+      await expect(
+        svc.ingestWebhookEmail(
+          { to: TENANT.scanEmail },
+          [sampleFile],
+          {} as any,
+        ),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
     });
   });
 

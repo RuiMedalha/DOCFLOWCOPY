@@ -14,9 +14,16 @@ type PartyRow = {
   name: string;
   nif: string | null;
   iban: string | null;
+  address?: string | null;
+  postalCode?: string | null;
+  city?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  website?: string | null;
   country: string;
   isActive: boolean;
   isRecurring: boolean;
+  isRecurringManualOverride: boolean;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -45,7 +52,9 @@ function buildPrismaStub() {
             (where.nif.contains
               ? (p.nif ?? "").includes(where.nif.contains)
               : p.nif === where.nif)) &&
-          (!where?.country || p.country === where.country)
+          (!where?.country || p.country === where.country) &&
+          (!where?.iban || p.iban === where.iban) &&
+          (!where?.type || p.type === where.type)
         ) {
           if (select) {
             const out: any = {};
@@ -57,19 +66,37 @@ function buildPrismaStub() {
       }
       return null;
     }),
+    /**
+     * Fase 4.1 — o resolver passou a procurar por nome normalizado
+     * quando não há NIF validado (fallback que evita as três
+     * `CreateInfor` que apareceram em produção).
+     */
+    findMany: jest.fn(async ({ where }: any) => {
+      const out: any[] = [];
+      for (const p of dbParties.values()) {
+        if (
+          (!where?.tenantId || p.tenantId === where.tenantId) &&
+          (!where?.country || p.country === where.country) &&
+          (!where?.type || p.type === where.type)
+        ) {
+          out.push({ id: p.id, name: p.name, nif: p.nif, isRecurring: p.isRecurring });
+        }
+      }
+      return out;
+    }),
     create: jest.fn(async ({ data }: any) => {
       const id = `party-${++partyCounter}`;
       const now = new Date();
-      const row: PartyRow = {
+      const row: any = {
         id,
-        tenantId: data.tenantId,
-        type: data.type,
-        name: data.name,
+        ...data,
         nif: data.nif ?? null,
         iban: data.iban ?? null,
         country: data.country ?? "PT",
         isActive: data.isActive ?? true,
         isRecurring: data.isRecurring ?? false,
+        isRecurringManualOverride:
+          data.isRecurringManualOverride ?? false,
         createdAt: now,
         updatedAt: now,
       };
@@ -82,6 +109,28 @@ function buildPrismaStub() {
       Object.assign(row, data);
       row.updatedAt = new Date();
       return { ...row };
+    }),
+    /**
+     * Audit §3 TOCTOU fix: refreshRecurringFlag now uses updateMany keyed
+     * on `isRecurringManualOverride: false` for an atomic conditional
+     * write. The in-memory stub mirrors real semantics — only update rows
+     * that match ALL where-clause predicates, return { count }.
+     */
+    updateMany: jest.fn(async ({ where, data }: any) => {
+      let count = 0;
+      for (const p of dbParties.values()) {
+        if (
+          (!where?.id || p.id === where.id) &&
+          (where?.isRecurringManualOverride === undefined ||
+            (p as any).isRecurringManualOverride ===
+              where.isRecurringManualOverride)
+        ) {
+          Object.assign(p, data);
+          p.updatedAt = new Date();
+          count++;
+        }
+      }
+      return { count };
     }),
   };
 
@@ -118,6 +167,67 @@ function buildPrismaStub() {
 }
 
 describe("SupplierResolver", () => {
+  /**
+   * Fase 4.2 (P0.1) — invariante duro: nunca criamos/ligamos um Party
+   * FORNECEDOR com o NIF do próprio tenant (515208566, o fallback de
+   * identidade quando a base não tem tenant configurado — o mesmo
+   * usado em todos estes testes). Defesa em profundidade: mesmo que
+   * `ensureSupplierCustomerSanity` deixe passar algo, esta é a última
+   * linha antes de escrever na base.
+   */
+  it("Fase 4.2 (P0.1): BLOQUEIA a criação de um fornecedor com o NIF do próprio tenant", async () => {
+    const prisma = buildPrismaStub();
+    const resolver = new SupplierResolver(prisma as any);
+
+    const result = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "PT",
+      supplierName: "NOV OUSADO UNIPESSOAL LDA",
+      supplierNif: "515208566", // o nosso próprio NIF
+      aiConfidence: 0.95,
+    });
+
+    expect(prisma.dbParties.size).toBe(0); // nada foi criado
+    expect(result.party).toBeNull();
+    expect(result.supplierReview).toBe(true);
+    expect(result.reason).toBe("blocked_tenant_nif_as_supplier");
+  });
+
+  /**
+   * Fase 4.2 (P0.4.5) — último recurso de identificação: um IBAN já
+   * visto identifica o mesmo fornecedor mesmo quando não há NIF válido
+   * nem um nome que normalize de forma reconhecível.
+   */
+  it("Fase 4.2 (P0.4.5): liga pelo IBAN já conhecido quando NIF e nome falham", async () => {
+    const prisma = buildPrismaStub();
+    const resolver = new SupplierResolver(prisma as any);
+
+    // 1º documento: cria a Party com IBAN válido.
+    const first = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "PT",
+      supplierName: "Fornecedor Genuino Lda",
+      supplierNif: "502757191",
+      iban: "PT50000201231234567890154",
+      aiConfidence: 0.95,
+    });
+    expect(prisma.dbParties.size).toBe(1);
+
+    // 2º documento: NIF ilegível (falha mod-11) e nome tão diferente
+    // que a normalização não casa — só o IBAN sobrevive como sinal.
+    const second = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "PT",
+      supplierName: "Nome Completamente Diferente Distribuicao",
+      supplierNif: "999999999", // inválido
+      iban: "PT50 0002 0123 1234 5678 9015 4",
+      aiConfidence: 0.5,
+    });
+
+    expect(prisma.dbParties.size).toBe(1); // não criou uma segunda entidade
+    expect(second.party?.id).toBe(first.party?.id);
+  });
+
   it("creates a new Party on first supplier extraction with high confidence + valid PT NIF", async () => {
     const prisma = buildPrismaStub();
     const resolver = new SupplierResolver(prisma as any);
@@ -215,12 +325,20 @@ describe("SupplierResolver", () => {
     expect(ids[1]).toBe(ids[2]);
     const party = Array.from(prisma.dbParties.values())[0];
     expect(party.isRecurring).toBe(true);
-    expect(prisma.party.update).toHaveBeenCalledWith(
+    // Audit §3 TOCTOU fix: the auto-flip now uses updateMany keyed on
+    // `isRecurringManualOverride: false` — NOT a naive party.update. A
+    // regression to the old SELECT+UPDATE pair would re-open the TOCTOU
+    // window audited 2026-09-03.
+    expect(prisma.party.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: party.id },
+        where: {
+          id: party.id,
+          isRecurringManualOverride: false,
+        },
         data: { isRecurring: true },
       }),
     );
+    expect(prisma.party.update).not.toHaveBeenCalled();
   });
 
   it("sets supplierReview=true and still creates the Party when AI confidence < 0.8", async () => {
@@ -264,7 +382,13 @@ describe("SupplierResolver", () => {
     expect(party.nif).toBeNull();
   });
 
-  it("creates a Party with a country-prefixed VAT for foreign suppliers (no PT NIF)", async () => {
+  /**
+   * Fase 4.1 — um NIF-IVA estrangeiro deixou de se tornar a identidade
+   * do fornecedor só por ter a sintaxe certa. Sem confirmação do VIES
+   * fica em `vatNumber` como texto não validado (`viesValid: null`) e a
+   * coluna `nif` — que é a chave de identificação — não é preenchida.
+   */
+  it("keeps a foreign VAT as unvalidated text until VIES confirms it", async () => {
     const prisma = buildPrismaStub();
     const resolver = new SupplierResolver(prisma as any);
 
@@ -277,12 +401,109 @@ describe("SupplierResolver", () => {
     });
 
     expect(prisma.dbParties.size).toBe(1);
-    const party = Array.from(prisma.dbParties.values())[0];
+    const party: any = Array.from(prisma.dbParties.values())[0];
     expect(party.country).toBe("FR");
-    // The helper stores the VAT as the `nif` column with its country
-    // prefix so future lookups can match.
+    expect(party.nif).toBeNull();
+    expect(party.vatNumber).toBe("FR12345678901");
+    expect(party.viesValid).toBeNull();
+    expect(result.party).not.toBeNull();
+  });
+
+  it("promotes a foreign VAT to the identity column once VIES returns official data", async () => {
+    const prisma = buildPrismaStub();
+    const viesProvider = {
+      fetch: jest.fn(async () => ({
+        ok: true,
+        fields: { name: "SOCIETE FRANCAISE SARL", address: "1 Rue de Paris", city: "Paris", postalCode: "75001" },
+      })),
+    };
+    const resolver = new SupplierResolver(prisma as any, undefined, viesProvider as any);
+
+    await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "FR",
+      supplierName: "Société Française SARL",
+      supplierVatId: "FR12345678901",
+      aiConfidence: 0.91,
+    });
+
+    const party: any = Array.from(prisma.dbParties.values())[0];
     expect(party.nif).toBe("FR12345678901");
-    expect(result.supplierReview).toBe(false);
+    expect(party.vatNumber).toBe("FR12345678901");
+    expect(party.viesValid).toBe(true);
+  });
+
+  /**
+   * Fase 4.1 — a causa das três `CreateInfor` em produção: a IA trocou
+   * um dígito do NIF, o módulo 11 falhou, não se gravou NIF nenhum e a
+   * procura seguinte criou outra entidade. Agora o nome normalizado
+   * apanha-a.
+   */
+  it("links to the existing party by normalized name when the AI's NIF fails mod-11", async () => {
+    const prisma = buildPrismaStub();
+    const resolver = new SupplierResolver(prisma as any);
+
+    // 1º documento: NIF válido → cria a Party com NIF.
+    await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "PT",
+      supplierName: "CreateInfor",
+      supplierNif: "507298608",
+      aiConfidence: 0.95,
+    });
+    expect(prisma.dbParties.size).toBe(1);
+
+    // 2º documento: mesma empresa, NIF mal lido (507290608 falha mod-11)
+    // e nome com a forma jurídica — tem de ligar à MESMA Party.
+    const again = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "PT",
+      supplierName: "CreateInfor, Lda",
+      supplierNif: "507290608",
+      aiConfidence: 0.95,
+    });
+
+    expect(prisma.dbParties.size).toBe(1);
+    const party: any = Array.from(prisma.dbParties.values())[0];
+    expect(again.party?.id).toBe(party.id);
+    expect(party.nif).toBe("507298608");
+    expect(again.supplierReview).toBe(true); // o NIF inválido continua a pedir revisão
+  });
+
+  /**
+   * Fase 4.1 — o smoke em produção mostrou entidades estrangeiras com o
+   * NIF-IVA na coluna `nif` mas `viesValid` nulo e regime PT: o resolver
+   * só gravava a prova do VIES ao CRIAR a entidade, nunca ao reencontrar
+   * uma já existente. Sem a prova, o identificador era inverificável.
+   */
+  it("records the VIES proof on an EXISTING party, not only when creating it", async () => {
+    const prisma = buildPrismaStub();
+    const viesProvider = {
+      fetch: jest.fn(async () => ({ ok: true, fields: { name: "TEFCOLD ES SL" } })),
+    };
+    const resolver = new SupplierResolver(prisma as any, undefined, viesProvider as any);
+    const input = {
+      tenantId: TENANT_ID,
+      country: "ES",
+      supplierName: "TEFCOLD ES, S.L.",
+      supplierVatId: "ESB09802059",
+      aiConfidence: 0.95,
+    };
+    await resolver.resolve(input);
+    // Simula a linha antiga: NIF-IVA gravado sem prova nenhuma.
+    const party: any = Array.from(prisma.dbParties.values())[0];
+    party.viesValid = null;
+    party.vatNumber = null;
+    party.vatRegime = "PT";
+
+    await resolver.resolve(input); // segundo documento do mesmo fornecedor
+
+    expect(prisma.dbParties.size).toBe(1);
+    const after: any = Array.from(prisma.dbParties.values())[0];
+    expect(after.viesValid).toBe(true);
+    expect(after.vatNumber).toBe("ESB09802059");
+    expect(after.vatRegime).toBe("UE_REVERSE_CHARGE");
+    expect(after.viesValidatedAt).toBeInstanceOf(Date);
   });
 
   it("returns { party: null, supplierReview: true } on DB failure (no crash)", async () => {
@@ -331,5 +552,157 @@ describe("SupplierResolver", () => {
     });
     expect(b.party?.id).not.toBe(a.party?.id);
     expect(prisma.dbParties.size).toBe(2);
+  });
+
+  it("auto-enriches PT supplier with official name and address from NifLookupService", async () => {
+    const prisma = buildPrismaStub();
+    const mockNifLookup = {
+      lookup: jest.fn().mockResolvedValue({
+        nif: "500697256",
+        mod11Valid: true,
+        baseVerified: true,
+        name: "EDP Comercial - Comercialização de Energia, S.A.",
+        address: "Av. 24 de Julho 12, 1200-480 Lisboa",
+        source: "upstream",
+        fetchedAt: new Date().toISOString(),
+      }),
+    };
+
+    const resolver = new SupplierResolver(prisma as any, mockNifLookup as any);
+
+    const result = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "PT",
+      supplierName: "EDP",
+      supplierNif: "500697256",
+      aiConfidence: 0.95,
+    });
+
+    expect(mockNifLookup.lookup).toHaveBeenCalledWith(TENANT_ID, "system", "500697256");
+    expect(result.party).toBeDefined();
+    const party = Array.from(prisma.dbParties.values())[0];
+    expect(party.name).toBe("EDP Comercial - Comercialização de Energia, S.A.");
+    expect(party.address).toBe("Av. 24 de Julho 12");
+    expect((party as any).postalCode).toBe("1200-480");
+    expect((party as any).city).toBe("Lisboa");
+  });
+
+  it("auto-enriches existing supplier filling empty address and official name", async () => {
+    const prisma = buildPrismaStub();
+    // Existing party with provisional name and empty address
+    await prisma.party.create({
+      data: {
+        tenantId: TENANT_ID,
+        type: "FORNECEDOR",
+        name: "Fornecedor por identificar",
+        nif: "500697256",
+        country: "PT",
+      },
+    });
+
+    const mockNifLookup = {
+      lookup: jest.fn().mockResolvedValue({
+        nif: "500697256",
+        mod11Valid: true,
+        baseVerified: true,
+        name: "Razão Social Oficial Lda",
+        address: "Rua Central 100, 4000-001 Porto",
+        source: "upstream",
+        fetchedAt: new Date().toISOString(),
+      }),
+    };
+
+    const resolver = new SupplierResolver(prisma as any, mockNifLookup as any);
+
+    const result = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "PT",
+      supplierName: "Fornecedor por identificar",
+      supplierNif: "500697256",
+      aiConfidence: 0.9,
+    });
+
+    expect(result.reason).toBe("found");
+    expect(prisma.party.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          name: "Razão Social Oficial Lda",
+          address: "Rua Central 100",
+          postalCode: "4000-001",
+          city: "Porto",
+        }),
+      }),
+    );
+  });
+
+  it("auto-enriches EU supplier using ViesProvider", async () => {
+    const prisma = buildPrismaStub();
+    const mockVies = {
+      fetch: jest.fn().mockResolvedValue({
+        ok: true,
+        source: "vies",
+        fields: {
+          name: "Acme Europe SL",
+          address: "Calle Mayor 1, 28013 Madrid",
+          city: "Madrid",
+          postalCode: "28013",
+        },
+      }),
+    };
+
+    const resolver = new SupplierResolver(prisma as any, undefined, mockVies as any);
+
+    const result = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "ES",
+      supplierName: "Acme",
+      supplierVatId: "ESB12345678",
+      aiConfidence: 0.95,
+    });
+
+    expect(mockVies.fetch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        country: "ES",
+        nif: "B12345678",
+      }),
+    );
+    expect(result.party).toBeDefined();
+    const party = Array.from(prisma.dbParties.values())[0];
+    expect(party.name).toBe("Acme Europe SL");
+    expect(party.address).toBe("Calle Mayor 1");
+    expect((party as any).city).toBe("Madrid");
+    expect((party as any).postalCode).toBe("28013");
+  });
+
+  it("preserves invoice supplierName when Spanish VIES returns no name ('---')", async () => {
+    const prisma = buildPrismaStub();
+    const mockVies = {
+      fetch: jest.fn().mockResolvedValue({
+        ok: true,
+        source: "vies",
+        fields: {
+          name: null, // VIES Spain suppresses trader name
+          address: "Carrer del Castanyet, 132, 08430 Santa Coloma de Farners",
+          city: "Santa Coloma de Farners",
+          postalCode: "08430",
+        },
+      }),
+    };
+
+    const resolver = new SupplierResolver(prisma as any, undefined, mockVies as any);
+
+    const result = await resolver.resolve({
+      tenantId: TENANT_ID,
+      country: "ES",
+      supplierName: "GARCIA DE POU S.A.",
+      supplierVatId: "ESA08242851",
+      aiConfidence: 0.95,
+    });
+
+    expect(result.party).toBeDefined();
+    const party = Array.from(prisma.dbParties.values())[0];
+    expect(party.name).toBe("GARCIA DE POU S.A.");
+    expect(party.address).toBe("Carrer del Castanyet, 132");
+    expect((party as any).city).toBe("Santa Coloma de Farners");
   });
 });

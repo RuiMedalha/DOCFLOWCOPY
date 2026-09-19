@@ -943,13 +943,13 @@ describe('PaymentsService', () => {
         updatedAt: new Date(),
       });
 
-      const out = await svc.calendarView(TENANT_ID, '2026-08-01', '2026-09-30');
+      const out = await svc.calendarView(TENANT_ID, '2026-08-01', '2026-11-30');
 
       const items = out.items as Array<{ dueDate: string; status: PaymentStatus }>;
       const aug = items.find((i) => i.dueDate.startsWith('2026-08-'));
-      const sep = items.find((i) => i.dueDate.startsWith('2026-09-'));
+      const oct = items.find((i) => i.dueDate.startsWith('2026-10-'));
       expect(aug?.status).toBe(PaymentStatus.OVERDUE);
-      expect(sep?.status).toBe(PaymentStatus.SCHEDULED);
+      expect(oct?.status).toBe(PaymentStatus.SCHEDULED);
     });
   });
 });

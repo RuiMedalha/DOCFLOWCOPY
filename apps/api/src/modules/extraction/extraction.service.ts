@@ -29,7 +29,14 @@ import { PDFParse } from "pdf-parse";
 import { PrismaService } from "../../prisma/prisma.service";
 import { StorageService } from "../documents/storage/storage-service.interface";
 import { VisionService } from "../ai/vision.service";
+import { ZeroxService } from "../ai/zerox.service";
 import { FolderRulesEngine } from "../documents/folder-rules/folder-rules.engine";
+import {
+  ExpenseCategory,
+  isExpenseCategory,
+  mapToExpenseCategory,
+  VAT_DEDUCTIBILITY_HINTS,
+} from "../documents/folder-rules/folder-rules.types";
 import { DocumentsService } from "../documents/documents.service";
 import { SupplierResolver } from "./supplier-resolver";
 import {
@@ -38,8 +45,71 @@ import {
   ExtractionJob,
   ExtractionJobResult,
 } from "./extraction.constants";
-import { autoOrientImage, decodeAtQr } from "./qr-decode/qr-decoder";
-import type { ImageToPdfService } from "../documents/image-to-pdf/image-to-pdf.service";
+import { autoOrientImage } from "./qr-decode/qr-decoder";
+import { classifyFiscalStatus, isValidAtQr, normalizeDocNumber } from "./fiscal-status";
+import { reconcileTotals, signedAmounts } from "./totals-reconciliation";
+import { classifyLineDiscount } from "./line-discount";
+import {
+  calculateCertaintyScore,
+  CertaintyScoreResult,
+  extractAtcudFromText,
+  fieldConfidence,
+  resolveDocumentCountry,
+  resolveTaxIds,
+  sanitizeAtcud,
+  shouldClearStoredAtcud,
+  shouldClearStoredNif,
+} from "./field-validation";
+import { ViesService } from "../vies/vies.service";
+import { EcbFxService } from "../../common/fx/ecb-fx.service";
+import { pickAutoCategory } from "../parties/auto-category";
+import { decodeAtQrOffThread as decodeAtQr } from "./qr-decode/qr-decode-offthread";
+
+/** Remove postal code/city fragments duplicated in an extracted address. */
+function sanitizeExtractedSupplierAddress(
+  address: string,
+  postalCode?: string,
+  city?: string,
+): string {
+  let cleaned = address.trim();
+  for (const fragment of [postalCode, city]) {
+    const value = fragment?.trim();
+    if (!value) continue;
+    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    cleaned = cleaned.replace(new RegExp(`(?:^|[\\s,;|-])${escaped}(?=$|[\\s,;|-])`, "giu"), " ");
+  }
+  return cleaned
+    .replace(/\s*[,;|-]\s*(?=[,;|-]|$)/g, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[,;|-]+|[,;|-]+$/g, "")
+    .trim();
+}
+// Fase 4.1 — estes dois eram importados com `import type`, que apaga a
+// classe em tempo de execução: o `design:paramtypes` ficava `Object`,
+// o Nest não resolvia nada e o `@Optional()` escondia a falha. O
+// derivado PDF NUNCA era reconstruído — era por isso que as fotos
+// continuavam deitadas e com 3 MB no arquivo. Ambos os ficheiros são
+// folhas (só dependem de pdf-lib / jimp), por isso importá-los por
+// valor não cria ciclo de módulos.
+import { ImageToPdfService } from "../documents/image-to-pdf/image-to-pdf.service";
+import { ArchiveImageService } from "../documents/image-to-pdf/archive-image.service";
+import { OcrmypdfService } from "./ocrmypdf.service";
+import { ImageEnhancerService } from "./image-enhancer.service";
+// Sprint I — publish `document.extracted` so the processing pipeline's
+// EXTRACTING → ENRICHING handler runs. Previously the extraction service
+// returned its result but never told the pipeline to advance — documents
+// were stuck in EXTRACTING until manual intervention. QueueAdapter is
+// global (QueueModule.forRoot() in app.module.ts) so this resolves even
+// when ExtractionModule is the boot path.
+import { QUEUE_ADAPTER, type QueueAdapter } from "../../common/queue/queue-adapter.interface";
+// Sprint H+ extraction-fix-3 — structural NIF/IBAN validators used by
+// the filename-heuristic guard + the AI-vs-QR disagreement logger below.
+// The validator never throws on malformed input, so importing it is
+// safe in this hot path. `isValidIban` is already imported from
+// @docflow/shared at the top of the file — only `isValidPortugueseNif`
+// is new (the shared helper validates PT NIFs differently and is used
+// in different parts of the pipeline).
+import { isValidPortugueseNif } from "../../common/validation/tax-id.validator";
 
 /**
  * Where the text fed into the regex/QR pipeline came from. Recorded on
@@ -74,6 +144,12 @@ export interface ExtractedFields {
   supplierNif?: string;
   /** Country-prefixed VAT identifier when the issuer is outside Portugal. */
   supplierVatId?: string;
+  supplierAddress?: string;
+  supplierPostalCode?: string;
+  supplierCity?: string;
+  supplierPhone?: string;
+  supplierEmail?: string;
+  supplierWebsite?: string;
   customerNif?: string;
   supplier?: string;
   customer?: string;
@@ -101,6 +177,24 @@ export interface ExtractedFields {
    * that without evidence.
    */
   documentType?: DocumentType;
+  /**
+   * Fase 4.1 — cabeçalho do documento transcrito à letra pelo modelo
+   * ("OFERTA DE VENTA", "PRESUPUESTO", "FACTURA", "NOTA DE CRÉDITO"…).
+   * É só texto: a decisão de fiscal/não-fiscal continua a ser tomada
+   * em código por `detectNonFiscalKind`. Indispensável para as fotos,
+   * onde o OCR devolve vazio e não há mais nada para a regra ler.
+   */
+  documentTitle?: string;
+  /**
+   * Fase 4.1 — numa nota de crédito, o número da fatura que retifica
+   * (campo "documento retificado"). Usado para ligar a NC à fatura.
+   */
+  correctedDocumentNumber?: string;
+  /**
+   * Fase 4.1 — true quando soma(linhas) − descontos + IVA = total ao
+   * cêntimo. Só então os totais podem mostrar confiança alta.
+   */
+  totalsReconciled?: boolean;
   confidence: number;
   /**
    * Origin of the fields:
@@ -231,6 +325,7 @@ export class ExtractionService implements OnModuleDestroy {
   private lastVisionExtracted:
     | import("../ai/vision.service").VisionExtractedFields
     | null = null;
+  private lastAiExtraction: Record<string, any> | null = null;
 
   /**
    * HARDENED 2026-09-01: serial sync-fallback queue.
@@ -299,6 +394,33 @@ export class ExtractionService implements OnModuleDestroy {
     @Optional()
     @Inject(forwardRef(() => DocumentsService))
     private readonly documents?: DocumentsService,
+    // QueueAdapter — Sprint I wiring. Published `document.extracted`
+    // at the end of a successful processDocumentAsync so the
+    // processing pipeline's handleExtracted advances the doc from
+    // EXTRACTING → ENRICHING. Marked @Optional because the existing
+    // unit-test harness constructs ExtractionService without DI; the
+    // publish becomes a no-op (logs a warning) so the tests still pass.
+    @Optional()
+    @Inject(QUEUE_ADAPTER)
+    private readonly queueAdapter?: QueueAdapter,
+    @Optional()
+    private readonly vies?: ViesService,
+    @Optional()
+    private readonly fx?: EcbFxService,
+    // Fase 4.1 (P1.4) — endireita pelo conteúdo e comprime a imagem
+    // antes de a embeber no PDF de arquivo. @Optional pela mesma razão
+    // que o ImageToPdfService: o harness de testes não liga o módulo.
+    @Optional()
+    private readonly archiveImage?: ArchiveImageService,
+    // OCRmyPDF — conversão e enriquecimento PDF/A legal (art. 52.º CIVA) com OCR
+    @Optional()
+    private readonly ocrmypdf?: OcrmypdfService,
+    // Zerox — extração e particionamento de PDFs/fotos com visão IA e Markdown estruturado
+    @Optional()
+    private readonly zerox?: ZeroxService,
+    // Sharp — auto-rotação, recorte de borda de suporte (trim/crop), contraste e nitidez
+    @Optional()
+    private readonly imageEnhancer?: ImageEnhancerService,
   ) {}
 
   /**
@@ -425,7 +547,9 @@ export class ExtractionService implements OnModuleDestroy {
   async processDocumentAsync(
     input: ExtractionJob,
   ): Promise<ExtractionJobResult> {
-    const { tenantId, documentId, userId } = input;
+    const job = input;
+    const { tenantId, documentId, userId, modelOverride, providerOverride, forceReextract } = input;
+    this.lastAiExtraction = null;
     this.logger.log(
       `[processDocumentAsync] start document=${documentId} tenant=${tenantId}`,
     );
@@ -444,6 +568,77 @@ export class ExtractionService implements OnModuleDestroy {
         documentId,
         ok: false,
         reason: "document_not_found",
+      };
+    }
+
+    // Sprint H+ extraction-fix-3 — Operator-Verified Guard.
+    //
+    // If the operator has explicitly confirmed the supplier block via
+    // PATCH /documents/:id/verify-supplier (writes supplierVerifiedAt)
+    // OR has corrected it via POST /documents/:id/correct-supplier (the
+    // endpoint resets processingStatus back to RECEIVED so the pipeline
+    // re-runs the enrichment), we MUST NOT overwrite the supplier
+    // fields with freshly-AI-extracted values. The real bug from
+    // 2026-09-06 cmtoag5il: operator corrected supplier to ONNERA
+    // REFRIGERATION S.A., correct-supplier re-published document.uploaded,
+    // the pipeline re-extracted, and AI Vision — reading the filename
+    // "NOV-OUSADO-LDA_*.pdf" — overwrote the row back to "NOV OUSADO LDA".
+    //
+    // We honour the operator's decision by:
+    //   1) Skipping the supplier-side extraction entirely (no QR/AI merge
+    //      for supplier fields, no party re-resolve, no IBAN re-check).
+    //   2) Still writing metadata + ocrConfidence so the audit trail
+    //      shows the re-run happened but nothing was destroyed.
+    //   3) Returning ok:true so the pipeline can advance to ENRICHING.
+    //
+    // This is a behaviour change from the previous "AI always wins on
+    // re-run" stance, and the only way the operator's correction survives
+    // a pipeline re-trigger. The trade-off: if the operator is wrong, the
+    // wrong values stick until they re-verify or re-correct. That's
+    // intentional — the verify-supplier UX triad already requires an
+    // explicit "Confirmar como está" gesture for exactly this reason.
+    // Fase 4.3 (P0.1) — se for re-extração completa forçada, reprocessar de raiz
+    if (doc.supplierVerifiedAt && !job?.forceReextract) {
+      this.logger.warn(
+        `[processDocumentAsync] document=${documentId} supplierVerifiedAt=${doc.supplierVerifiedAt.toISOString()} ` +
+          `— skipping supplier-side extraction to preserve operator-verified ` +
+          `supplier block (supplier="${doc.supplier ?? "?"}", supplierNif="${doc.supplierNif ?? "?"}"). ` +
+          `Re-run is harmless (metadata/ocrConfidence will refresh) but won't ` +
+          `overwrite the operator's decision.`,
+      );
+      // Touch only metadata + ocrConfidence so the pipeline can advance.
+      // Status is left as-is — the operator already decided the row's fate.
+      const refreshed = await this.prisma.document.update({
+        where: { id: documentId },
+        data: {
+          metadata: {
+            ...((doc.metadata && typeof doc.metadata === "object" && !Array.isArray(doc.metadata)
+              ? (doc.metadata as Record<string, unknown>)
+              : {}) as Record<string, unknown>),
+            extraction: {
+              ...((doc.metadata &&
+                typeof doc.metadata === "object" &&
+                "extraction" in (doc.metadata as Record<string, unknown>) &&
+                (doc.metadata as Record<string, unknown>).extraction &&
+                typeof (doc.metadata as Record<string, unknown>).extraction === "object" &&
+                !Array.isArray((doc.metadata as Record<string, unknown>).extraction)
+                ? ((doc.metadata as Record<string, unknown>).extraction as Record<string, unknown>)
+                : {}) as Record<string, unknown>),
+              reRunSkippedSupplier: true,
+              reRunSkippedAt: new Date().toISOString(),
+              reRunSkippedReason: "supplierVerifiedAt_set",
+            },
+          } as Prisma.InputJsonValue,
+        },
+      });
+      return {
+        queued: false,
+        documentId,
+        ok: true,
+        source: "none",
+        confidence: 0,
+        reason: "supplier_verified_skip",
+        document: { id: refreshed.id, status: refreshed.status },
       };
     }
 
@@ -469,66 +664,80 @@ export class ExtractionService implements OnModuleDestroy {
     ) {
       try {
         const obj = await this.storage.getBuffer(doc.fileKey);
-        const oriented = await autoOrientImage(obj.buffer, doc.mimeType, this.logger);
-        // If autoOrient rewrote the bytes (returned something different),
-        // persist them so the next extractor/download/viewer sees an
-        // upright image. Use atomic write so the existing file is never
-        // half-overwritten.
+        let oriented = obj.buffer;
+        let enhancedMime = doc.mimeType;
+
+        if (this.imageEnhancer && this.imageEnhancer.isAvailable()) {
+          oriented = await this.imageEnhancer.processDocumentImage(obj.buffer, doc.mimeType);
+          enhancedMime = 'image/jpeg';
+        } else {
+          oriented = await autoOrientImage(obj.buffer, doc.mimeType, this.logger);
+        }
+
+        // If enhanced/oriented rewrote the bytes, persist them
         if (oriented !== obj.buffer) {
           try {
             if (!this.storage.put) {
               throw new Error("storage.put not available");
             }
             await this.storage.put(doc.fileKey, oriented, {
-              contentType: doc.mimeType,
+              contentType: enhancedMime,
             });
             this.logger.log(
-              `[processDocumentAsync] auto-rotated ${doc.fileName} ` +
-                `(original ${obj.buffer.length}B → upright ${oriented.length}B) ` +
-                `and persisted upright bytes`,
+              `[processDocumentAsync] enhanced/auto-rotated ${doc.fileName} ` +
+                `(original ${obj.buffer.length}B → enhanced ${oriented.length}B) ` +
+                `and persisted enhanced bytes`,
             );
-            // Same fix applies to the PDF derivative when one exists
-            // — pdf-lib previously embedded the sideways pixels, so the
-            // viewer would have shown the rotated version even after we
-            // fixed the upstream file. We rebuild the PDF here against
-            // the upright bytes. Best-effort: a pdf-lib failure is
-            // logged and the upload continues with the sideways PDF
-            // (which is the prior behaviour, not worse than before).
-            try {
-              const docRecord = await this.prisma.document.findFirst({
-                where: { id: documentId },
-                select: { pdfKey: true },
-              });
-              if (docRecord?.pdfKey && this.imageToPdf?.supports(doc.mimeType)) {
-                const newPdf = await this.imageToPdf.convert(
-                  oriented,
-                  doc.mimeType,
-                );
-                if (!this.storage.put) {
-                  throw new Error("storage.put not available");
-                }
-                await this.storage.put(docRecord.pdfKey, newPdf, {
-                  contentType: "application/pdf",
-                });
-                this.logger.log(
-                  `[processDocumentAsync] rebuilt pdf derivative ` +
-                    `${docRecord.pdfKey} from upright bytes`,
-                );
-              }
-            } catch (pdfErr) {
-              this.logger.warn(
-                `[processDocumentAsync] pdf derivative rebuild failed ` +
-                  `for ${doc.fileName}: ${(pdfErr as Error).message}`,
-              );
-            }
           } catch (putErr) {
             this.logger.warn(
-              `[processDocumentAsync] failed to persist upright bytes for ` +
-                `${doc.fileName}: ${(putErr as Error).message}. Continuing ` +
-                `with original bytes for QR decode.`,
+              `[processDocumentAsync] storage.put enhanced image failed for ${doc.fileName}: ` +
+                `${(putErr as Error).message}`,
             );
           }
         }
+
+        // Always ensure A4 PDF derivative exists for image uploads
+        try {
+          const docRecord = await this.prisma.document.findFirst({
+            where: { id: documentId },
+            select: { pdfKey: true },
+          });
+          const targetPdfKey = docRecord?.pdfKey || doc.fileKey.replace(/\.[^.]+$/, '.pdf');
+          if (this.ocrmypdf || (this.imageToPdf && this.imageToPdf.supports(enhancedMime))) {
+            const newPdf = this.ocrmypdf
+              ? await this.ocrmypdf.processImageOrPdf(oriented, enhancedMime)
+              : await this.imageToPdf!.convert(oriented, enhancedMime);
+            if (this.storage.put) {
+              await this.storage.put(targetPdfKey, newPdf, {
+                contentType: 'application/pdf',
+              });
+              if (!docRecord?.pdfKey) {
+                await this.prisma.document.update({
+                  where: { id: documentId },
+                  data: { pdfKey: targetPdfKey },
+                });
+                doc.pdfKey = targetPdfKey;
+              }
+              this.logger.log(
+                `[processDocumentAsync] built/rebuilt pdf derivative ` +
+                  `${targetPdfKey} from enhanced bytes`,
+              );
+            }
+          }
+        } catch (pdfErr) {
+          this.logger.warn(
+            `[processDocumentAsync] pdf derivative creation failed ` +
+              `for ${doc.fileName}: ${(pdfErr as Error).message}`,
+          );
+        }
+        // ── Fase 4.1 (P1.4) — PDF de arquivo: direito e ≤ 500 KB ───────
+        // O arquivo fiscal é de 10 anos: um JPEG de 3 MB por documento
+        // não é sustentável, e as fotos apareciam deitadas porque muitas
+        // não trazem etiqueta EXIF (a rotação EXIF acima só resolve as
+        // que trazem). Aqui endireitamos pelo conteúdo e comprimimos. O
+        // original fica intacto no MinIO; é o PDF que vai para arquivo.
+        await this.rebuildArchivePdf(documentId, doc, oriented);
+
         // Now try the QR decode on the upright bytes (always prefer the
         // rotated version when present — even when the persist step
         // failed, `oriented` is local and correct).
@@ -573,12 +782,56 @@ export class ExtractionService implements OnModuleDestroy {
     // camera capture) OVER everything; then a freshly ZXing-decoded QR
     // from this image; then the text layer of the PDF (which can carry
     // the QR string on a digital PDF export).
-    const storedQr = doc.qrPayload ? this.findAtQrInText(doc.qrPayload) : null;
-    const zxingCandidate = storedQr ? null : (zxingQr ? this.findAtQrInText(zxingQr) : null);
+    // Fase 3 — a stored payload is only trusted when it is a complete AT-QR
+    // (valid issuer NIF, ATCUD, Q hash, R certificate). Rows written before
+    // the Fase 2 cross-check may hold an LLM-mangled read-back; those are
+    // ignored so the deterministic decoders run again.
+    const storedParsed = doc.qrPayload ? parseAtQr(doc.qrPayload) : null;
+    const storedQrTrusted = isValidAtQr(storedParsed);
+    if (doc.qrPayload && !storedQrTrusted) {
+      this.logger.warn(
+        `[processDocumentAsync] stored qrPayload for document=${documentId} is not a complete AT-QR ` +
+          `(missing Q/R/ATCUD or invalid NIF) — ignoring it and re-decoding`,
+      );
+    }
+    const storedQr = storedQrTrusted && doc.qrPayload ? this.findAtQrInText(doc.qrPayload) : null;
+    let zxingCandidate = storedQr ? null : (zxingQr ? this.findAtQrInText(zxingQr) : null);
     const textQr = storedQr || zxingCandidate ? null : this.findAtQrInText(loaded.text);
+    // Fase 2 — deterministic QR for PDFs: when neither the stored payload
+    // nor the PDF text layer carries an AT-QR (scanned PDFs, or digital PDFs
+    // that draw the QR as an image), rasterise the first and last page and
+    // run the same ZXing/jsQR cascade used for photos. This runs BEFORE any
+    // vision call so NIF/total/ATCUD come from the QR, never from the LLM.
+    if (
+      !storedQr &&
+      !zxingCandidate &&
+      !textQr &&
+      /^application\/pdf/i.test(doc.mimeType) &&
+      this.storage
+    ) {
+      try {
+        const fromRaster = await this.decodeQrFromPdfRaster(doc, loaded.pageCount);
+        if (fromRaster) {
+          zxingQr = fromRaster;
+          zxingCandidate = fromRaster;
+          this.logger.log(
+            `[processDocumentAsync] ZXing decoded AT-QR from rasterised PDF page of ${doc.fileName}`,
+          );
+        }
+      } catch (err) {
+        this.logger.warn(
+          `[processDocumentAsync] PDF raster QR step failed for ${doc.fileName}: ${(err as Error).message}`,
+        );
+      }
+    }
     const qrCandidate = storedQr ?? zxingCandidate ?? textQr;
 
     let fields: ExtractedFields;
+    const aiOverrides =
+      modelOverride || providerOverride
+        ? { model: modelOverride, provider: providerOverride }
+        : undefined;
+
     if (qrCandidate) {
       // QR-AT + Gemini merge — the QR is AUTHORITATIVE for the fiscal
       // fields it carries (issuer NIF, doc type, total, tax, date,
@@ -588,9 +841,16 @@ export class ExtractionService implements OnModuleDestroy {
       // fills the gaps. If Gemini fails or times out we keep the QR
       // fields alone — never worse than today.
       const qrFields = this.extractFromQr(qrCandidate, doc);
-      fields = await this.mergeQrWithAi(qrFields, doc, loaded, tenantId);
+      fields = await this.mergeQrWithAi(
+        qrFields,
+        doc,
+        loaded,
+        tenantId,
+        undefined,
+        aiOverrides,
+      );
     } else {
-      fields = await this.runAiOrRegexPath(doc, loaded, tenantId);
+      fields = await this.runAiOrRegexPath(doc, loaded, tenantId, aiOverrides);
       // Gemini-assisted QR fallback: when the jsqr image decoder failed
       // on a real phone photo (small, angled, low-contrast QR) but
       // Gemini vision DID read the AT-QR string visually, treat that as
@@ -607,19 +867,46 @@ export class ExtractionService implements OnModuleDestroy {
       if (aiQrRaw && this.findAtQrInText(aiQrRaw)) {
         const validated = this.findAtQrInText(aiQrRaw);
         if (validated) {
-          this.logger.log(
-            `[processDocumentAsync] using AI-returned atQrRaw as QR candidate ` +
-              `(document=${documentId}, payload len=${validated.length})`,
-          );
           const qrFields = this.extractFromQr(validated, doc);
-          // Reset source so the merge can re-write it to "at_qr+ai".
-          const mergedFromAiQr = await this.mergeQrWithAi(qrFields, doc, loaded, tenantId);
-          // Preserve any AI-only fields (line items, discounts, supplier
-          // name, IBAN) the original AI-only pass captured but the
-          // merge-from-QR pass wouldn't otherwise see. mergeQrWithAi
-          // already re-runs the AI path internally; mergedFromAiQr is
-          // the authoritative result.
-          fields = mergedFromAiQr;
+          // Fase 2 — an LLM "reading" a QR is NOT a QR decode: the Fase 2
+          // benchmark caught a hallucinated NIF (valid check digit!) and a
+          // total of 5.20 on a 38.10 receipt. The read-back is only trusted
+          // when it agrees with the fields the same model extracted from the
+          // visible text (NIF, total, date). Otherwise the structured AI
+          // fields stay and the document is flagged for review.
+          const check = this.isAiQrConsistent(qrFields, fields);
+          if (check.ok) {
+            this.logger.log(
+              `[processDocumentAsync] using AI-returned atQrRaw as QR candidate ` +
+                `(document=${documentId}, payload len=${validated.length}, cross-checked with AI fields)`,
+            );
+            const mergedFromAiQr = await this.mergeQrWithAi(
+              qrFields,
+              doc,
+              loaded,
+              tenantId,
+              fields,
+              aiOverrides,
+            );
+            mergedFromAiQr.hints = [
+              ...(mergedFromAiQr.hints ?? []),
+              "qrOrigin:ai_vision_readback",
+            ];
+            fields = mergedFromAiQr;
+          } else {
+            this.logger.warn(
+              `[processDocumentAsync] AI-returned atQrRaw REJECTED for document=${documentId}: ` +
+                `${check.reasons.join(", ")} — keeping AI structured fields, flagging review`,
+            );
+            fields = {
+              ...fields,
+              hints: [...(fields.hints ?? []), "qrOrigin:ai_vision_readback_rejected"],
+              warnings: [
+                ...(fields.warnings ?? []),
+                `ai_qr_inconsistent_with_ai_fields:${check.reasons.join("|")}`,
+              ],
+            };
+          }
         }
       }
     }
@@ -641,7 +928,57 @@ export class ExtractionService implements OnModuleDestroy {
     // stored qrPayload, then the AI's vision read. The supplier-swap
     // safety net uses the most trustworthy QR string available.
     const qrForSanity = zxingQr ?? doc.qrPayload ?? aiQrForSanity ?? undefined;
-    fields = await this.ensureSupplierCustomerSanity(tenantId, fields, qrForSanity);
+    fields = await this.ensureSupplierCustomerSanity(
+      tenantId,
+      fields,
+      qrForSanity,
+      doc.fileName,
+    );
+
+    // ── Party-resolve-by-NIF fallback (DIAGNOSTIC-2 §5 item 7) ──────
+    // When the AI's supplier NIF is structurally invalid AND the customer
+    // NIF is structurally valid AND resolves to an existing Party in
+    // this tenant, the customer Party is almost certainly the actual
+    // supplier (AI swapped the slots). We rewrite the fields with the
+    // trusted Party's name + NIF and capture the resolved partyId on
+    // `resolvedPartyFromNif` so the SupplierResolver branch below links
+    // to the trusted Party instead of creating a brand-new (wrong)
+    // supplier row. Skipped when the document is already linked to a
+    // Party — that means the operator verified/corrected earlier and
+    // we MUST NOT overwrite.
+    let resolvedPartyFromNif: { id: string; isRecurring: boolean; name?: string } | null = null;
+    if (!doc.partyId) {
+      try {
+        const resolved = await this.resolveSupplierByNif(
+          tenantId,
+          documentId,
+          fields,
+        );
+        if (resolved) {
+          fields = {
+            ...fields,
+            supplier: resolved.supplier,
+            supplierNif: resolved.supplierNif,
+            customerNif: undefined, // clear — the buyer NIF was the supplier all along
+            hints: [
+              ...(fields.hints ?? []),
+              `partySwap:reason=${resolved.reason}`,
+              `partySwap:partyId=${resolved.partyId ?? "null"}`,
+            ],
+          };
+          if (resolved.partyId) {
+            resolvedPartyFromNif = { id: resolved.partyId, isRecurring: false, name: resolved.supplier };
+          }
+        }
+      } catch (err) {
+        // Belt + braces — never let the NIF-resolve fallback abort
+        // extraction. The supplier-resolver below still runs against
+        // the un-swapped fields and may still produce a useful link.
+        this.logger.warn(
+          `[processDocumentAsync] resolveSupplierByNif threw for document=${documentId}: ${(err as Error).message}`,
+        );
+      }
+    }
 
     const aiQrRawForRow = (fields.hints ?? [])
       .find((h) => h.startsWith("aiQrRaw:"))
@@ -652,8 +989,162 @@ export class ExtractionService implements OnModuleDestroy {
     // when both exist — the user explicitly asked for "QR first for
     // certainty of fiscal data". Only fall back to aiQrRaw when ZXing
     // didn't decode anything.
-    const qrPayloadOverride = zxingQr ?? aiQrRawForRow ?? undefined;
+    // Fase 2 — an AI read-back is only persisted as the row's qrPayload when
+    // it passed the cross-check (see isAiQrConsistent). A rejected read-back
+    // must never become the "stored QR" that short-circuits future re-runs.
+    const aiQrAccepted = (fields.hints ?? []).includes("qrOrigin:ai_vision_readback");
+    const qrPayloadOverride =
+      zxingQr ?? (aiQrAccepted ? aiQrRawForRow : undefined) ?? undefined;
+
+    const qrOriginForFiscal: "zxing" | "stored" | "pdf-text" | "ai" | null = zxingQr
+      ? "zxing"
+      : storedQr
+        ? "stored"
+        : textQr
+          ? "pdf-text"
+          : aiQrAccepted
+            ? "ai"
+            : null;
+    const qrForFiscal = qrPayloadOverride ?? (storedQrTrusted ? doc.qrPayload : null) ?? null;
+    // An ATCUD is authoritative only when it came from a real QR decode; an
+    // LLM read-back can flip a character (JJY2HD8C vs JJY2HD80 on the same
+    // IKEA receipt), so it may confirm a duplicate but never veto one.
+    const atcudTrusted = qrOriginForFiscal !== null && qrOriginForFiscal !== "ai";
+    const parsedForFiscal = qrForFiscal ? parseAtQr(qrForFiscal) : null;
+    // Fase 4 — VIES: a foreign EU VAT id validated by the Commission's
+    // service upgrades the document from INDETERMINADO to FISCAL.
+    let viesValidatedForDoc = false;
+    if (fields.supplierVatId && !/^PT/i.test(fields.supplierVatId) && this.vies) {
+      try {
+        viesValidatedForDoc = await this.vies.isValidated(fields.supplierVatId, tenantId);
+      } catch (err) {
+        this.logger.warn(`[processDocumentAsync] VIES check failed: ${(err as Error).message}`);
+      }
+    }
+
+    // ── Fase 4.1 — saneamento determinístico de NIF e ATCUD ──────────
+    // Um NIF ou um ATCUD inventados pelo modelo que sigam para a
+    // contabilidade são o pior erro possível neste sistema. Nada do que
+    // a IA leu nestes dois campos é persistido sem passar por código:
+    //   ATCUD  só existe em Portugal e só com o formato oficial da AT;
+    //   NIF    PT → módulo 11; UE → VIES; extra-UE → nunca confirmado.
+    const docCountry = resolveDocumentCountry({
+      country: fields.country,
+      supplierVatId: fields.supplierVatId,
+      supplierNif: fields.supplierNif,
+      qrIssuerNif: parsedForFiscal?.issuerNif,
+    });
+    const taxIds = resolveTaxIds({
+      supplierNif: fields.supplierNif ?? null,
+      supplierVatId: fields.supplierVatId ?? null,
+      country: docCountry,
+      viesValidated: viesValidatedForDoc,
+    });
+    // Fase 4.1 (P2.1) — o ATCUD chega, por esta ordem: campo H de um
+    // QR-AT realmente descodificado > "ATCUD:" impresso no texto/OCR >
+    // o que a IA disse. Em várias fotos o QR lia-se mas o ATCUD não
+    // chegava ao documento.
+    const atcudFromQr = atcudTrusted ? (parsedForFiscal?.atcud ?? null) : null;
+    const atcudFromText = extractAtcudFromText(loaded.text);
+    const atcudCandidate = atcudFromQr ?? atcudFromText ?? fields.atcud ?? null;
+    if (!fields.atcud && atcudCandidate) {
+      fields.hints = [
+        ...(fields.hints ?? []),
+        `atcudSource:${atcudFromQr ? "qr_field_h" : "ocr_text"}`,
+      ];
+    }
+    const atcudSan = sanitizeAtcud(atcudCandidate, {
+      country: docCountry,
+      fromTrustedQr: Boolean(atcudFromQr),
+    });
+    if (taxIds.rejected) {
+      this.logger.warn(
+        `[processDocumentAsync] document=${documentId} tax id rejected ` +
+          `(${taxIds.reason}) — NOT persisted, document goes to review`,
+      );
+    }
+    if (fields.atcud && !atcudSan.atcud) {
+      this.logger.warn(
+        `[processDocumentAsync] document=${documentId} ATCUD dropped (${atcudSan.reason})`,
+      );
+    }
+    fields = {
+      ...fields,
+      supplierNif: taxIds.nif ?? undefined,
+      atcud: atcudSan.atcud ?? undefined,
+      hints: [
+        ...(fields.hints ?? []),
+        `taxId:${taxIds.validation}:${taxIds.reason}`,
+        `atcud:${atcudSan.reason}`,
+      ],
+    };
+
+    // Scan loaded.text for supplier contacts fallback if not yet extracted by AI
+    if (loaded?.text) {
+      if (!fields.supplierEmail) {
+        const emailMatch = loaded.text.match(/\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b/);
+        if (emailMatch && !/example\.com|domain\.com/i.test(emailMatch[1])) {
+          fields.supplierEmail = emailMatch[1].trim();
+        }
+      }
+      if (!fields.supplierWebsite) {
+        const webMatch = loaded.text.match(/\b((?:https?:\/\/)?(?:www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:\/[^\s]*)?)\b/i);
+        if (webMatch) {
+          fields.supplierWebsite = webMatch[1].trim();
+        }
+      }
+      if (!fields.supplierPhone) {
+        const phoneMatch = loaded.text.match(
+          /(?:Tel[eé]fon[oe]|Tel(?:ef|f|\.)?|Contacto|Phone|Mobile|Tlm)[:\s]*([+0-9\s()./-]{9,20})\b/i,
+        );
+        if (phoneMatch) {
+          const cleanPhone = phoneMatch[1].replace(/\s+/g, ' ').trim();
+          if (cleanPhone.replace(/\D/g, '').length >= 9) {
+            fields.supplierPhone = cleanPhone;
+          }
+        }
+      }
+    }
+
+    // Só um valor cruzado com algo (QR-AT, módulo 11, VIES) pode mostrar
+    // confiança alta. O que vem só do modelo fica com teto baixo.
+    const identityValidated = taxIds.validation === 'PT_MOD11' || taxIds.validation === 'VIES';
+    const updateDataPreClean: Record<string, unknown> = {};
+    // O saneamento tem de LIMPAR o que já está gravado, não apenas
+    // recusar-se a escrever por cima. O `buildUpdateData` é aditivo (só
+    // escreve valores truthy), por isso uma linha antiga com lixo ficava
+    // lá para sempre: em produção havia documentos com o TOTAL gravado
+    // na coluna do ATCUD ("1012.30", "155.00") e NIFs que falham o
+    // módulo 11, escritos antes destas regras existirem. Um operador
+    // nunca confirmaria nenhum desses valores, por isso limpá-los não
+    // apaga trabalho humano.
+    if (shouldClearStoredAtcud(doc.atcud, docCountry, atcudSan.atcud)) {
+      updateDataPreClean.atcud = null;
+      this.logger.warn(
+        `[processDocumentAsync] document=${documentId} clearing stored ATCUD ` +
+          `"${doc.atcud}" — fails the AT format or the document is not PT`,
+      );
+    }
+    if (shouldClearStoredNif(doc.supplierNif, docCountry, taxIds.nif, viesValidatedForDoc)) {
+      updateDataPreClean.supplierNif = null;
+      updateDataPreClean.nifValid = false;
+      this.logger.warn(
+        `[processDocumentAsync] document=${documentId} clearing stored supplier NIF ` +
+          `"${doc.supplierNif}" — did not pass mod-11 / VIES`,
+      );
+    }
+
+    const confidenceSources = {
+      nif: (atcudTrusted && parsedForFiscal?.issuerNif === taxIds.nif
+        ? 'qr'
+        : identityValidated
+          ? 'validated'
+          : 'ai') as 'qr' | 'validated' | 'ai',
+      qrBacked: (atcudTrusted && Boolean(parsedForFiscal) ? 'qr' : 'ai') as 'qr' | 'ai',
+    };
+
     const updateData = this.buildUpdateData(fields, {
+      confidenceSources,
       // Persist the freshly-decoded payload to the row so re-runs don't
       // re-prompt Gemini. Existing doc.qrPayload (already on the row)
       // is preserved by NOT passing an override — the field stays
@@ -663,6 +1154,118 @@ export class ExtractionService implements OnModuleDestroy {
       // model's attempt at reading QR modules visually.
       qrPayloadOverride,
     });
+    // As limpezas explícitas (null) entram DEPOIS do buildUpdateData,
+    // que é aditivo e nunca escreve null por si.
+    Object.assign(updateData, updateDataPreClean);
+    // ── Fase 3 — validade fiscal determinística + chave fiscal ──────────
+    // The classifier is pure code (extraction/fiscal-status.ts). The AI
+    // only contributed the *inputs* (supplier NIF/VAT, doc number, date,
+    // raw document type); whether the document is FISCAL is decided by the
+    // QR-AT (real decode only) and by deterministic keyword rules.
+    let tenantIdentity: TenantIdentity | undefined;
+    try {
+      tenantIdentity = await getTenantIdentity(this.prisma, tenantId);
+    } catch (err) {
+      this.logger.warn(
+        `[processDocumentAsync] getTenantIdentity failed for tenant=${tenantId}: ${(err as Error).message}`,
+      );
+    }
+
+    const fiscal = classifyFiscalStatus({
+      qr: parsedForFiscal
+        ? {
+            issuerNif: parsedForFiscal.issuerNif,
+            atcud: parsedForFiscal.atcud,
+            hash4: parsedForFiscal.hash4,
+            softwareCert: parsedForFiscal.softwareCert,
+            documentType: parsedForFiscal.documentType,
+          }
+        : null,
+      qrOrigin: qrOriginForFiscal,
+      supplierNif: fields.supplierNif ?? null,
+      supplierVatId: fields.supplierVatId ?? null,
+      docNumber: fields.docNumber ?? null,
+      docDate: fields.docDate ?? null,
+      // Fase 4.1 — nas fotos o OCR devolve vazio (`textSource: none`), e
+      // era por isso que a regra de palavras-chave corria às cegas e uma
+      // "oferta de venta" espanhola passava por fatura. O `documentTitle`
+      // é o cabeçalho transcrito à letra pelo modelo: dá texto à regra
+      // sem lhe dar a decisão, que continua a ser tomada aqui em código.
+      text: [
+        loaded.text,
+        fields.documentTitle ?? "",
+        doc.fileName,
+        fields.documentType ?? "",
+        ...(fields.hints ?? []).filter((h) => /^(aiDocType|documentType|aiDocumentType|aiDocTitle):/i.test(h)),
+      ].join(String.fromCharCode(10)),
+      viesValidated: viesValidatedForDoc,
+      tenantNif: tenantIdentity?.tenantNif,
+      customerNif: fields.customerNif ?? null,
+    });
+    // ── Fase 4.1 (P2.2) — a correção manual do operador manda ────────
+    // Quem marcou um documento como não fiscal (ou lhe corrigiu o tipo)
+    // não pode ver a decisão desfeita pela re-extração seguinte.
+    const hasAuthoritativeQr = !!(parsedForFiscal && isValidAtQr(parsedForFiscal));
+    const isExplicitReextract = !!forceReextract || !!modelOverride || !!providerOverride;
+    // Quando o operador pede explicitamente uma re-extração (ou com modelo diferente),
+    // ou quando o documento tem QR-AT oficial autêntico, não mantemos o bloqueio antigo.
+    const fiscalLocked = doc.fiscalStatusManualOverride === true && !isExplicitReextract && !hasAuthoritativeQr;
+    const typeLocked = doc.typeManualOverride === true && !isExplicitReextract && !hasAuthoritativeQr;
+    if (fiscalLocked) {
+      fields.hints = [...(fields.hints ?? []), `fiscalStatus:manual_override_kept:${doc.fiscalStatus}`];
+      this.logger.log(
+        `[processDocumentAsync] document=${documentId} keeping operator's fiscalStatus ` +
+          `${doc.fiscalStatus} (classifier said ${fiscal.fiscalStatus})`,
+      );
+    } else {
+      (updateData as Record<string, unknown>).fiscalStatus = fiscal.fiscalStatus;
+      (updateData as Record<string, unknown>).fiscalReason = fiscal.reason;
+      (updateData as Record<string, unknown>).isNonFiscalDoc =
+        fiscal.fiscalStatus === "NAO_FISCAL" || fiscal.fiscalStatus === "NAO_APLICAVEL";
+      if (isExplicitReextract || hasAuthoritativeQr) {
+        (updateData as Record<string, unknown>).fiscalStatusManualOverride = false;
+      }
+    }
+    if (typeLocked) {
+      delete (updateData as Record<string, unknown>).type;
+      fields.hints = [...(fields.hints ?? []), `documentType:manual_override_kept:${doc.type}`];
+    } else {
+      if (fiscal.documentType) {
+        updateData.type = fiscal.documentType as DocumentType;
+      } else if (fields.documentType) {
+        updateData.type = fields.documentType as DocumentType;
+      } else if (hasAuthoritativeQr) {
+        updateData.type = DocumentType.FATURA_RECEBIDA;
+      }
+      if (isExplicitReextract || hasAuthoritativeQr) {
+        (updateData as Record<string, unknown>).typeManualOverride = false;
+      }
+    }
+    const docNumberNorm = normalizeDocNumber(fields.docNumber);
+    if (docNumberNorm) (updateData as Record<string, unknown>).docNumberNorm = docNumberNorm;
+    fields.hints = [...(fields.hints ?? []), `fiscalStatus:${fiscal.fiscalStatus}:${fiscal.reason}`];
+
+    // Duplicate by fiscal key (tenant + supplier NIF + normalised number
+    // [+ ATCUD when both sides have one]). The partial unique index
+    // documents_fiscal_key_unique is the race-proof backstop (P2002 below).
+    let duplicateOfDoc: { id: string; fileName: string } | null = null;
+    if ((fields.supplierNif && docNumberNorm) || fields.atcud) {
+      duplicateOfDoc = await this.findFiscalKeyOriginal(
+        tenantId,
+        documentId,
+        fields.supplierNif ?? null,
+        docNumberNorm,
+        fields.atcud ?? null,
+        atcudTrusted,
+      );
+      if (duplicateOfDoc) {
+        this.logger.warn(
+          `[processDocumentAsync] document=${documentId} is a DUPLICATE of ${duplicateOfDoc.id} ` +
+            `(${duplicateOfDoc.fileName}) by fiscal key nif=${fields.supplierNif} nr=${docNumberNorm}`,
+        );
+        fields.warnings = [...(fields.warnings ?? []), `duplicate_fiscal_key:${duplicateOfDoc.id}`];
+      }
+    }
     let ibanCheck: IbanCheckResult | null = null;
 
     if (fields.iban && doc.partyId) {
@@ -688,7 +1291,18 @@ export class ExtractionService implements OnModuleDestroy {
     // and a `supplierResolve` block for the audit trail.
     let supplierReviewFlag = false;
     let supplierResolveReason: string | undefined;
-    if (this.supplierResolver && !doc.partyId) {
+    if (resolvedPartyFromNif) {
+      // NIF-resolve fallback already picked a trusted Party — wire it
+      // directly and skip SupplierResolver (avoids creating a duplicate
+      // row keyed on the swapped-out fields).
+      updateData.party = { connect: { id: resolvedPartyFromNif.id } };
+      if (resolvedPartyFromNif.name && (!updateData.supplier || !String(updateData.supplier).trim())) {
+        updateData.supplier = resolvedPartyFromNif.name;
+        fields.supplier = resolvedPartyFromNif.name;
+      }
+      supplierReviewFlag = false;
+      supplierResolveReason = "party-resolved-by-nif";
+    } else if (this.supplierResolver && !doc.partyId) {
       try {
         const aiConfidence = Number(
           (fields.hints ?? [])
@@ -701,11 +1315,28 @@ export class ExtractionService implements OnModuleDestroy {
           supplierName: fields.supplier,
           supplierNif: fields.supplierNif,
           supplierVatId: fields.supplierVatId,
+          supplierAddress: fields.supplierAddress,
+          supplierPostalCode: fields.supplierPostalCode,
+          supplierCity: fields.supplierCity,
+          supplierPhone: fields.supplierPhone,
+          supplierEmail: fields.supplierEmail,
+          supplierWebsite: fields.supplierWebsite,
           iban: fields.iban,
           aiConfidence: Number.isFinite(aiConfidence) ? aiConfidence : fields.confidence,
+          suggestedCategory: fields.suggestedCategory,
         });
         if (resolved.party) {
           updateData.party = { connect: { id: resolved.party.id } };
+          if (resolved.party.name && (!updateData.supplier || !String(updateData.supplier).trim())) {
+            updateData.supplier = resolved.party.name;
+            fields.supplier = resolved.party.name;
+          }
+          // For foreign EU suppliers, trigger VIES validateParty in background to ensure Party has official VIES data
+          if (this.vies && (fields.country && fields.country !== 'PT' || fields.supplierVatId && !/^PT/i.test(fields.supplierVatId))) {
+            this.vies.validateParty(tenantId, resolved.party.id).catch((viesErr) => {
+              this.logger.warn(`[processDocumentAsync] background VIES validateParty failed: ${(viesErr as Error).message}`);
+            });
+          }
         }
         supplierReviewFlag = resolved.supplierReview;
         supplierResolveReason = resolved.reason;
@@ -721,6 +1352,56 @@ export class ExtractionService implements OnModuleDestroy {
       }
     }
 
+    // Se o documento estiver associado a um fornecedor, preencher campos em falta na ficha a partir da fatura
+    const targetPartyId =
+      (updateData.party as { connect?: { id?: string } } | undefined)?.connect?.id ??
+      resolvedPartyFromNif?.id ??
+      doc.partyId ??
+      null;
+    if (targetPartyId) {
+      try {
+        const existingParty = await this.prisma.party.findUnique({
+          where: { id: targetPartyId },
+          select: { name: true, address: true, city: true, postalCode: true, phone: true, email: true, website: true },
+        });
+        if (existingParty) {
+          if (existingParty.name && (!updateData.supplier || !String(updateData.supplier).trim())) {
+            updateData.supplier = existingParty.name;
+            fields.supplier = existingParty.name;
+          }
+          const partyUpdates: Record<string, string> = {};
+          if (
+            (!existingParty.address || /^[-–—\s/.]+$/.test(existingParty.address.trim())) &&
+            fields.supplierAddress
+          ) {
+            partyUpdates.address = sanitizeExtractedSupplierAddress(
+              fields.supplierAddress,
+              fields.supplierPostalCode,
+              fields.supplierCity,
+            );
+          }
+          if (!existingParty.city && fields.supplierCity) partyUpdates.city = fields.supplierCity;
+          if (!existingParty.postalCode && fields.supplierPostalCode) partyUpdates.postalCode = fields.supplierPostalCode;
+          if (!(existingParty as any).phone && fields.supplierPhone) partyUpdates.phone = fields.supplierPhone;
+          if (!(existingParty as any).email && fields.supplierEmail) partyUpdates.email = fields.supplierEmail;
+          if (!(existingParty as any).website && fields.supplierWebsite) partyUpdates.website = fields.supplierWebsite;
+          if (Object.keys(partyUpdates).length > 0) {
+            await this.prisma.party.update({
+              where: { id: targetPartyId },
+              data: partyUpdates,
+            });
+            this.logger.log(
+              `[processDocumentAsync] updated party=${targetPartyId} with extracted fields: ${Object.keys(partyUpdates).join(', ')}`,
+            );
+          }
+        }
+      } catch (partyErr) {
+        this.logger.warn(
+          `[processDocumentAsync] failed to update party ${targetPartyId} fields: ${(partyErr as Error).message}`,
+        );
+      }
+    }
+
     // ── Auto-file from AI category ──────────────────────────────────
     // When the AI supplied an SNC category AND a rules engine is wired
     // AND the AI actually produced this row's documentType / supplier
@@ -729,7 +1410,31 @@ export class ExtractionService implements OnModuleDestroy {
     // matches a category-aware rule, the new folder wins; otherwise we
     // keep the upload-time suggestion untouched (rules remain the
     // fallback for documents the AI couldn't categorise).
+    //
+    // In the same branch we also resolve the AI's free-text
+    // `suggestedCategory` onto a PT bucket (one of EXPENSE_CATEGORIES)
+    // and stash it on `metadata.filing.expenseCategory` with source
+    // 'ai'. The PATCH /documents/:id path remains the canonical way
+    // for the user to override the AI pick (source='user'); see
+    // DocumentsService.update.
     let aiFiledFolder: string | undefined;
+    let aiFiledExpenseCategory: ExpenseCategory | null = null;
+    if (
+      fields.suggestedCategory &&
+      (fields.source === "ai" || fields.source === "at_qr+ai")
+    ) {
+      // Resolve the AI suggestion onto one of the EXPENSE_CATEGORIES
+      // slugs. mapToExpenseCategory returns null when nothing matches,
+      // in which case we leave the filing untouched — the user can
+      // still pick a category manually via PATCH.
+      aiFiledExpenseCategory = mapToExpenseCategory(fields.suggestedCategory);
+      if (aiFiledExpenseCategory) {
+        this.logger.log(
+          `[processDocumentAsync] AI-resolved expenseCategory for document=${documentId}: ` +
+            `${fields.suggestedCategory} → ${aiFiledExpenseCategory}`,
+        );
+      }
+    }
     if (
       fields.suggestedCategory &&
       (fields.source === "ai" || fields.source === "at_qr+ai") &&
@@ -819,22 +1524,273 @@ export class ExtractionService implements OnModuleDestroy {
       finalStatus = DocumentStatus.EM_REVISAO;
     }
 
-    const updated = await this.prisma.document.update({
-      where: { id: documentId },
-      data: {
-        ...updateData,
-        metadata: this.composeMetadata(
-          doc.metadata,
-          fields,
-          ibanCheck,
-          undefined,
-          loaded,
-          { supplierReview: supplierReviewFlag, supplierReason: supplierResolveReason },
-        ),
-        ocrConfidence: fields.confidence,
-        status: finalStatus,
-      },
+    // ── Fase 4 — contravalor em EUR (BCE) ──────────────────────────
+    if (fields.total != null && Number.isFinite(fields.total)) {
+      const cur = (fields.currency || "EUR").toUpperCase();
+      if (cur === "EUR") {
+        (updateData as Record<string, unknown>).amountEur = fields.total;
+      } else if (this.fx) {
+        try {
+          const fxDate = fields.docDate ?? new Date().toISOString().slice(0, 10);
+          const conv = await this.fx.toEur(fields.total, cur, fxDate);
+          if (conv) {
+            (updateData as Record<string, unknown>).amountEur = conv.amountEur;
+            (updateData as Record<string, unknown>).exchangeRate = conv.rate.rate;
+            (updateData as Record<string, unknown>).exchangeRateDate = new Date(`${conv.rate.rateDate}T00:00:00Z`);
+            fields.hints = [...(fields.hints ?? []), `fx:${cur}→EUR@${conv.rate.rate}(${conv.rate.rateDate})`];
+          } else {
+            fields.warnings = [...(fields.warnings ?? []), `fx_rate_unavailable:${cur}`];
+          }
+        } catch (err) {
+          this.logger.warn(`[processDocumentAsync] FX conversion failed: ${(err as Error).message}`);
+        }
+      }
+    }
+
+    // ── Fase 4.1 (P1.3) — descontos e fecho dos totais ao cêntimo ────
+    // Antes, um desconto aparecia como "diferença" e ficava gravado em
+    // silêncio. Agora a conta é explícita — soma(linhas) − descontos +
+    // IVA = total, com tolerância de 1 cêntimo — e quando não fecha o
+    // documento vai para revisão com o motivo.
+    const recon = reconcileTotals({
+      lineItems: fields.lineItems,
+      discountAmount: fields.discountAmount,
+      // Fase 4.2 (P0.3) — "Pronto pago", "desconto financeiro",
+      // "descuento", "DPP"... quando não há um valor em euros explícito
+      // no cabeçalho, o desconto de pronto pagamento em percentagem é o
+      // fallback. Sem isto, a SAMMIC (2% sobre 40,74 = 0,81€) aparecia
+      // como uma diferença por explicar em vez de um desconto global.
+      cashDiscountRate: fields.cashDiscountRate,
+      taxAmount: fields.taxAmount,
+      netAmount: fields.netAmount,
+      total: fields.total,
     });
+    fields.totalsReconciled = recon.reconciled;
+    if (recon.discountAmount != null) {
+      (updateData as Record<string, unknown>).discountAmount = recon.discountAmount;
+    }
+    (updateData as Record<string, unknown>).lineDiscountTotal = recon.lineDiscountTotal;
+    (updateData as Record<string, unknown>).totalsReconciled = recon.reconciled;
+    (updateData as Record<string, unknown>).totalsDelta = recon.delta;
+    fields.hints = [...(fields.hints ?? []), `totals:${recon.reconciled ? "ok" : "mismatch"}:${recon.reason}`];
+    if (!recon.reconciled && recon.delta != null) {
+      fields.warnings = [...(fields.warnings ?? []), recon.reason];
+      finalStatus = DocumentStatus.EM_REVISAO;
+    }
+
+    // ── Fase 4.1 (P1.2) — notas de crédito ───────────────────────────
+    // Uma NC entra negativa no saldo do fornecedor e no IVA, e liga-se à
+    // fatura que retifica. O valor impresso fica intacto em `total`.
+    const effectiveType =
+      ((updateData as Record<string, unknown>).type as DocumentType | undefined) ?? doc.type;
+    const signed = signedAmounts(effectiveType, {
+      total: fields.total ?? (doc.total != null ? Number(doc.total) : null),
+      taxAmount: fields.taxAmount ?? (doc.taxAmount != null ? Number(doc.taxAmount) : null),
+      netAmount: fields.netAmount ?? (doc.netAmount != null ? Number(doc.netAmount) : null),
+    });
+    (updateData as Record<string, unknown>).signedTotal = signed.signedTotal;
+    (updateData as Record<string, unknown>).signedTaxAmount = signed.signedTaxAmount;
+    (updateData as Record<string, unknown>).signedNetAmount = signed.signedNetAmount;
+
+    // Fase 4.3 (P0.3) — uma Nota de Crédito tem de guardar total, base e IVA negativos
+    if (effectiveType === "NOTA_CREDITO") {
+      const curTotal = updateData.total != null ? Number(updateData.total) : doc.total != null ? Number(doc.total) : null;
+      if (curTotal != null) updateData.total = -Math.abs(curTotal);
+      const curNet = updateData.netAmount != null ? Number(updateData.netAmount) : doc.netAmount != null ? Number(doc.netAmount) : null;
+      if (curNet != null) updateData.netAmount = -Math.abs(curNet);
+      const curTax = updateData.taxAmount != null ? Number(updateData.taxAmount) : doc.taxAmount != null ? Number(doc.taxAmount) : null;
+      if (curTax != null) updateData.taxAmount = -Math.abs(curTax);
+      if ((updateData as Record<string, unknown>).amountEur != null) {
+        (updateData as Record<string, unknown>).amountEur = -Math.abs(Number((updateData as Record<string, unknown>).amountEur));
+      }
+      (updateData as Record<string, unknown>).signedTotal = -Math.abs(Number(signed.signedTotal ?? curTotal ?? 0));
+      (updateData as Record<string, unknown>).signedTaxAmount = -Math.abs(Number(signed.signedTaxAmount ?? curTax ?? 0));
+      (updateData as Record<string, unknown>).signedNetAmount = -Math.abs(Number(signed.signedNetAmount ?? curNet ?? 0));
+    }
+    if (effectiveType === "NOTA_CREDITO" && fields.correctedDocumentNumber) {
+      (updateData as Record<string, unknown>).correctedDocNumber = fields.correctedDocumentNumber;
+      const original = await this.findCorrectedDocument(
+        tenantId,
+        documentId,
+        fields.correctedDocumentNumber,
+        taxIds.nif,
+      );
+      if (original) {
+        // `Prisma.DocumentUpdateInput` é a variante *checked*: uma chave
+        // estrangeira escreve-se pela relação, não pela coluna. Escrever
+        // `correctedDocumentId` directamente rebentava a extração — e só
+        // quando a fatura retificada era mesmo encontrada, que é o único
+        // caso que interessa.
+        updateData.correctedDocument = { connect: { id: original.id } };
+        fields.hints = [...(fields.hints ?? []), `creditNote:corrects=${original.id}:${original.docNumber ?? "?"}`];
+      } else {
+        fields.hints = [
+          ...(fields.hints ?? []),
+          `creditNote:corrected_doc_not_found:${fields.correctedDocumentNumber}`,
+        ];
+      }
+    }
+
+    // ── Fase 4 — categoria automática por fornecedor ────────────────
+    const linkedPartyId =
+      (updateData.party as { connect?: { id?: string } } | undefined)?.connect?.id ?? doc.partyId ?? null;
+    let categoryApplied = false;
+    if (linkedPartyId) {
+      const auto = await this.resolveAutoCategory(tenantId, linkedPartyId);
+      if (auto) {
+        updateData.expenseCategory = { connect: { id: auto.categoryId } };
+        (updateData as Record<string, unknown>).categoryConfidence = auto.confidence;
+        fields.hints = [...(fields.hints ?? []), `autoCategory:${auto.categoryId}:${auto.reason}`];
+        // The review screen reads `metadata.filing.expenseCategory` (Category.name);
+        // mirror the automatic choice there so the badge and IVA deduction follow.
+        const catName = await this.categoryNameById(tenantId, auto.categoryId);
+        if (catName && isExpenseCategory(catName)) aiFiledExpenseCategory = catName;
+        categoryApplied = true;
+      }
+    }
+    if (!categoryApplied && fields.suggestedCategory) {
+      const matched = await this.matchCategoryBySuggestion(tenantId, fields.suggestedCategory);
+      if (matched) {
+        updateData.expenseCategory = { connect: { id: matched.id } };
+        (updateData as Record<string, unknown>).categoryConfidence = 0.85;
+        fields.hints = [...(fields.hints ?? []), `suggestedCategoryMatched:${matched.id}:${matched.name}`];
+        if (isExpenseCategory(matched.name)) aiFiledExpenseCategory = matched.name as ExpenseCategory;
+      }
+    }
+
+    if (!tenantIdentity) {
+      try {
+        tenantIdentity = await getTenantIdentity(this.prisma, tenantId);
+      } catch (err) {
+        this.logger.warn(
+          `[processDocumentAsync] getTenantIdentity failed for tenant=${tenantId}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    // ── Validação Aritmética, Fiscal e Motor de Certainty Score (Fase 5) ──
+    const certaintyResult = calculateCertaintyScore({
+      netAmount: fields.netAmount,
+      taxAmount: fields.taxAmount,
+      total: fields.total,
+      lineItems: fields.lineItems,
+      taxRate: fields.taxRate,
+      supplierNif: taxIds.nif ?? fields.supplierNif,
+      supplierVatId: taxIds.vatId ?? fields.supplierVatId,
+      customerNif: fields.customerNif,
+      tenantNif: tenantIdentity?.tenantNif,
+      tenantName: tenantIdentity?.tenantName,
+      country: docCountry,
+      viesValidated: viesValidatedForDoc,
+      qrPayload: qrForFiscal ?? doc.qrPayload,
+      qrOrigin: qrOriginForFiscal,
+      atcud: atcudSan.atcud ?? fields.atcud,
+      hash4: parsedForFiscal?.hash4,
+      softwareCert: parsedForFiscal?.softwareCert,
+      discountAmount: fields.discountAmount,
+      cashDiscountRate: fields.cashDiscountRate,
+      isIntracommunity: fields.isEuIntracommunity ?? doc.isIntracommunity,
+    });
+
+    fields.hints = [
+      ...(fields.hints ?? []),
+      `certaintyScore:${certaintyResult.score}%`,
+      `certaintyLevel:${certaintyResult.level}`,
+      ...(certaintyResult.tenantNifValidation
+        ? [`tenantNifValidation:${certaintyResult.tenantNifValidation.status}`]
+        : []),
+    ];
+
+    if (
+      certaintyResult.needsReview ||
+      (certaintyResult.tenantNifValidation && !certaintyResult.tenantNifValidation.isOfficialDocument)
+    ) {
+      finalStatus = DocumentStatus.EM_REVISAO;
+
+      // Salvaguarda fiscal (art. 36.º CIVA): documento sem NIF da empresa adquirente
+      // nunca pode ser gravado como documento fiscal oficial dedutível.
+      if (certaintyResult.tenantNifValidation && !certaintyResult.tenantNifValidation.isOfficialDocument) {
+        if (certaintyResult.tenantNifValidation.status === 'MISMATCH_THIRD_PARTY') {
+          (updateData as Record<string, unknown>).fiscalStatus = 'NAO_FISCAL';
+          (updateData as Record<string, unknown>).fiscalReason = certaintyResult.tenantNifValidation.warning;
+          (updateData as Record<string, unknown>).isNonFiscalDoc = true;
+        } else if (certaintyResult.tenantNifValidation.status === 'MISSING_NIF') {
+          (updateData as Record<string, unknown>).fiscalStatus = 'DUVIDOSO';
+          (updateData as Record<string, unknown>).fiscalReason = certaintyResult.tenantNifValidation.warning;
+        }
+      }
+
+      const existingWarns = new Set(fields.warnings ?? []);
+      for (const w of certaintyResult.warnings) {
+        if (!existingWarns.has(w)) {
+          fields.warnings = [...(fields.warnings ?? []), w];
+          existingWarns.add(w);
+        }
+      }
+    }
+
+    const composeFinalMetadata = () =>
+      this.composeMetadata(
+        doc.metadata,
+        fields,
+        ibanCheck,
+        undefined,
+        loaded,
+        { supplierReview: supplierReviewFlag, supplierReason: supplierResolveReason },
+        aiFiledExpenseCategory,
+        certaintyResult,
+      );
+    if (duplicateOfDoc) finalStatus = DocumentStatus.DUPLICADO;
+    let updated;
+    try {
+      updated = await this.runFinalUpdate(
+        documentId,
+        {
+          ...updateData,
+          ...(duplicateOfDoc ? { duplicateOf: { connect: { id: duplicateOfDoc.id } } } : {}),
+        },
+        finalStatus,
+        composeFinalMetadata,
+        fields.confidence,
+      );
+    } catch (err) {
+      // Race: two uploads of the same invoice extracted concurrently — the
+      // partial unique index documents_fiscal_key_unique rejected this one.
+      // Re-resolve the original and store this row as DUPLICADO instead of
+      // failing the pipeline.
+      const code = (err as { code?: string }).code;
+      if (code !== "P2002" || duplicateOfDoc || !((fields.supplierNif && docNumberNorm) || fields.atcud)) throw err;
+      const original = await this.findFiscalKeyOriginal(
+        tenantId,
+        documentId,
+        fields.supplierNif ?? null,
+        docNumberNorm,
+        fields.atcud ?? null,
+        atcudTrusted,
+      );
+      if (!original) throw err;
+      this.logger.warn(
+        `[processDocumentAsync] P2002 on fiscal key — document=${documentId} stored as DUPLICATE of ${original.id}`,
+      );
+      fields.warnings = [...(fields.warnings ?? []), `duplicate_fiscal_key:${original.id}`];
+      duplicateOfDoc = original;
+      finalStatus = DocumentStatus.DUPLICADO;
+      updated = await this.runFinalUpdate(
+        documentId,
+        { ...updateData, duplicateOf: { connect: { id: original.id } } },
+        finalStatus,
+        composeFinalMetadata,
+        fields.confidence,
+      );
+    }
+
+    // Fase 4 — persist the AI-extracted line items as DocumentItem rows.
+    // Without this, the "produtos comprados" feature (party-products.service)
+    // and the manual line-item editor both stay empty forever — the AI's
+    // lineItems only ever lived in metadata.extraction JSON. Idempotent
+    // re-extraction: replace the set rather than append. Never throws —
+    // a line-item write failure must not fail the extraction pipeline.
+    await this.persistLineItems(documentId, fields.lineItems);
 
     // Post-extraction rename: swap the upload-time filename (e.g.
     // `image.jpg`, `<hash>.pdf`) for a human-friendly slug like
@@ -865,6 +1821,13 @@ export class ExtractionService implements OnModuleDestroy {
             select: { id: true, status: true, fileName: true },
           });
           if (afterRename) {
+            // Sprint I: also publish when the rename path returns early,
+            // using the post-rename row id so handleExtracted observes
+            // the same document state we hand back to the caller.
+            await this.publishExtracted(tenantId, documentId, userId, {
+              ...fields,
+              ibanCheck: ibanCheck ?? undefined,
+            }, afterRename.id);
             return {
               queued: false,
               documentId,
@@ -890,6 +1853,20 @@ export class ExtractionService implements OnModuleDestroy {
         );
       }
     }
+
+    // ── Sprint I — publish `document.extracted` so the processing
+    // pipeline's handleExtracted advances the doc from EXTRACTING →
+    // ENRICHING. The publish is the critical missing link identified
+    // by the Sprint I scout report: without it the pipeline stops at
+    // EXTRACTING forever. Wrapped in try/catch so any adapter failure
+    // (Redis down, adapter swallowed the publish) NEVER re-throws into
+    // the extraction path — the row is already persisted at this
+    // point, so the foregone enrichment is recoverable via the manual
+    // "Re-extrair dados" button in the Party detail page.
+    await this.publishExtracted(tenantId, documentId, userId, {
+      ...fields,
+      ibanCheck: ibanCheck ?? undefined,
+    }, updated.id);
 
     return {
       queued: false,
@@ -1012,6 +1989,104 @@ export class ExtractionService implements OnModuleDestroy {
       `[writeNeedsReviewMarker] wrote needs_review for document=${documentId} ` +
         `reason=${reason.slice(0, 100)}`,
     );
+  }
+
+  /**
+   * Sprint I — publish `document.extracted` so the processing pipeline's
+   * `handleExtracted` advances the doc from EXTRACTING → ENRICHING.
+   *
+   * Best-effort: any adapter failure is logged and swallowed so it
+   * cannot fail the extraction path. The row is already persisted at
+   * this point, so a missed publish can be compensated by the manual
+   * "Re-extrair dados" button in the Party detail page or by a
+   * future re-trigger via `POST /extraction/documents/:id/reprocess`.
+   *
+   * The shape mirrors the `DocumentExtractedEvent` documented in
+   * `processing.service.ts:58-65` so the handler can map directly.
+   */
+  private async publishExtracted(
+    tenantId: string,
+    documentId: string,
+    userId: string | null,
+    fields: Record<string, unknown> & { ibanCheck?: unknown },
+    persistedDocumentId: string,
+  ): Promise<void> {
+    if (!this.queueAdapter) {
+      this.logger.warn(
+        `[publishExtracted] no QueueAdapter wired for document=${documentId} ` +
+          `— skipping publish; pipeline will stay at EXTRACTING ` +
+          `(manual re-trigger required)`,
+      );
+      return;
+    }
+    try {
+      await this.queueAdapter.publish("document.extracted", {
+        topic: "document.extracted",
+        documentId: persistedDocumentId,
+        tenantId,
+        userId,
+        confidence:
+          typeof fields.confidence === "number" ? fields.confidence : 0,
+        source:
+          typeof fields.source === "string"
+            ? fields.source
+            : "none",
+        extractedFields: this.extractPublicFields(fields),
+      });
+      this.logger.log(
+        `[publishExtracted] published document.extracted for ` +
+          `document=${persistedDocumentId} tenant=${tenantId}`,
+      );
+    } catch (err) {
+      this.logger.error(
+        `[publishExtracted] publish FAILED for document=${persistedDocumentId}: ` +
+          `${(err as Error).message}`,
+      );
+      // Do NOT re-throw: extraction is already persisted to disk.
+    }
+  }
+
+  /**
+   * Build a flat, JSON-safe payload of the extracted fields for the
+   * pipeline event. Keeps the queue event small (no nested PdfParse
+   * buffers / BigInt values). Mirrors the shape of DocumentExtractedEvent
+   * in processing.service.ts:58-65.
+   */
+  private extractPublicFields(fields: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    const allowed = [
+      "supplier",
+      "supplierNif",
+      "supplierVatId",
+      "customer",
+      "customerNif",
+      "docNumber",
+      "atcud",
+      "docDate",
+      "dueDate",
+      "total",
+      "taxAmount",
+      "netAmount",
+      "iban",
+      "currency",
+      "country",
+      "ibanCountry",
+      "taxRate",
+      "ivaBreakdown",
+      "suggestedCategory",
+      "cashDiscountRate",
+      "discountAmount",
+      "isEuIntracommunity",
+      "documentLocale",
+      "documentTitle",
+      "correctedDocumentNumber",
+      "totalsReconciled",
+    ];
+    for (const k of allowed) {
+      const v = fields[k];
+      if (v !== undefined && v !== null) out[k] = v;
+    }
+    return out;
   }
 
   /**
@@ -1168,6 +2243,7 @@ export class ExtractionService implements OnModuleDestroy {
     doc: { fileKey: string; mimeType: string; fileName: string },
     loaded: LoadedText,
     tenantId?: string,
+    overrides?: { model?: string; provider?: string },
   ): Promise<ExtractedFields> {
     // Top-level safety net: a vision failure must NEVER abort the regex
     // extraction. This is the canary that fires whenever something in
@@ -1177,7 +2253,7 @@ export class ExtractionService implements OnModuleDestroy {
       // 1) Try the AI provider first — when we have at least something to
       //    feed it AND a key is configured. Empty inputs still hit regex so
       //    the operator sees the same fields they did before.
-      const visionResult = await this.tryVisionAnalysis(doc, loaded, tenantId);
+      const visionResult = await this.tryVisionAnalysis(doc, loaded, tenantId, overrides);
 
       // 2) Always run regex in parallel-ish — it fills gaps the LLM missed.
       //    Cheap, deterministic, and stays in metadata so we can audit which
@@ -1367,12 +2443,13 @@ export class ExtractionService implements OnModuleDestroy {
     doc: { fileKey: string; mimeType: string; fileName: string },
     loaded: LoadedText,
     tenantId?: string,
+    overrides?: { model?: string; provider?: string },
   ): Promise<import("../ai/vision.service").VisionAnalysisResult | null> {
     // Defensive: `this.vision` may be undefined when the AI module is
     // not wired (e.g. unit tests, or a future code-path that bypasses
     // AiModule). Use optional chaining — never throw a TypeError that
     // the caller would have to dig through stack traces to diagnose.
-    if (!this.vision?.liveProviderAvailable) {
+    if (!this.vision?.liveProviderAvailable && !this.zerox?.isAvailable()) {
       return null;
     }
     try {
@@ -1462,7 +2539,16 @@ export class ExtractionService implements OnModuleDestroy {
       // own 50s). The overall analyze() ceiling is the SUM of those
       // — ~110s in the worst case — but a flaky upstream never blocks
       // one call longer than 30s.
-      const visionResult = await this.vision.analyze({
+      // Zerox integration: if provider override is zerox, or as high-res markdown table extractor
+      if (overrides?.provider === "zerox" && this.zerox?.isAvailable()) {
+        const zBuffer = fileBase64 ? Buffer.from(fileBase64, "base64") : undefined;
+        if (zBuffer) {
+          const zRes = await this.tryZeroxAnalysis(doc, zBuffer, overrides);
+          if (zRes) return zRes;
+        }
+      }
+
+      const visionResult = this.vision?.liveProviderAvailable ? await this.vision.analyze({
         fileBase64,
         mimeType,
         text: loaded.text || undefined,
@@ -1470,7 +2556,9 @@ export class ExtractionService implements OnModuleDestroy {
         documentContext: "invoice",
         timeoutMs: 30_000,
         tenantId: tenantId,
-      });
+        preferredProvider: (overrides?.provider as any) ?? "auto",
+        modelOverride: overrides?.model,
+      }) : null;
       // Sidecar — capture the raw extracted payload so
       // `mergeQrWithAi` can pull supplier / IBAN / lineItems out of
       // a partial AI response (where `mergeVisionWithRegex` gated
@@ -1479,6 +2567,22 @@ export class ExtractionService implements OnModuleDestroy {
       // a stale value from a prior document can't leak across.
       if (visionResult) {
         this.lastVisionExtracted = visionResult.extracted;
+        this.lastAiExtraction = {
+          provider: visionResult.provider,
+          model: visionResult.model,
+          processingTimeMs: visionResult.processingTimeMs,
+          tokens: {
+            prompt: visionResult.tokensIn ?? 0,
+            completion: visionResult.tokensOut ?? 0,
+            total: (visionResult.tokensIn ?? 0) + (visionResult.tokensOut ?? 0),
+          },
+          tokensIn: visionResult.tokensIn ?? 0,
+          tokensOut: visionResult.tokensOut ?? 0,
+          estimatedCostEur: visionResult.estimatedCostEur ?? 0,
+          confidence: visionResult.confidence,
+          fallbackUsed: visionResult.fallbackUsed,
+          timestamp: new Date().toISOString(),
+        };
       }
       return visionResult;
     } catch (err) {
@@ -1494,6 +2598,62 @@ export class ExtractionService implements OnModuleDestroy {
   }
 
   /**
+   * Process document using Zerox to split high-resolution PDFs and photos,
+   * returning structured Markdown and extracted invoice fields.
+   */
+  async tryZeroxAnalysis(
+    doc: { fileKey: string; mimeType: string; fileName: string },
+    buffer: Buffer,
+    overrides?: { model?: string; provider?: string },
+  ): Promise<import("../ai/vision.service").VisionAnalysisResult | null> {
+    if (!this.zerox?.isAvailable()) return null;
+    try {
+      this.logger.log(`[tryZeroxAnalysis] Processing ${doc.fileName} with zerox`);
+      const res = await this.zerox.processDocument({
+        buffer,
+        mimeType: doc.mimeType,
+        fileName: doc.fileName,
+        preferredProvider: (overrides?.provider as any) ?? "auto",
+        modelOverride: overrides?.model,
+      });
+      if (res.success) {
+        const visionRes: import("../ai/vision.service").VisionAnalysisResult = {
+          provider: "zerox",
+          model: res.model,
+          confidence: res.extracted.confidence,
+          extracted: res.visionExtracted,
+          rawResponse: res.markdown,
+          processingTimeMs: res.completionTimeMs,
+          fallbackUsed: false,
+          tokensIn: res.inputTokens,
+          tokensOut: res.outputTokens,
+        };
+        this.lastVisionExtracted = res.visionExtracted;
+        this.lastAiExtraction = {
+          provider: "zerox",
+          model: res.model,
+          processingTimeMs: res.completionTimeMs,
+          tokens: {
+            prompt: res.inputTokens,
+            completion: res.outputTokens,
+            total: res.inputTokens + res.outputTokens,
+          },
+          tokensIn: res.inputTokens,
+          tokensOut: res.outputTokens,
+          estimatedCostEur: 0,
+          confidence: res.extracted.confidence,
+          fallbackUsed: false,
+          timestamp: new Date().toISOString(),
+        };
+        return visionRes;
+      }
+    } catch (err) {
+      this.logger.warn(`[tryZeroxAnalysis] error: ${(err as Error).message}`);
+    }
+    return null;
+  }
+
+  /**
    * Rasterise the first page of a PDF to a PNG buffer. Used by
    * `tryVisionAnalysis` when the PDF has no text layer (scanned /
    * image-only PDF) and we want to feed the page as an image to Gemini.
@@ -1503,6 +2663,52 @@ export class ExtractionService implements OnModuleDestroy {
    * the raw PDF bytes — Gemini may still extract useful fields from an
    * image-only PDF inline.
    */
+  /**
+   * Fase 2 — rasterise page 1 (and the last page when the document has
+   * more than one) and try the AT-QR decoder cascade on each. Returns the
+   * validated payload or null. Kept separate from `rasterizeFirstPage()`
+   * because it needs page selection and a higher scale (QR modules must be
+   * ≥ 3 px to decode reliably; scale 2 on A4 gives ~1190 px width).
+   */
+  async decodeQrFromPdfRaster(
+    doc: { fileKey: string; fileName: string },
+    pageCount?: number,
+  ): Promise<string | null> {
+    if (!this.storage) return null;
+    const obj = await this.storage.getBuffer(doc.fileKey);
+    // Scale 2 (~1190 px on A4) decodes most; scale 3 recovered a
+    // vector-drawn QR that scale 2 missed (Fase 2 benchmark, Miranda 6384).
+    // Order: page 1 @2 → last page @2 → page 1 @3 (the @3 pass is the
+    // slowest, so it runs only after the cheap ones failed).
+    const attempts: Array<{ pageNo: number; scale: number }> = [{ pageNo: 1, scale: 2 }];
+    if (pageCount && pageCount > 1) attempts.push({ pageNo: pageCount, scale: 2 });
+    attempts.push({ pageNo: 1, scale: 3 });
+    for (const { pageNo, scale } of attempts) {
+      const parser = new PDFParse({ data: obj.buffer });
+      let png: Buffer | null = null;
+      try {
+        const shot = await parser.getScreenshot({
+          partial: [pageNo],
+          scale,
+          imageBuffer: true,
+        });
+        const page = shot?.pages?.[0];
+        if (page?.data) png = Buffer.from(page.data);
+      } finally {
+        try {
+          await parser.destroy?.();
+        } catch {
+          /* ignore */
+        }
+      }
+      if (!png) continue;
+      const raw = await decodeAtQr(png, "image/png", this.logger);
+      const validated = raw ? this.findAtQrInText(raw) : null;
+      if (validated) return validated;
+    }
+    return null;
+  }
+
   private async rasterizeFirstPage(
     buffer: Buffer,
     fileName: string,
@@ -1662,6 +2868,7 @@ export class ExtractionService implements OnModuleDestroy {
     tenantId: string,
     fields: ExtractedFields,
     qrPayloadOverride?: string,
+    fileName?: string,
   ): Promise<ExtractedFields> {
     try {
       const id = await getTenantIdentity(this.prisma, tenantId);
@@ -1708,11 +2915,100 @@ export class ExtractionService implements OnModuleDestroy {
         !!fields.customer || customerNif.length > 0;
       const tenantName = (id.tenantName ?? "").toLowerCase().trim();
       const supplierName = (fields.supplier ?? "").toLowerCase().trim();
+      const customerName = (fields.customer ?? "").toLowerCase().trim();
       const supplierNifNorm = normalizeTenantNif(fields.supplierNif);
+
+      const customerMatchesTenant =
+        tenantName.length >= 5 &&
+        customerName.length >= 5 &&
+        (tenantName === customerName ||
+          (tenantName.includes(customerName) && customerName.length >= 8) ||
+          (customerName.includes(tenantName) && tenantName.length >= 8));
+
+      const supplierMatchesTenant =
+        tenantName.length >= 5 &&
+        supplierName.length >= 5 &&
+        (tenantName === supplierName ||
+          (tenantName.includes(supplierName) && supplierName.length >= 8) ||
+          (supplierName.includes(tenantName) && tenantName.length >= 8));
+
+      // ── Fase 4.2 (P0.1) — nome de um bloco colado ao NIF de outro ────
+      // Bug real: ONNERA/Edenox (fatura espanhola) ficou com
+      // supplier="NOV OUSADO LDA" (o NOSSO nome — o comprador) e
+      // supplierNif="ESA14219836" (o CIF real do vendedor). Nenhuma
+      // das condições de swap abaixo dispara porque `hasCustomerData`
+      // é falso — a IA nem sequer devolveu um bloco de cliente
+      // distinto, por isso não há para onde "trocar". A IA colou o
+      // nome do bloco do destinatário ao número do bloco do emitente.
+      //
+      // Regra determinística: o nosso nome NUNCA é o do fornecedor.
+      // Quando o nome do fornecedor bate com o nosso e não há dados
+      // de cliente para trocar, o nome está errado por definição —
+      // descartamo-lo. O NIF só sobrevive se for demonstravelmente de
+      // outra entidade (diferente do nosso); caso contrário também é
+      // descartado. Nunca inventamos um par nome+NIF — o que não
+      // pertence comprovadamente ao mesmo bloco fica por confirmar.
+      if (
+        !hasCustomerData &&
+        tenantName.length >= 5 &&
+        supplierName.length >= 5 &&
+        (tenantName === supplierName ||
+          (tenantName.includes(supplierName) && supplierName.length >= 8) ||
+          (supplierName.includes(tenantName) && tenantName.length >= 8))
+      ) {
+        const nifIsOurs = supplierNifNorm === tenantNif || authoritativeSupplierNif === tenantNif;
+        this.logger.warn(
+          `[ensureSupplierCustomerSanity] supplier name "${fields.supplier}" matches ` +
+            `tenant name but no customer block was extracted — nome de um bloco colado ` +
+            `ao NIF de outro. Descartando o nome (nunca somos o fornecedor)` +
+            (nifIsOurs ? ` e o NIF (também é o nosso).` : `; mantendo o NIF "${fields.supplierNif}" para reresolução.`),
+        );
+        const fixed: ExtractedFields = {
+          ...fields,
+          supplier: undefined,
+          supplierNif: nifIsOurs ? undefined : fields.supplierNif,
+          supplierVatId: nifIsOurs ? undefined : fields.supplierVatId,
+        };
+        fixed.hints = [
+          ...(fixed.hints ?? []),
+          `partySwap:name_nif_mismatch_discarded`,
+          `partySwap:reason=supplier_name_eq_tenant_no_customer_block`,
+        ];
+        return fixed;
+      }
+
+      // ── Fase 4.3 (P0.6) — ONNERA/Edenox: customer is ALREADY the tenant!
+      // If customer is already the tenant name, NEVER swap customer into supplier.
+      // That would make our tenant the supplier! Keep the supplier name intact.
       if (
         authoritativeSupplierNif &&
         authoritativeSupplierNif === tenantNif &&
-        hasCustomerData
+        customerMatchesTenant
+      ) {
+        this.logger.warn(
+          `[ensureSupplierCustomerSanity] tenant NIF (${formatPtNif(tenantNif)}) was in supplierNif, ` +
+            `but customer "${fields.customer}" is ALREADY tenant — preserving supplier "${fields.supplier}" ` +
+            `and moving tenant NIF to customerNif.`,
+        );
+        const fixed: ExtractedFields = {
+          ...fields,
+          customerNif: tenantNif,
+          supplierNif: supplierNifNorm === tenantNif ? undefined : fields.supplierNif,
+        };
+        fixed.hints = [
+          ...(fixed.hints ?? []),
+          `partySwap:retained_supplier_customer_already_tenant`,
+          `partySwap:reason=customer_matches_tenant_name`,
+        ];
+        return fixed;
+      }
+
+      if (
+        authoritativeSupplierNif &&
+        authoritativeSupplierNif === tenantNif &&
+        hasCustomerData &&
+        !customerMatchesTenant &&
+        (supplierMatchesTenant || (customerNif && customerNif !== tenantNif))
       ) {
         this.logger.warn(
           `[ensureSupplierCustomerSanity] supplier NIF matches tenant NIF ` +
@@ -1737,16 +3033,10 @@ export class ExtractionService implements OnModuleDestroy {
 
       // ── SWAP CONDITION 3: QR's B: (buyer NIF) equals the tenant's NIF
       // AND the AI put the tenant's NIF (or name) in the supplier slot.
-      // This catches the bug where the QR decoded cleanly but the AI
-      // swapped the parties in its own JSON.
       if (
         authoritativeBuyerNif === tenantNif &&
-        (supplierNifNorm === tenantNif ||
-          tenantName.length >= 5 &&
-          supplierName.length >= 5 &&
-          (tenantName === supplierName ||
-            (tenantName.includes(supplierName) && supplierName.length >= 8) ||
-            (supplierName.includes(tenantName) && tenantName.length >= 8))) &&
+        !customerMatchesTenant &&
+        (supplierNifNorm === tenantNif || supplierMatchesTenant) &&
         hasCustomerData
       ) {
         this.logger.warn(
@@ -1769,14 +3059,9 @@ export class ExtractionService implements OnModuleDestroy {
       }
 
       // ── SWAP CONDITION 2: supplier name matches tenant name
-      // (and tenant NIF is not the supplierNif — could be a name-only
-      // mismatch where the AI put the buyer in the supplier slot).
       if (
-        tenantName.length >= 5 &&
-        supplierName.length >= 5 &&
-        (tenantName === supplierName ||
-          (tenantName.includes(supplierName) && supplierName.length >= 8) ||
-          (supplierName.includes(tenantName) && tenantName.length >= 8)) &&
+        supplierMatchesTenant &&
+        !customerMatchesTenant &&
         hasCustomerData
       ) {
         this.logger.warn(
@@ -1798,6 +3083,238 @@ export class ExtractionService implements OnModuleDestroy {
         return swapped;
       }
 
+      // ── CONDITION 5: QR's A: field (issuer NIF) overrides AI supplier NIF
+      // The QR's A: is the legal source of truth for the supplier's NIF —
+      // when present and well-formed, ANY AI-returned supplier NIF that
+      // disagrees must be discarded. This is the primary fix for the
+      // bug where Gemini infers the supplier NAME from the filename (e.g.
+      // `NOV-OUSADO-LDA_*.pdf` looks like a NOV OUSADO supplier but the
+      // QR A: says 502782160 = EDENOX, which is actually the supplier).
+      // We DO NOT swap blindly because we don't have the supplier NAME in
+      // the QR — we set qrAuthoritativeSupplierNif so downstream code can
+      // re-resolve the supplier via NIF lookup after this returns.
+      //
+      // `qrAuthoritativeSupplierNif` here means: the NIF we resolved from
+      // the QR payload (NOT the AI fallback `fields.supplierNif`). We
+      // detect that by re-reading the QR string explicitly.
+      const qrSoleNif = qrStr ? qrStr.match(/(?:^|\*)A:(\d+)/)?.[1] : undefined;
+      const qrNifNormalized = qrSoleNif ? normalizeTenantNif(qrSoleNif) : undefined;
+      if (
+        qrNifNormalized &&
+        qrNifNormalized.length === 9 &&
+        // differs from what the AI put in the supplier slot
+        supplierNifNorm !== qrNifNormalized &&
+        // AND the QR NIF doesn't match the tenant (otherwise CONDITION 1 already handled it)
+        qrNifNormalized !== tenantNif
+      ) {
+        const trustedNif = qrNifNormalized;
+        const aiNifWas = supplierNifNorm || "none";
+        this.logger.warn(
+          `[ensureSupplierCustomerSanity] QR A: NIF (${formatPtNif(trustedNif)}) ` +
+            `overrides AI supplier NIF (${aiNifWas === "none" ? "(empty)" : formatPtNif(aiNifWas)}). ` +
+            `Discarding AI supplier NAME so it can be re-resolved from the trusted NIF. ` +
+            `document=${fileName ?? "?"}, aiSupplier="${fields.supplier ?? "?"}".`,
+        );
+        const corrected: ExtractedFields = {
+          ...fields,
+          // Overwrite NIF with QR truth. Clear NAME so the supplier-resolver
+          // fills it from a Party lookup keyed on the trusted NIF.
+          supplierNif: trustedNif,
+          supplier: undefined,
+          supplierVatId: undefined,
+        };
+        corrected.hints = [
+          ...(corrected.hints ?? []),
+          `qrAuthoritativeSupplierNif:${trustedNif}`,
+          `aiSupplierDiscarded:reason=qr_a_overrides_ai_supplier_nif`,
+        ];
+        return corrected;
+      }
+
+      // ── CONDITION 4: AI supplier name matches the upload filename
+      // (heurística errada: o modelo leu o filename e colocou como
+      // emitente). Quando o customer slot tem dados E o customer NIF
+      // difere do tenant NIF, descartamos o supplier do AI e fazemos o
+      // swap — o nome real do supplier está provavelmente no customer
+      // (a fatura tem DOIS nomes e o AI escolheu o errado baseado no
+      // filename). Marcamos qrAuthoritativeSupplierNif:none + um hint
+      // para auditoria. Real bug medido em 2026-09-06 no doc
+      // `cmtoag5il000ng59oor229cb3` (NOV-OUSADO-LDA_2026-03-19_*.pdf):
+      // Gemini leu o filename como supplier, e o QR não foi captado
+      // pelo pipeline nesse doc, então cai nesse caminho.
+      if (
+        fileName &&
+        supplierName.length >= 5 &&
+        hasCustomerData &&
+        // Customer NIF é presente E não é o tenant NIF (= não é o comprador)
+        customerNif.length > 0 &&
+        customerNif !== tenantNif
+      ) {
+        // Heurística: limpar o filename e ver se o supplier name aparece
+        // como prefixo. DocFlow uploads usam `<NAME>_<DATE>_<NUMBER>.pdf`,
+        // então o nome do CUSTOMER é tipicamente o prefixo. Se o supplier
+        // do AI casa com esse prefixo, é forte sinal de que o AI inverteu.
+        const fileNameNorm = fileName
+          .replace(/\.pdf$/i, "")
+          .replace(/_[0-9]{4}-[0-9]{2}-[0-9]{2}_.*$/, "")
+          .replace(/_[0-9]{8,}.*$/, "")
+          // Treat dashes/spaces/underscores as interchangeable — uploads
+          // often use `NOV-OUSADO-LDA` while the AI extracted `NOV OUSADO
+          // LDA`. Without this normalisation the substring check misses
+          // both directions on every DocFlow upload (the real bug from
+          // 2026-09-06 EDENOX invoice).
+          .replace(/[-_\s]+/g, " ")
+          .toLowerCase()
+          .trim();
+        const supplierNameNorm = supplierName.replace(/[-_\s]+/g, " ");
+        const filenameSuspiciousMatch =
+          fileNameNorm.length >= 5 &&
+          (fileNameNorm.includes(supplierNameNorm) ||
+            supplierNameNorm.includes(fileNameNorm) ||
+            (supplierNameNorm.length >= 8 &&
+              fileNameNorm.startsWith(supplierNameNorm.slice(0, 8))));
+        // Sprint H+ extraction-fix-3 — structural cross-check on the
+        // supplier NIF. When AI Vision returns a supplier NIF that fails
+        // the mod-11 checksum AND a customer NIF that passes, the AI
+        // almost certainly swapped the two — the filename heuristic
+        // alone misses cases where the AI returned a NIF-looking-but-
+        // invalid string in the supplier slot (e.g. the EDENOX NIF
+        // 502782160 which has a wrong check digit). The structural
+        // check is independent of the filename, so it catches both
+        // real-bug cases: wrong NIF for the actual supplier (AI
+        // hallucinated) AND AI swapped customer→supplier (and the
+        // customer NIF is the structurally-valid one).
+        const supplierNifRaw = fields.supplierNif;
+        const customerNifRaw = fields.customerNif;
+        const supplierNifStructurallyInvalid =
+          !!supplierNifRaw &&
+          // strip "PT" prefix before checking — the helper already does
+          // this but we want the explicit predicate here so the
+          // intent is clear.
+          !isValidPortugueseNif(supplierNifRaw) &&
+          // don't fire on foreign NIFs (ES/FR/...) where the helper
+          // intentionally returns false because it's PT-specific.
+          !/^[A-Z]{2}/.test(supplierNifRaw);
+        const customerNifStructurallyValid =
+          !!customerNifRaw && isValidPortugueseNif(customerNifRaw);
+        const structuralNifMismatch =
+          supplierNifStructurallyInvalid && customerNifStructurallyValid;
+        // Root-cause fix (DIAGNOSTIC-2 §5 item 6): the structural NIF check
+        // is now the primary signal. The filename heuristic used to gate
+        // the swap behind `&& filenameSuspiciousMatch`, which meant every
+        // case where the AI hallucinated a supplier name NOT present in
+        // the filename would silently escape the safety net — the user's
+        // "10x the same PDF" pattern. We now swap whenever the supplier
+        // NIF fails mod-11 AND the customer NIF passes it, regardless of
+        // whether the filename heuristic also matches.
+        const shouldSwap = structuralNifMismatch;
+        if (shouldSwap) {
+          if (filenameSuspiciousMatch) {
+            this.logger.warn(
+              `[ensureSupplierCustomerSanity] AI supplier name "${fields.supplier}" ` +
+                `matches filename prefix (${fileName}); likely swapped with customer. ` +
+                `Real bug from 2026-09-06 EDENOX invoice. Structural NIF check confirmed: ` +
+                `supplierNif="${supplierNifRaw}" fails mod-11 checksum, customerNif="${customerNifRaw}" ` +
+                `passes — AI swapped the slots.`,
+            );
+          } else {
+            this.logger.warn(
+              `[extraction] partySwap triggered by structural NIF mismatch (no filename anchor) ` +
+                `doc=${fileName ?? "?"} supplierNif="${supplierNifRaw}" customerNif="${customerNifRaw}". ` +
+                `Filename heuristic did not match — swap is NIF-anchored only.`,
+            );
+          }
+          const swapped: ExtractedFields = {
+            ...fields,
+            supplier: fields.customer,
+            customer: fields.supplier,
+            supplierNif: fields.customerNif,
+            customerNif: fields.supplierNif,
+          };
+          swapped.hints = [
+            ...(swapped.hints ?? []),
+            `partySwap:ai-swapped-supplier-customer`,
+            `partySwap:reason=ai_supplier_name_matches_filename_prefix`,
+          ];
+          return swapped;
+        }
+      }
+
+      // ── CONDITION 6: Tenant's own NIF was assigned to supplierNif
+      // If supplierNif matches our tenant NIF: we are the BUYER / CUSTOMER, not the supplier!
+      // In Portugal, on simplified invoices (FS/FR) or retail receipts, the customer gives their NIF (our tenant NIF).
+      // If the extractor assigned our tenant NIF to supplierNif:
+      // 1) Search hints or customerNif for an alternative valid NIF that is NOT tenantNif.
+      //    If found: supplierNif = altSupplierNif, customerNif = tenantNif.
+      // 2) If no alternative NIF was found, but doc is clearly an incoming invoice/expense/simplified invoice:
+      //    customerNif = tenantNif, supplierNif = undefined, supplier = supplierMatchesTenant ? undefined : fields.supplier.
+      //    If document hints/text or type suggest simplified invoice/receipt, ensure documentType is 'FATURA_SIMPLIFICADA'.
+      if (
+        (supplierNifNorm === tenantNif || authoritativeSupplierNif === tenantNif) &&
+        !customerMatchesTenant
+      ) {
+        const candidateNifs: string[] = [];
+        if (customerNif && customerNif !== tenantNif && isValidPortugueseNif(customerNif)) {
+          candidateNifs.push(customerNif);
+        }
+        if (fields.hints) {
+          for (const h of fields.hints) {
+            const m = h.match(/^(?:nif|customerNif|vat|qrAuthoritativeSupplierNif):([A-Z0-9]+)/i);
+            if (m && m[1]) {
+              const norm = normalizeTenantNif(m[1]);
+              if (norm && norm !== tenantNif && isValidPortugueseNif(norm) && !candidateNifs.includes(norm)) {
+                candidateNifs.push(norm);
+              }
+            }
+          }
+        }
+
+        const altSupplierNif = candidateNifs[0];
+        this.logger.warn(
+          `[ensureSupplierCustomerSanity] CONDITION 6: supplierNif is tenant's own NIF (${tenantNif}). ` +
+            `Tenant is the buyer/customer. Setting customerNif = ${tenantNif}, ` +
+            `supplierNif = ${altSupplierNif ?? "undefined"}.`,
+        );
+
+        const isSimplifiedOrExpense =
+          fields.documentType === "FATURA_SIMPLIFICADA" ||
+          fields.documentType === "RECIBO" ||
+          (fields.hints ?? []).some((h) =>
+            /simplificada|recibo|cup[aã]o|restaurante/i.test(h),
+          ) ||
+          (fields.docNumber &&
+            /^(?:FS|FR|Simplificada)/i.test(fields.docNumber));
+
+        const updated: ExtractedFields = {
+          ...fields,
+          supplierNif: altSupplierNif ?? undefined,
+          supplierVatId: altSupplierNif ?? undefined,
+          customerNif: tenantNif,
+          supplier: supplierMatchesTenant
+            ? altSupplierNif
+              ? undefined
+              : fields.customer
+            : fields.supplier,
+          customer: supplierMatchesTenant
+            ? fields.supplier
+            : fields.customer || id.tenantName || undefined,
+          documentType:
+            isSimplifiedOrExpense &&
+            (!fields.documentType ||
+              fields.documentType === "OUTRO" ||
+              fields.documentType === "ENCOMENDA")
+              ? "FATURA_SIMPLIFICADA"
+              : fields.documentType,
+        };
+        updated.hints = [
+          ...(updated.hints ?? []),
+          `partySwap:tenant_nif_in_supplier_fixed`,
+          `partySwap:customerNif=${tenantNif}`,
+          ...(altSupplierNif ? [`partySwap:supplierNif=${altSupplierNif}`] : []),
+        ];
+        return updated;
+      }
+
       return fields;
     } catch (err) {
       this.logger.warn(
@@ -1808,6 +3325,87 @@ export class ExtractionService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Root-cause fix (DIAGNOSTIC-2 §5 item 7): when the AI's supplier NIF
+   * fails mod-11 BUT the customer NIF is structurally valid AND resolves
+   * to an existing Party in this tenant, the customer Party is almost
+   * certainly the actual supplier (AI swapped the slots). We swap the
+   * supplier/customer fields and link to the resolved Party.
+   *
+   * This is the NIF-anchored counterpart to `shouldSwap`'s filename
+   * heuristic: the heuristic misses every hallucination where the
+   * AI invented a supplier name NOT present in the upload filename.
+   * A Party lookup on (tenantId, nif) is structural and never lies.
+   *
+   * Tenant scoping is mandatory — never let a Party from another tenant
+   * leak into this document. Cross-tenant NIF matches are silently
+   * rejected (returns null) and logged at WARN.
+   *
+   * Returns the resolved swap payload (or null when no swap applies).
+   * The caller applies the swap to `ExtractedFields` and writes the
+   * resulting `partyId` onto `Document.partyId` so the link is the
+   * trusted Party row, not a freshly-created wrong-supplier Party.
+   */
+  async resolveSupplierByNif(
+    tenantId: string,
+    documentId: string,
+    fields: ExtractedFields,
+  ): Promise<{
+    supplier: string;
+    supplierNif: string;
+    partyId: string | null;
+    reason: string;
+  } | null> {
+    const supplierNifRaw = (fields.supplierNif ?? "").toString().trim();
+    const customerNifRaw = (fields.customerNif ?? "").toString().trim();
+
+    // Guard: only fire when the AI's supplier NIF is structurally invalid
+    // AND the customer NIF passes mod-11 — the same precondition as the
+    // `structuralNifMismatch` branch of `shouldSwap`. Skipping a valid
+    // supplier NIF here keeps AI-confidence flows untouched.
+    if (!supplierNifRaw || isValidPortugueseNif(supplierNifRaw)) {
+      return null;
+    }
+    if (!customerNifRaw || !isValidPortugueseNif(customerNifRaw)) {
+      return null;
+    }
+
+    let party: { id: string; name: string; nif: string | null } | null = null;
+    try {
+      party = await this.prisma.party.findFirst({
+        where: { tenantId, nif: customerNifRaw },
+        select: { id: true, name: true, nif: true },
+      });
+    } catch (err) {
+      // Tenant scoping / DB hiccup — never abort extraction on this path.
+      this.logger.warn(
+        `[resolveSupplierByNif] party lookup failed for tenant=${tenantId} ` +
+          `customerNif=${customerNifRaw}: ${(err as Error).message}. ` +
+          `Skipping NIF-resolve fallback.`,
+      );
+      return null;
+    }
+    if (!party) {
+      // No Party in this tenant for the customer NIF — no swap to apply.
+      return null;
+    }
+    // Prisma `where: { tenantId }` already enforces tenant scoping on the
+    // lookup; no extra cross-tenant check needed (and the helper is a
+    // helper, not an audit point).
+
+    this.logger.warn(
+      `[resolveSupplierByNif] AI supplier NIF (${supplierNifRaw}) fails mod-11 ` +
+        `but customer NIF (${customerNifRaw}) resolves Party "${party.name}" ` +
+        `(${party.id}) in tenant=${tenantId} doc=${documentId}. ` +
+        `Swapping supplier/customer — Party lookup is the trusted anchor.`,
+    );
+    return {
+      supplier: party.name,
+      supplierNif: party.nif ?? customerNifRaw,
+      partyId: party.id,
+      reason: "customer-nif-resolves-existing-party",
+    };
+  }
   private mergeVisionWithRegex(
     vision: import("../ai/vision.service").VisionAnalysisResult,
     regex: ExtractedFields,
@@ -1865,6 +3463,18 @@ export class ExtractionService implements OnModuleDestroy {
         merged.customerNif = pick("customerNif") as string | undefined;
       if (pick("supplierVatId"))
         merged.supplierVatId = pick("supplierVatId") as string | undefined;
+      if (pick("supplierAddress"))
+        merged.supplierAddress = pick("supplierAddress") as string | undefined;
+      if (pick("supplierPostalCode"))
+        merged.supplierPostalCode = pick("supplierPostalCode") as string | undefined;
+      if (pick("supplierCity"))
+        merged.supplierCity = pick("supplierCity") as string | undefined;
+      if (pick("supplierPhone"))
+        merged.supplierPhone = pick("supplierPhone") as string | undefined;
+      if (pick("supplierEmail"))
+        merged.supplierEmail = pick("supplierEmail") as string | undefined;
+      if (pick("supplierWebsite"))
+        merged.supplierWebsite = pick("supplierWebsite") as string | undefined;
       if (pick("docNumber"))
         merged.docNumber = pick("docNumber") as string | undefined;
       if (pick("atcud")) merged.atcud = pick("atcud") as string | undefined;
@@ -1919,6 +3529,15 @@ export class ExtractionService implements OnModuleDestroy {
       }
       if (typeof pick("isEuIntracommunity") === "boolean") {
         merged.isEuIntracommunity = pick("isEuIntracommunity");
+      }
+      // Fase 4.1 — cabeçalho literal + referência da fatura retificada.
+      const docTitle = pick("documentTitle") as string | undefined;
+      if (docTitle && docTitle.trim().length > 0) {
+        merged.documentTitle = docTitle.trim().slice(0, 200);
+      }
+      const correctedRef = pick("correctedDocumentNumber") as string | undefined;
+      if (correctedRef && correctedRef.trim().length > 0) {
+        merged.correctedDocumentNumber = correctedRef.trim().slice(0, 100);
       }
       const suggestedCategory = pick("suggestedCategory") as string | undefined;
       if (suggestedCategory && suggestedCategory.trim().length > 0) {
@@ -1998,6 +3617,373 @@ export class ExtractionService implements OnModuleDestroy {
     return merged;
   }
 
+  /**
+   * Fase 3 — find the "live" original for a fiscal key. Excludes soft-deleted
+   * rows and rows already marked DUPLICADO; when both sides carry an ATCUD
+   * they must match (different ATCUD = different certified document even if
+   * the human-readable number collides across series). Tolerates prisma
+   * test doubles without `findMany`.
+   */
+  async findFiscalKeyOriginal(
+    tenantId: string,
+    documentId: string,
+    supplierNif: string | null,
+    docNumberNorm: string | null,
+    atcud: string | null,
+    atcudTrusted = true,
+  ): Promise<{ id: string; fileName: string } | null> {
+    const finder = (this.prisma.document as unknown as { findMany?: unknown }).findMany;
+    if (typeof finder !== "function") return null;
+    const keys: Prisma.DocumentWhereInput[] = [];
+    if (supplierNif && docNumberNorm) keys.push({ supplierNif, docNumberNorm });
+    // The ATCUD alone identifies a certified document (series code + number),
+    // so two rows sharing it are the same invoice even when the human-readable
+    // number was read differently (photo vs scan).
+    if (atcud) keys.push({ atcud });
+    if (keys.length === 0) return null;
+    try {
+      const rows = await this.prisma.document.findMany({
+        where: {
+          tenantId,
+          deletedAt: null,
+          id: { not: documentId },
+          status: { not: DocumentStatus.DUPLICADO },
+          OR: keys,
+        },
+        select: { id: true, fileName: true, atcud: true },
+        orderBy: { createdAt: "asc" },
+        take: 10,
+      });
+      const hit =
+        rows.find((r) => atcud && r.atcud === atcud) ??
+        rows.find((r) => !r.atcud || !atcud || !atcudTrusted);
+      return hit ? { id: hit.id, fileName: hit.fileName } : null;
+    } catch (err) {
+      this.logger.warn(
+        `[findFiscalKeyOriginal] lookup failed for document=${documentId}: ${(err as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Fase 4 — categoria de despesa automática: >= 3 aprovações da mesma
+   * categoria para o fornecedor (PartyCategoryStat) ou a categoria por
+   * defeito do fornecedor. Tolera prisma sem o modelo (test doubles).
+   */
+  private async resolveAutoCategory(
+    tenantId: string,
+    partyId: string,
+  ): Promise<{ categoryId: string; confidence: number; reason: string } | null> {
+    const client = this.prisma as unknown as {
+      partyCategoryStat?: { findMany: (args: unknown) => Promise<Array<{ categoryId: string; approvedCount: number }>> };
+      party?: { findFirst: (args: unknown) => Promise<{ defaultCategoryId: string | null } | null> };
+    };
+    if (typeof client.partyCategoryStat?.findMany !== "function" || typeof client.party?.findFirst !== "function") {
+      return null;
+    }
+    try {
+      const [stats, party] = await Promise.all([
+        client.partyCategoryStat.findMany({
+          where: { tenantId, partyId },
+          select: { categoryId: true, approvedCount: true },
+        }),
+        client.party.findFirst({ where: { id: partyId, tenantId }, select: { defaultCategoryId: true } }),
+      ]);
+      return pickAutoCategory(stats ?? [], party?.defaultCategoryId ?? null);
+    } catch (err) {
+      this.logger.warn(`[resolveAutoCategory] failed for party=${partyId}: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Fase 4 — replace this document's DocumentItem rows with the
+   * AI-extracted line items. Skips items with no description or no
+   * derivable total (garbage in, nothing written). Tolerates prisma test
+   * doubles without `documentItem` (same pattern as the other Fase 3/4
+   * optional-model helpers in this file).
+   */
+  private async persistLineItems(
+    documentId: string,
+    lineItems: ExtractedFields["lineItems"] | undefined,
+  ): Promise<void> {
+    const client = this.prisma as unknown as {
+      documentItem?: {
+        deleteMany: (args: unknown) => Promise<unknown>;
+        createMany: (args: unknown) => Promise<unknown>;
+      };
+    };
+    if (typeof client.documentItem?.deleteMany !== "function") return;
+    try {
+      await client.documentItem.deleteMany({ where: { documentId } });
+      const rows = (lineItems ?? [])
+        .map((it) => {
+          const description = it.description?.trim();
+          const quantity = it.quantity ?? 1;
+          const unitPrice = it.unitPrice;
+          const total =
+            it.lineTotal ??
+            (unitPrice != null ? Math.round(unitPrice * quantity * 100) / 100 : undefined);
+          if (!description || total == null || !Number.isFinite(total)) return null;
+          // Fase 4.2 (P0.3) — o valor impresso na coluna de desconto
+          // pode ser uma percentagem (a SAMMIC imprime "Dto. 30,00" =
+          // 30%, não 30€). Classificamos pela aritmética antes de
+          // gravar: `discount` guarda sempre o VALOR em euros (a soma
+          // das linhas continua correta); `discountPercent` guarda a
+          // percentagem quando a classificação a confirmou, para a
+          // interface mostrar "30%" em vez de "30,00 EUR".
+          const classified = classifyLineDiscount({
+            quantity,
+            unitPrice,
+            discount: it.discount,
+            lineTotal: it.lineTotal,
+          });
+          return {
+            documentId,
+            code: it.code ?? null,
+            description,
+            quantity,
+            unitPrice: unitPrice ?? total / (quantity || 1),
+            discount: classified.discountAmount ?? 0,
+            discountPercent: classified.kind === 'percent' ? classified.discountPercent : null,
+            taxRate: it.vatRate ?? 23,
+            total,
+          };
+        })
+        .filter((r): r is NonNullable<typeof r> => r !== null);
+      if (rows.length > 0) {
+        await client.documentItem.createMany({ data: rows });
+      }
+    } catch (err) {
+      this.logger.warn(
+        `[persistLineItems] failed for document=${documentId}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  private async categoryNameById(tenantId: string, id: string): Promise<string | null> {
+    const client = this.prisma as unknown as { category?: { findFirst: (args: unknown) => Promise<{ name: string } | null> } };
+    if (typeof client.category?.findFirst !== "function") return null;
+    try {
+      const row = await client.category.findFirst({ where: { id, tenantId }, select: { name: true } });
+      return row?.name ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async matchCategoryBySuggestion(
+    tenantId: string,
+    suggestedCategory: string,
+  ): Promise<{ id: string; name: string } | null> {
+    const client = this.prisma as unknown as { category?: { findMany: (args: unknown) => Promise<Array<{ id: string; name: string; slug: string }>> } };
+    if (typeof client.category?.findMany !== "function") return null;
+    try {
+      const categories = await client.category.findMany({
+        where: { tenantId },
+        select: { id: true, name: true, slug: true },
+      });
+      if (!categories || categories.length === 0) return null;
+
+      const mappedSlug = mapToExpenseCategory(suggestedCategory);
+      if (mappedSlug) {
+        const byName = categories.find((c) => c.name.toLowerCase() === mappedSlug.toLowerCase());
+        if (byName) return byName;
+      }
+
+      const clean = suggestedCategory.toLowerCase();
+      if (clean.includes('31.') || clean.includes('mercadoria')) {
+        const revenda = categories.find((c) => c.slug === 'mercadorias-revenda' || c.name.toLowerCase().includes('revenda'));
+        if (revenda) return revenda;
+      }
+      if (clean.includes('43.') || clean.includes('imobilizado') || clean.includes('equipamento')) {
+        const imob = categories.find((c) => c.slug === 'imobilizado' || c.name.toLowerCase().includes('imobilizado'));
+        if (imob) return imob;
+      }
+      if (clean.includes('62.2.') || clean.includes('62.1.') || clean.includes('62.6.') || clean.includes('serviços') || clean.includes('servicos') || clean.includes('fse') || clean.includes('limpeza')) {
+        const fse = categories.find((c) => c.slug === 'servicos-fse' || c.name.toLowerCase().includes('serviços'));
+        if (fse) return fse;
+      }
+      if (clean.includes('62.3.3') || clean.includes('escritório') || clean.includes('escritorio')) {
+        const esc = categories.find((c) => c.slug === 'material-escritorio');
+        if (esc) return esc;
+      }
+      if (clean.includes('62.4.2') || clean.includes('combust')) {
+        const comb = categories.find((c) => c.slug === 'combustivel');
+        if (comb) return comb;
+      }
+      if (clean.includes('refei') || clean.includes('restaur')) {
+        const ref = categories.find((c) => c.slug === 'refeicoes');
+        if (ref) return ref;
+      }
+
+      const matched = categories.find((c) => clean.includes(c.name.toLowerCase()));
+      if (matched) return matched;
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Fase 3 — the single place that writes the extraction result row. */
+  /**
+   * Fase 4.1 (P1.2) — encontra a fatura que uma nota de crédito
+   * retifica. Procuramos pelo nº normalizado do documento retificado,
+   * dentro do mesmo tenant e, quando o sabemos, do mesmo fornecedor. Uma
+   * NC nunca se liga a si própria nem a outra nota de crédito.
+   */
+  private async findCorrectedDocument(
+    tenantId: string,
+    selfId: string,
+    correctedNumber: string,
+    supplierNif: string | null,
+  ): Promise<{ id: string; docNumber: string | null } | null> {
+    const norm = normalizeDocNumber(correctedNumber);
+    if (!norm) return null;
+    try {
+      const rows = await this.prisma.document.findMany({
+        where: {
+          tenantId,
+          id: { not: selfId },
+          docNumberNorm: norm,
+          type: { not: DocumentType.NOTA_CREDITO },
+          deletedAt: null,
+          ...(supplierNif ? { supplierNif } : {}),
+        },
+        select: { id: true, docNumber: true, supplierNif: true },
+        orderBy: { createdAt: "asc" },
+        take: 5,
+      });
+      // Com NIF conhecido, o filtro já garantiu o fornecedor certo; sem
+      // ele, só aceitamos quando não há ambiguidade.
+      if (rows.length === 1) return rows[0];
+      if (supplierNif && rows.length > 0) return rows[0];
+      return null;
+    } catch (err) {
+      this.logger.warn(
+        `[findCorrectedDocument] lookup failed for "${correctedNumber}": ${(err as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Fase 4.1 (P1.4) — reconstrói o derivado PDF a partir da imagem
+   * endireitada pelo conteúdo e comprimida para ≤ 500 KB, e confirma
+   * que o QR-AT continua legível depois da compressão.
+   *
+   * Best-effort de ponta a ponta: qualquer falha deixa o documento
+   * exactamente como estava. O original nunca é tocado.
+   */
+  private async rebuildArchivePdf(
+    documentId: string,
+    doc: { mimeType: string; fileName: string },
+    uprightBytes: Buffer,
+  ): Promise<void> {
+    if (!this.archiveImage || !this.imageToPdf || !this.storage?.put) {
+      // Alto e bom som: um silêncio aqui custou fotos de 3 MB deitadas
+      // no arquivo sem ninguém dar por isso.
+      this.logger.warn(
+        `[archive] skipped for ${doc.fileName} — archiveImage=${Boolean(this.archiveImage)} ` +
+          `imageToPdf=${Boolean(this.imageToPdf)} storage.put=${Boolean(this.storage?.put)}`,
+      );
+      return;
+    }
+    if (!this.imageToPdf.supports(doc.mimeType)) return;
+    try {
+      const prepared = await this.archiveImage.prepare(uprightBytes, doc.mimeType);
+      if (!prepared) return;
+
+      // O QR tem de continuar a ler-se depois da compressão — é o que
+      // sustenta toda a validade fiscal do documento. Se a versão
+      // comprimida perdeu o QR que o original tinha, ficamos com o
+      // original: um ficheiro maior é melhor do que um ilegível.
+      const qrBefore = await decodeAtQr(uprightBytes, doc.mimeType, this.logger);
+      let bytesForPdf = prepared.buffer;
+      if (qrBefore) {
+        const qrAfter = await decodeAtQr(prepared.buffer, "image/jpeg", this.logger);
+        if (!qrAfter) {
+          this.logger.warn(
+            `[archive] compression cost the QR on ${doc.fileName} — keeping the uncompressed image`,
+          );
+          bytesForPdf = uprightBytes;
+        }
+      }
+
+      const pdf = this.ocrmypdf
+        ? await this.ocrmypdf.processImageOrPdf(
+            bytesForPdf,
+            bytesForPdf === prepared.buffer ? "image/jpeg" : doc.mimeType,
+          )
+        : await this.imageToPdf.convert(
+            bytesForPdf,
+            bytesForPdf === prepared.buffer ? "image/jpeg" : doc.mimeType,
+          );
+      const row = await this.prisma.document.findFirst({
+        where: { id: documentId },
+        select: { pdfKey: true, fileKey: true },
+      });
+      const pdfKey = row?.pdfKey ?? `${row?.fileKey ?? documentId}.pdf`;
+      await this.storage.put(pdfKey, pdf, { contentType: "application/pdf" });
+      await this.prisma.document.update({
+        where: { id: documentId },
+        data: {
+          pdfKey,
+          fileSize: pdf.length,
+        },
+      });
+      this.logger.log(
+        `[archive] ${doc.fileName}: rotated ${prepared.rotation}° (${prepared.rotationReason}), ` +
+          `${(prepared.originalBytes / 1024).toFixed(0)}KB → ${(prepared.buffer.length / 1024).toFixed(0)}KB ` +
+          `@q${prepared.quality}, pdf ${(pdf.length / 1024).toFixed(0)}KB` +
+          (prepared.withinBudget ? "" : " (ACIMA do orçamento de 500KB)"),
+      );
+    } catch (err) {
+      this.logger.warn(`[archive] rebuild failed for ${doc.fileName}: ${(err as Error).message}`);
+    }
+  }
+
+  private runFinalUpdate(
+    documentId: string,
+    data: Prisma.DocumentUpdateInput,
+    status: DocumentStatus,
+    metadata: () => Prisma.InputJsonValue,
+    ocrConfidence: number,
+  ) {
+    return this.prisma.document.update({
+      where: { id: documentId },
+      data: { ...data, metadata: metadata(), ocrConfidence, status },
+    });
+  }
+
+  /**
+   * Fase 2 — cross-check an LLM-read QR payload against the structured
+   * fields the same LLM extracted from the document. Both come from the
+   * model, so agreement is evidence the read-back is real; disagreement
+   * means at least one of them is a hallucination and the QR must not be
+   * promoted to "at_qr" authority. Requires NIF + total in the QR.
+   */
+  isAiQrConsistent(
+    qr: Pick<ExtractedFields, "supplierNif" | "total" | "docDate">,
+    ai: Pick<ExtractedFields, "supplierNif" | "total" | "docDate">,
+  ): { ok: boolean; reasons: string[] } {
+    const reasons: string[] = [];
+    const norm = (v?: string) => (v ?? "").replace(/^PT/i, "").replace(/\s/g, "");
+    if (!qr.supplierNif || qr.total == null) reasons.push("qr_missing_nif_or_total");
+    if (qr.supplierNif && ai.supplierNif && norm(qr.supplierNif) !== norm(ai.supplierNif)) {
+      reasons.push(`nif:${norm(qr.supplierNif)}!=${norm(ai.supplierNif)}`);
+    }
+    if (qr.total != null && ai.total != null && Math.abs(qr.total - ai.total) >= 0.01) {
+      reasons.push(`total:${qr.total}!=${ai.total}`);
+    }
+    if (qr.docDate && ai.docDate && qr.docDate !== ai.docDate) {
+      reasons.push(`date:${qr.docDate}!=${ai.docDate}`);
+    }
+    return { ok: reasons.length === 0, reasons };
+  }
+
   /** Parse a known-AT-QR payload string into Document fields. */
   extractFromQr(qrText: string, doc: { type: string }): ExtractedFields {
     const cleaned = (qrText ?? "").replace(/\s+/g, "");
@@ -2024,7 +4010,9 @@ export class ExtractionService implements OnModuleDestroy {
       customerNif,
       supplier: undefined, // QR payload does not carry the supplier name
       customer: undefined,
-      docNumber: parsed.uniqueDocId ?? parsed.atcud,
+      // Fase 3 — the ATCUD is NOT a document number; when G: is missing the
+      // AI/regex docNumber fills in during the merge instead.
+      docNumber: parsed.uniqueDocId,
       atcud: parsed.atcud,
       docDate: parsed.documentDate,
       dueDate: undefined,
@@ -2125,6 +4113,8 @@ export class ExtractionService implements OnModuleDestroy {
     doc: { fileKey: string; mimeType: string; fileName: string },
     loaded: LoadedText,
     tenantId?: string,
+    precomputedAi?: ExtractedFields,
+    overrides?: { model?: string; provider?: string },
   ): Promise<ExtractedFields> {
     // No vision provider configured → the QR is the only signal we
     // have. Tag the warning so the operator sees WHY supplier is
@@ -2151,10 +4141,16 @@ export class ExtractionService implements OnModuleDestroy {
     // supplier / IBAN / line-items merge we ALSO need access to the
     // raw vision `extracted` payload — captured via a sidecar hook
     // on the tryVisionAnalysis call.
-    this.lastVisionExtracted = null;
     let aiFields: ExtractedFields | null = null;
+    if (precomputedAi && this.lastVisionExtracted != null) {
+      // Fase 2 — the caller already ran the AI path for this document;
+      // reuse it instead of paying for a second vision call.
+      aiFields = precomputedAi;
+    } else {
+      this.lastVisionExtracted = null;
+    }
     try {
-      aiFields = await this.runAiOrRegexPath(doc, loaded, tenantId);
+      if (!aiFields) aiFields = await this.runAiOrRegexPath(doc, loaded, tenantId, overrides);
     } catch (err) {
       this.logger.warn(
         `[mergeQrWithAi] AI path threw for document=${doc.fileName}: ` +
@@ -2261,11 +4257,83 @@ export class ExtractionService implements OnModuleDestroy {
       merged.supplier = aiSupplier;
       aiHints.push(`aiSupplier:${aiSupplier}`);
     }
+    // ── AI-vs-QR mismatch logger (Sprint H+ extraction-fix-3) ────────
+    // When the QR-A-field carries an authoritative issuer name that
+    // disagrees with what AI Vision produced, emit a structured warning
+    // so the operator can see the disagreement in the extraction log
+    // even when no error fires. The 2026-09-06 ONNERA vs EDENOX bug
+    // showed: AI reads the FILENAME (`NOV-OUSADO-LDA_*.pdf`) and
+    // assumes that string is the supplier. The QR (when present)
+    // would have said `ONNERA REFRIGERATION S.A.` — but the QR was
+    // missing from that particular PDF so the safety net had to fire
+    // from the filename heuristic instead. This logger is the
+    // audit-trail hook that lets ops alert on recurring mismatch.
+    const qrSupplierName = qrFields.supplier;
+    if (
+      qrSupplierName &&
+      aiSupplier &&
+      qrSupplierName.trim().toLowerCase() !== aiSupplier.trim().toLowerCase()
+    ) {
+      this.logger.warn(
+        `[mergeQrWithAi] AI-vs-QR supplier name disagreement for document=${doc.fileName}: ` +
+          `qr="${qrSupplierName}" vs ai="${aiSupplier}". ` +
+          `QR is authoritative for fiscal data; AI wins on supplier name when QR has none. ` +
+          `Both recorded in metadata.extraction.aiVsQrMismatch for the audit trail.`,
+      );
+      aiWarnings.push(
+        `aiVsQrMismatch:supplier_name:qr=${qrSupplierName}:ai=${aiSupplier}`,
+      );
+    }
+    // Also detect: AI supplier NIF == tenant NIF (the supplier slot is
+    // pointing at the buyer / our own company). This is the same
+    // wrong-side-up bug the filename heuristic catches, but here we
+    // catch it from the structural side: if AI's supplier NIF matches
+    // the tenant identity helper, the AI swapped the parties in its
+    // own JSON. The downstream `ensureSupplierCustomerSanity` will
+    // also catch this and swap, but logging it here gives us a
+    // pre-emptive signal that runs even when the safety net short-
+    // circuits (e.g. on a foreign-tenant NIF match).
+    const aiSupplierNifRaw =
+      aiRaw?.supplierNif ?? aiFields.supplierNif ?? undefined;
+    if (aiSupplierNifRaw && tenantId) {
+      try {
+        const id = await getTenantIdentity(this.prisma, tenantId);
+        const tenantNifNorm = normalizeTenantNif(id.tenantNif);
+        const aiNifNorm = normalizeTenantNif(aiSupplierNifRaw);
+        if (
+          tenantNifNorm &&
+          aiNifNorm &&
+          tenantNifNorm === aiNifNorm
+        ) {
+          this.logger.warn(
+            `[mergeQrWithAi] AI supplier NIF (${formatPtNif(aiNifNorm)}) matches tenant NIF — ` +
+              `AI swapped supplier/customer in its own JSON. document=${doc.fileName}, ` +
+              `aiSupplier="${aiSupplier ?? "?"}". Will be corrected by ensureSupplierCustomerSanity.`,
+          );
+          aiWarnings.push(
+            `aiSupplierNifEqualsTenantNif:${aiNifNorm}`,
+          );
+        }
+      } catch (err) {
+        // Identity lookup is best-effort — never fail the extraction
+        // because we couldn't read tenant NIF here.
+        this.logger.debug(
+          `[mergeQrWithAi] tenant identity lookup failed for tenant=${tenantId}: ` +
+            `${(err as Error).message}. Skipping structural tenant-NIF check.`,
+        );
+      }
+    }
     if (!merged.customer && aiCustomer) {
       merged.customer = aiCustomer;
     }
+    // Fase 2 — an AI-read IBAN is only accepted when MOD-97 validates it;
+    // a mistranscribed IBAN is worse than none (payment to the wrong account).
     if (!merged.iban && aiIban) {
-      merged.iban = aiIban;
+      if (this.isValidIbanLocal(aiIban)) {
+        merged.iban = aiIban;
+      } else {
+        aiWarnings.push(`ai_iban_rejected_mod97:${aiIban}`);
+      }
       aiHints.push(`aiIban:${aiIban}`);
     }
     if (!merged.dueDate && aiDueDate) {
@@ -2460,6 +4528,25 @@ export class ExtractionService implements OnModuleDestroy {
     //    specific (NC / ND / RECIBO / etc.) come before the generic
     //    "FATURA" so we don't misclassify a credit note as an invoice.
     const aliasMap: Record<string, DocumentType> = {
+      // Fase 3 — non-fiscal / simplified kinds the vision model may name.
+      PRO_FORMA: DocumentType.PROFORMA,
+      PROFORMA_INVOICE: DocumentType.PROFORMA,
+      FATURA_PROFORMA: DocumentType.PROFORMA,
+      FATURA_PRO_FORMA: DocumentType.PROFORMA,
+      QUOTATION: DocumentType.ORCAMENTO,
+      QUOTE: DocumentType.ORCAMENTO,
+      DEVIS: DocumentType.ORCAMENTO,
+      PRESUPUESTO: DocumentType.ORCAMENTO,
+      AVISO: DocumentType.AVISO_PAGAMENTO,
+      AVISO_DE_PAGAMENTO: DocumentType.AVISO_PAGAMENTO,
+      PAYMENT_NOTICE: DocumentType.AVISO_PAGAMENTO,
+      EXTRATO: DocumentType.EXTRATO_FORNECEDOR,
+      EXTRATO_DE_CONTA: DocumentType.EXTRATO_FORNECEDOR,
+      ACCOUNT_STATEMENT: DocumentType.EXTRATO_FORNECEDOR,
+      STATEMENT: DocumentType.EXTRATO_FORNECEDOR,
+      FS: DocumentType.FATURA_SIMPLIFICADA,
+      FATURA_SIMPLIFICADA: DocumentType.FATURA_SIMPLIFICADA,
+      SIMPLIFIED_INVOICE: DocumentType.FATURA_SIMPLIFICADA,
       // Credit notes / debit notes — must precede FATURA.
       NC: DocumentType.NOTA_CREDITO,
       NOTA_CREDITO: DocumentType.NOTA_CREDITO,
@@ -2468,6 +4555,13 @@ export class ExtractionService implements OnModuleDestroy {
       GUTSCHRIFTSRECHNUNG: DocumentType.NOTA_CREDITO,
       AVOIR: DocumentType.NOTA_CREDITO,
       NOTA_DE_CREDITO: DocumentType.NOTA_CREDITO,
+      // Fase 4.2 (P1.3) — sinónimos em falta: "nota de abono" (PT) e
+      // "factura rectificativa" (ES, quando o valor rectificado é
+      // negativo — a versão positiva é só uma correção de dados).
+      NOTA_DE_ABONO: DocumentType.NOTA_CREDITO,
+      NOTA_ABONO: DocumentType.NOTA_CREDITO,
+      FACTURA_RECTIFICATIVA: DocumentType.NOTA_CREDITO,
+      FATURA_RETIFICATIVA: DocumentType.NOTA_CREDITO,
       ND: DocumentType.NOTA_DEBITO,
       NOTA_DEBITO: DocumentType.NOTA_DEBITO,
       DEBIT_NOTE: DocumentType.NOTA_DEBITO,
@@ -2485,7 +4579,6 @@ export class ExtractionService implements OnModuleDestroy {
       // only runs on the supplier-invoice (received) extraction path.
       FT: DocumentType.FATURA_RECEBIDA,
       FR: DocumentType.FATURA_RECEBIDA,
-      FS: DocumentType.FATURA_RECEBIDA,
       FATURA: DocumentType.FATURA_RECEBIDA,
       FATURA_RECEBIDA: DocumentType.FATURA_RECEBIDA,
       FACTURA: DocumentType.FATURA_RECEBIDA,
@@ -2502,6 +4595,17 @@ export class ExtractionService implements OnModuleDestroy {
       ENCOMENDA: DocumentType.ENCOMENDA,
       ORDER: DocumentType.ENCOMENDA,
       BON_DE_COMMANDE: DocumentType.ENCOMENDA,
+      CONFIRMACAO_DE_ENCOMENDA: DocumentType.ENCOMENDA,
+      CONFIRMACAO_ENCOMENDA: DocumentType.ENCOMENDA,
+      CONFIRMACION_DE_PEDIDO: DocumentType.ENCOMENDA,
+      CONFIRMACION_PEDIDO: DocumentType.ENCOMENDA,
+      ORDER_CONFIRMATION: DocumentType.ENCOMENDA,
+      PURCHASE_ORDER: DocumentType.ENCOMENDA,
+      NOTA_DE_ENCOMENDA: DocumentType.ENCOMENDA,
+      NOTA_ENCOMENDA: DocumentType.ENCOMENDA,
+      ORDEM_DE_ENCOMENDA: DocumentType.ENCOMENDA,
+      PEDIDO_DE_COMPRA: DocumentType.ENCOMENDA,
+      PEDIDO: DocumentType.ENCOMENDA,
       GUIA_TRANSPORTE: DocumentType.GUIA_TRANSPORTE,
       GUIA_DE_TRANSPORTE: DocumentType.GUIA_TRANSPORTE,
       DELIVERY_NOTE: DocumentType.GUIA_TRANSPORTE,
@@ -2513,10 +4617,14 @@ export class ExtractionService implements OnModuleDestroy {
 
     // 3. Loose keyword scan — reuse the regex-classifier vocabulary
     //    so a verbose label ("Fatura-Recibo n.º FT 2026/1") still
-      //    resolves. Order matters: nota de crédito / débito before
-      //    generic fatura.
+    //    resolves. Order matters: nota de crédito / débito, recibo,
+    //    encomenda before generic fatura.
     const lower = cleaned.toLowerCase();
-    if (/(nota.{0,3}credito|credit.{0,3}note|gutschrift|avoir)/.test(lower)) {
+    if (
+      /(nota.{0,3}credito|nota.{0,3}abono|credit.{0,3}note|gutschrift|avoir|(fa[ct]tura|factura).{0,3}rect)/.test(
+        lower,
+      )
+    ) {
       return DocumentType.NOTA_CREDITO;
     }
     if (/(nota.{0,3}debito|debit.{0,3}note|belastungsanzeige)/.test(lower)) {
@@ -2527,6 +4635,9 @@ export class ExtractionService implements OnModuleDestroy {
     ) {
       return DocumentType.RECIBO;
     }
+    if (/(confirma[çc][ãa]o.{0,10}encomenda|confirma[çc][ií]on.{0,10}pedido|order.{0,5}confirmation|nota.{0,5}encomenda|encomenda|purchase.{0,5}order|pedido.{0,5}compra|order|bon.de.commande)/.test(lower)) {
+      return DocumentType.ENCOMENDA;
+    }
     if (
       /(fatura|fatura.?recibo|fatura.?recebida|fatura.?emitida|factura|facture|invoice|rechnung|fattura)/.test(
         lower,
@@ -2536,9 +4647,6 @@ export class ExtractionService implements OnModuleDestroy {
     }
     if (/(comprovativo|proof.of.payment)/.test(lower)) {
       return DocumentType.COMPROVATIVO;
-    }
-    if (/(encomenda|order|bon.de.commande)/.test(lower)) {
-      return DocumentType.ENCOMENDA;
     }
     if (/(guia.{0,3}transporte|delivery.note|cmr|packing.slip)/.test(lower)) {
       return DocumentType.GUIA_TRANSPORTE;
@@ -2587,10 +4695,16 @@ export class ExtractionService implements OnModuleDestroy {
           /\b(recibo|receipt|quittung|quittance|ricevuta|reçu|recibo\s*de\s*vencimentos)\b/i,
         type: "RECIBO",
       },
-      // Invoices (most general — checked last so it doesn't swallow NC/ND/RC).
+      // Purchase orders & Order confirmations (match before generic invoice).
       {
         pattern:
-          /\b(fatura(?:\s*recebida|\s+recebida)?|factura|facture|invoice|rechnung|fattura|nota\s*de\s*encomenda)\b/i,
+          /\b(confirma[çc][ãa]o\s*(?:de\s*)?encomenda|confirma[çc][ií]on\s*(?:de\s*)?pedido|order\s*confirmation|nota\s*de\s*encomenda|ordem\s*de\s*encomenda|pedido\s*de\s*compra|purchase\s*order|bon\s*de\s*commande|bestellung|bestellbest[aä]tigung)\b/i,
+        type: "ENCOMENDA",
+      },
+      // Invoices (most general — checked last so it doesn't swallow NC/ND/RC/ENCOMENDA).
+      {
+        pattern:
+          /\b(fatura(?:\s*recebida|\s+recebida)?|factura|facture|invoice|rechnung|fattura)\b/i,
         type: "FATURA_RECEBIDA",
       },
     ];
@@ -2655,12 +4769,24 @@ export class ExtractionService implements OnModuleDestroy {
 
     // 2) NIF — preserve the Portuguese validation path first.
     let nif: string | undefined;
-    const labeledNif = normalized.match(
-      /(?:NIF|N\.?\s*I\.?\s*F\.?|Contribuinte|NIPC)[:\s]*(\d{9})/i,
-    );
-    if (labeledNif && isValidNif(labeledNif[1])) {
-      nif = normalizeNif(labeledNif[1]);
+    let customerNifFromRegex: string | undefined;
+    const nifRegex = /(?:NIF|N\.?\s*I\.?\s*F\.?|N\.?º?\s*Contr(?:ib(?:uinte)?)?\.?|Contr(?:ib(?:uinte)?)?\.?|NIPC)[:\s]*(?:PT)?(\d{9})\b/gi;
+    const matchedNifs: string[] = [];
+    let nifMatch: RegExpExecArray | null;
+    while ((nifMatch = nifRegex.exec(normalized)) !== null) {
+      const candidate = normalizeNif(nifMatch[1]);
+      if (isValidNif(candidate) && !matchedNifs.includes(candidate)) {
+        matchedNifs.push(candidate);
+      }
+    }
+
+    if (matchedNifs.length > 0) {
+      nif = matchedNifs[0];
       hints.push(`nif:${nif}`);
+      if (matchedNifs.length > 1) {
+        customerNifFromRegex = matchedNifs[1];
+        hints.push(`customerNif:${customerNifFromRegex}`);
+      }
     } else {
       const naked = normalized.match(/\b([1235689]\d{8})\b/);
       if (naked && isValidNif(naked[1])) {
@@ -2734,7 +4860,7 @@ export class ExtractionService implements OnModuleDestroy {
       if (docDate) hints.push(`docDate:${docDate}`);
     }
     const dueLabel = normalized.match(
-      /(?:Vencimento|Data\s*limite|Due\s*date|F[aä]llig(?:keit)?|[ÉE]ch[ée]ance)[:\s]*(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{4})/i,
+      /(?:Vencimento|Vencimiento|Fecha\s*de\s*vencimiento|F\.?\s*Vto|Vto\.?|Data\s*limite|Due\s*date|F[aä]llig(?:keit)?|[ÉE]ch[ée]ance)[:\s]*(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{4})/i,
     );
     if (dueLabel) {
       const dateText = dueLabel[1];
@@ -2747,6 +4873,29 @@ export class ExtractionService implements OnModuleDestroy {
         ? this.parseInvoiceDate(dueMatch, dateCountry, warnings)
         : undefined;
       if (dueDate) hints.push(`dueDate:${dueDate}`);
+    }
+
+    // If no absolute due date was found, calculate from payment terms (e.g. "Forma de Pago: 30 DÍAS")
+    if (!dueDate && docDate) {
+      const paymentTermMatch = normalized.match(
+        /(?:Forma\s*de\s*pago|Condi[çc][õo]es?\s*de\s*pagamento|Forma\s*de\s*pagamento|Prazo\s*de\s*pagamento|Condiciones\s*de\s*pago|Pagamento\s*a|Payment\s*terms|Net)[:\s]*(\d{1,3})\s*(?:d[ií]as?|days?)/i,
+      );
+      if (paymentTermMatch) {
+        const days = parseInt(paymentTermMatch[1], 10);
+        if (Number.isFinite(days) && days > 0 && days <= 365) {
+          const d = new Date(docDate);
+          d.setDate(d.getDate() + days);
+          dueDate = d.toISOString().slice(0, 10);
+          hints.push(`dueDate:${dueDate}`);
+        }
+      } else if (
+        /(?:Forma\s*de\s*pago|Forma\s*de\s*pagamento)[:\s]*(?:Pronto\s*pagamento|A\s*pronto|Contado|Al\s*contado|Immediate)\b/i.test(
+          normalized,
+        )
+      ) {
+        dueDate = docDate;
+        hints.push(`dueDate:${dueDate}`);
+      }
     }
 
     // 5) Totals + VAT — both 1.234,56 and 1,234.56 are common on invoices.
@@ -2865,7 +5014,7 @@ export class ExtractionService implements OnModuleDestroy {
     return {
       supplierNif: supplierVatId,
       supplierVatId,
-      customerNif: undefined,
+      customerNif: customerNifFromRegex,
       supplier,
       customer: undefined,
       docNumber,
@@ -3041,13 +5190,22 @@ export class ExtractionService implements OnModuleDestroy {
       GB: /^GB(?:\d{9}|\d{12}|GD\d{3}|HA\d{3})$/,
     };
     const labelled = text.matchAll(
-      /(?:VAT(?:\s*(?:No\.?|ID))?|Tax\s*ID|USt-?IdNr\.?|N[ºo]\s*TVA|CIF)\s*[:#-]?\s*([A-Z]{2}[A-Z0-9 .-]{7,16})/gi,
+      /(?:VAT(?:\s*(?:No\.?|ID))?|Tax\s*ID|USt-?IdNr\.?|N[ºo]\s*TVA|C\.?I\.?F\.?)\s*[:#-]?\s*([A-Z]{2}[- ]?[A-Z0-9][- ]?[0-9]{7}[A-Z0-9]?|[A-Z]{2}[A-Z0-9-]{7,14})\b/gi,
     );
     const candidates = [...labelled].map((match) => match[1]);
+
+    // Spanish CIF without ES prefix (e.g. C.I.F. A-14219836 or CIF A14219836)
+    const cifWithoutCountry = text.matchAll(
+      /(?:C\.?I\.?F\.?)\s*[:#-]?\s*([A-Z][- ]?\d{7}[- ]?[A-Z0-9])\b/gi,
+    );
+    for (const match of cifWithoutCountry) {
+      candidates.push(`ES${match[1]}`);
+    }
+
     candidates.push(
       ...[
         ...text.matchAll(
-          /\b(?:ATU\d{8}|(?:BE|BG|CY|CZ|DE|DK|EE|ES|FI|FR|GR|EL|HR|HU|IE|IT|LT|LU|LV|MT|NL|PL|RO|SE|SI|SK|GB)[A-Z0-9]{7,13})\b/gi,
+          /\b(?:ATU\d{8}|(?:BE|BG|CY|CZ|DE|DK|EE|ES|FI|FR|GR|EL|HR|HU|IE|IT|LT|LU|LV|MT|NL|PL|RO|SE|SI|SK|GB)[- ]?[A-Z0-9][- ]?[0-9]{6,12}[A-Z0-9]?)\b/gi,
         ),
       ].map((match) => match[0]),
     );
@@ -3365,7 +5523,18 @@ export class ExtractionService implements OnModuleDestroy {
    */
   private buildUpdateData(
     fields: ExtractedFields,
-    options?: { qrPayloadOverride?: string },
+    options?: {
+      qrPayloadOverride?: string;
+      /**
+       * Fase 4.1 — origem de cada família de campos, para o teto de
+       * confiança. Sem isto assume-se `ai` (teto baixo), que é a
+       * posição segura: quem não prova, não mostra 90 %.
+       */
+      confidenceSources?: {
+        nif: 'qr' | 'validated' | 'ai';
+        qrBacked: 'qr' | 'ai';
+      };
+    },
   ): Prisma.DocumentUpdateInput {
     const data: Prisma.DocumentUpdateInput = {};
     if (fields.supplierNif) data.supplierNif = fields.supplierNif;
@@ -3391,7 +5560,69 @@ export class ExtractionService implements OnModuleDestroy {
     if (options?.qrPayloadOverride) {
       data.qrPayload = options.qrPayloadOverride;
     }
+
+    // ── Sprint 1.A — per-field extraction confidence ───────────────
+    // The AI returns a single top-level confidence; Gemini does not
+    // score fields individually. We fan that score out to every field
+    // the path actually populated, so the review screen's chip grid
+    // reflects "how confident was the model in what it returned"
+    // instead of "we have no idea". A future migration that captures
+    // per-field scores from the prompt can replace these lines
+    // without touching the schema or the UI.
+    //
+    // We ALSO compute nifValid / ibanValid at write time — mod-11 and
+    // mod-97 are cheap enough that running them here is free, and the
+    // review screen needs the verdict alongside the value to flag
+    // "AI is confident but the checksum disagrees" cases.
+    //
+    // Fase 4.1 — a confiança reportada tem de refletir a validação. Um
+    // campo que não foi cruzado com nada (só o modelo o viu) fica com
+    // teto em UNVALIDATED_CONFIDENCE_CAP, para a interface não mostrar
+    // 90 % num valor que ninguém verificou.
+    const src = options?.confidenceSources;
+    const fan = (column: string, source: "qr" | "validated" | "ai" = "ai") => {
+      const value = fieldConfidence(fields.confidence, source);
+      if (value == null) return;
+      (data as Record<string, unknown>)[column] = value;
+    };
+
+    if (fields.supplierNif) {
+      // Chegou aqui → já passou o resolveTaxIds (módulo 11 / VIES).
+      fan("supplierNifConfidence", src?.nif ?? "validated");
+      data.nifValid = this.isValidPortugueseNifLocal(fields.supplierNif);
+    }
+    if (fields.iban) {
+      const ibanValid = this.isValidIbanLocal(fields.iban);
+      fan("supplierIbanConfidence", ibanValid ? "validated" : "ai");
+      data.ibanValid = ibanValid;
+    }
+    if (fields.supplier) fan("supplierNameConfidence");
+    if (fields.total != null) {
+      // Os totais só são "validados" quando fecham entre si ao cêntimo
+      // (soma − descontos + IVA = total) ou vieram do QR-AT.
+      fan("totalAmountConfidence", fields.totalsReconciled ? "validated" : (src?.qrBacked ?? "ai"));
+    }
+    if (fields.docDate) fan("issueDateConfidence", src?.qrBacked ?? "ai");
+    if (fields.dueDate) fan("dueDateConfidence");
+    if (fields.suggestedCategory) fan("categoryConfidence");
     return data;
+  }
+
+  /**
+   * Local re-export of the NIF validator. Imported from
+   * `common/validation/tax-id.validator` at the top of the file but
+   * referenced here via thin wrappers so a future swap to a
+   * per-country helper stays localised.
+   */
+  private isValidPortugueseNifLocal(value: string): boolean {
+    return isValidPortugueseNif(value);
+  }
+
+  /**
+   * Local re-export of the IBAN validator. See isValidPortugueseNifLocal.
+   */
+  private isValidIbanLocal(value: string): boolean {
+    return isValidIban(value);
   }
 
   private composeMetadata(
@@ -3401,6 +5632,8 @@ export class ExtractionService implements OnModuleDestroy {
     qrValidation?: { ok: boolean; errors: string[]; warnings: string[] },
     loaded?: LoadedText,
     supplierResolve?: { supplierReview: boolean; supplierReason?: string },
+    aiExpenseCategory?: ExpenseCategory | null,
+    certaintyResult?: CertaintyScoreResult,
   ): Prisma.InputJsonValue {
     // ── Per-rate VAT breakdown ───────────────────────────────────
     // Source priority:
@@ -3440,6 +5673,36 @@ export class ExtractionService implements OnModuleDestroy {
         ? (existing as Record<string, unknown>)
         : {}
     ) as Record<string, unknown>;
+
+    // ── Auto-persist expenseCategory into metadata.filing ───────────
+    // When the folder-rules branch above resolved an AI-driven
+    // expenseCategory (one of EXPENSE_CATEGORIES), we mirror it into
+    // `metadata.filing` so the document-detail page can show it on
+    // first load — no manual Save required. We respect any existing
+    // user-set filing.expenseCategory (a manual override on PATCH
+    // carries source='user') so this branch NEVER clobbers a manual
+    // pick — only fills it in when the row was empty.
+    let filing: Record<string, unknown> | undefined;
+    if (aiExpenseCategory) {
+      const existingFiling =
+        base.filing && typeof base.filing === "object" && !Array.isArray(base.filing)
+          ? (base.filing as Record<string, unknown>)
+          : {};
+      const alreadySetByUser =
+        typeof existingFiling.expenseCategory === "string" &&
+        existingFiling.source === "user";
+      if (!alreadySetByUser) {
+        filing = {
+          ...existingFiling,
+          expenseCategory: aiExpenseCategory,
+          vatDeductibilityHint: VAT_DEDUCTIBILITY_HINTS[aiExpenseCategory].reason,
+          source: "ai",
+        };
+      } else {
+        filing = existingFiling;
+      }
+    }
+
     // Cap the persisted text to a few KB so a 1MB PDF doesn't blow up
     // metadata. We keep the first N chars + a length marker so the
     // operator can see what the extractor actually saw.
@@ -3475,11 +5738,30 @@ export class ExtractionService implements OnModuleDestroy {
 
     return {
       ...base,
+      supplierAddress: fields.supplierAddress ?? base.supplierAddress ?? null,
+      supplierPostalCode: fields.supplierPostalCode ?? base.supplierPostalCode ?? null,
+      supplierCity: fields.supplierCity ?? base.supplierCity ?? null,
+      supplierPhone: fields.supplierPhone ?? base.supplierPhone ?? null,
+      supplierEmail: fields.supplierEmail ?? base.supplierEmail ?? null,
+      supplierWebsite: fields.supplierWebsite ?? base.supplierWebsite ?? null,
       extraction: {
         source: fields.source,
         confidence: fields.confidence,
         currency: fields.currency,
         country: fields.country,
+        supplierAddress: fields.supplierAddress ?? null,
+        supplierPostalCode: fields.supplierPostalCode ?? null,
+        supplierCity: fields.supplierCity ?? null,
+        supplierPhone: fields.supplierPhone ?? null,
+        supplierEmail: fields.supplierEmail ?? null,
+        supplierWebsite: fields.supplierWebsite ?? null,
+        // Fase 4.1 — o cabeçalho transcrito à letra fica gravado: é o
+        // texto em que a regra determinística se baseou para decidir
+        // "orçamento" em vez de "fatura", e sem ele quem revê o
+        // documento não consegue perceber porquê.
+        documentTitle: fields.documentTitle,
+        correctedDocumentNumber: fields.correctedDocumentNumber,
+        totalsReconciled: fields.totalsReconciled,
         documentLocale: fields.documentLocale,
         ibanCountry: fields.ibanCountry,
         supplierVatId: fields.supplierVatId,
@@ -3573,7 +5855,40 @@ export class ExtractionService implements OnModuleDestroy {
         // "created_review" / "resolve_threw:...").
         supplierReview: supplierResolve?.supplierReview ?? false,
         supplierReason: supplierResolve?.supplierReason ?? null,
+        // ── Certainty Score (95% - 99%) & Mathematical Triangulation (Fase 5) ──
+        certaintyScore: certaintyResult?.score ?? null,
+        certaintyLevel: certaintyResult?.level ?? null,
+        certainty: certaintyResult
+          ? {
+              score: certaintyResult.score,
+              level: certaintyResult.level,
+              label: certaintyResult.label,
+              needsReview: certaintyResult.needsReview,
+              triangulation: certaintyResult.triangulation,
+              taxIdResolution: certaintyResult.taxIdResolution,
+              tenantNifValidation: certaintyResult.tenantNifValidation,
+              lineItemsValidation: {
+                isValid: certaintyResult.lineItemsValidation.isValid,
+                totalLines: certaintyResult.lineItemsValidation.totalLines,
+                sumOfLines: certaintyResult.lineItemsValidation.sumOfLines,
+                discrepancies: certaintyResult.lineItemsValidation.lineDiscrepancies,
+              },
+              vatRatesValidation: {
+                isValid: certaintyResult.vatRatesValidation.isValid,
+                ratesChecked: certaintyResult.vatRatesValidation.ratesChecked,
+                invalidRates: certaintyResult.vatRatesValidation.invalidRates,
+              },
+              passedChecks: certaintyResult.passedChecks,
+              warnings: certaintyResult.warnings,
+            }
+          : null,
       },
+      ...(this.lastAiExtraction
+        ? { aiExtraction: this.lastAiExtraction }
+        : base.aiExtraction
+          ? { aiExtraction: base.aiExtraction }
+          : {}),
+      ...(filing ? { filing } : {}),
     } as unknown as Prisma.InputJsonValue;
   }
 
@@ -3819,6 +6134,177 @@ export class ExtractionService implements OnModuleDestroy {
   }
 
   /**
+   * Sprint H+ Part 2 — supplier-only re-extraction.
+   *
+   * Pulls the file bytes from storage, runs vision (if a provider is
+   * configured) + the regex/OCR path, and merges the result into a
+   * focused supplier-shaped payload:
+   *
+   *   { supplierName?, supplierNif?, supplierIban?, address?, country? }
+   *
+   * Distinct from `processDocumentAsync()` (the full 4-stage pipeline
+   * driver): this helper does NOT advance processingStatus, does NOT
+   * publish any queue events, and does NOT touch totals / line items
+   * / party links. Use this when the operator wants to refresh just
+   * the supplier block on a Document that already has the rest of the
+   * header locked in (typical "AI swapped the wrong party" case after
+   * the operator reviewed but BEFORE they verified-supplier).
+   *
+   * Operator-Verified Guard: the caller is responsible for checking
+   * `Document.supplierVerifiedAt` BEFORE invoking this method. This
+   * helper does not duplicate the guard — running it on a verified
+   * document is technically allowed, but the caller (DocumentsService.
+   * extractSupplierFromDocument) treats verified docs as 409 unless
+   * the operator passes `force=true`.
+   *
+   * Failure modes (graceful — never throws to the caller unless the
+   * underlying read blows up):
+   *   - storage missing                → regex path on filename only
+   *   - no vision provider configured  → regex path only (silent skip)
+   *   - vision throws / times out      → regex path takes over
+   */
+  async extractSupplierFromDocument(
+    tenantId: string,
+    userId: string,
+    documentId: string,
+  ): Promise<{
+    supplierName: string | null;
+    supplierNif: string | null;
+    supplierIban: string | null;
+    address: string | null;
+    country: string | null;
+  }> {
+    this.logger.log(
+      `[extractSupplierFromDocument] start document=${documentId} tenant=${tenantId}`,
+    );
+
+    const doc = await this.prisma.document.findFirst({
+      where: { id: documentId, tenantId },
+    });
+    if (!doc) {
+      throw new Error(`Document ${documentId} not found for tenant ${tenantId}`);
+    }
+
+    // Load text — reuse `loadDocumentText` so we benefit from the same
+    // OCR/PDF parsing pipeline as the full extraction. Returns
+    // `source='filename'` when storage is offline so the regex path
+    // still has SOMETHING to scan.
+    const loaded = await this.loadDocumentText({
+      fileKey: doc.fileKey,
+      mimeType: doc.mimeType,
+      fileName: doc.fileName,
+      fileSize: doc.fileSize,
+    });
+
+    // Regex path — always runs. Cheap, never throws, gives us the
+    // baseline supplier candidate (NIF / IBAN / country) even when the
+    // vision provider is offline.
+    const regexFields = await this.extractWithOcrFallback(
+      { fileKey: doc.fileKey, mimeType: doc.mimeType, fileName: doc.fileName },
+      loaded.text,
+    );
+
+    // Vision path — runs ONLY when a provider is configured AND the
+    // file is a multimodal-supporting type. Mirrors the same gating
+    // the full pipeline uses so we get the same provider fallback
+    // behaviour without re-implementing the chain.
+    let visionExtracted:
+      | import("../ai/vision.service").VisionExtractedFields
+      | null = null;
+    if (this.vision?.liveProviderAvailable) {
+      try {
+        const result = await this.callVisionForSupplier({
+          doc,
+          loaded,
+          tenantId,
+        });
+        visionExtracted = result;
+      } catch (err) {
+        this.logger.warn(
+          `[extractSupplierFromDocument] vision failed for ` +
+            `${doc.fileName}: ${(err as Error).message}. Falling back to regex.`,
+        );
+        visionExtracted = null;
+      }
+    }
+
+    // Merge priority: vision wins on overlap (vision carries the
+    // tenant-identity block, so it's the strongest signal on the
+    // supplier-vs-customer distinction). Regex fills the gaps so the
+    // operator still sees a sensible row when vision is silent or
+    // offline. This mirrors the public `mergeVisionWithRegex` shape
+    // but locally scoped to the supplier fields.
+    const merged = mergeSupplierOnly(visionExtracted, regexFields);
+
+    this.logger.log(
+      `[extractSupplierFromDocument] done document=${documentId} ` +
+        `vision=${visionExtracted ? "yes" : "no"} regex=${regexFields ? "yes" : "no"} ` +
+        `→ supplierName=${merged.supplierName ?? "?"} nif=${merged.supplierNif ?? "?"}`,
+    );
+
+    return merged;
+  }
+
+  /**
+   * Internal — runs the vision call focused on extracting the supplier
+   * block. Lives here (not as a separate public method) because it
+   * shares ~95 % of `tryVisionAnalysis`'s payload-building logic and
+   * the divergence is purely in which fields we keep afterwards. The
+   * caller passes the doc + loaded text and gets a
+   * `VisionExtractedFields` shape back, ready to be merged with the
+   * regex baseline.
+   */
+  private async callVisionForSupplier(args: {
+    doc: {
+      fileKey: string;
+      mimeType: string;
+      fileName: string;
+    };
+    loaded: LoadedText;
+    tenantId: string;
+  }): Promise<
+    import("../ai/vision.service").VisionExtractedFields | null
+  > {
+    const { doc, loaded, tenantId } = args;
+    if (!this.vision) return null;
+
+    // Build the multimodal payload — same logic as `tryVisionAnalysis`
+    // but inlined so we don't need to hoist `tryVisionAnalysis` to
+    // public just for this. Image/PDF routing matches the canonical
+    // pipeline (line 1682-1730 in `tryVisionAnalysis`).
+    let fileBase64: string | undefined;
+    let mimeType: string | undefined;
+    if (this.storage) {
+      try {
+        if (/^image\//i.test(doc.mimeType)) {
+          const obj = await this.storage.getBuffer(doc.fileKey);
+          fileBase64 = obj.buffer.toString("base64");
+          mimeType = obj.contentType ?? doc.mimeType;
+        } else if (/^application\/pdf/i.test(doc.mimeType)) {
+          const obj = await this.storage.getBuffer(doc.fileKey);
+          fileBase64 = obj.buffer.toString("base64");
+          mimeType = obj.contentType ?? "application/pdf";
+        }
+      } catch (err) {
+        this.logger.warn(
+          `extractSupplierFromDocument: vision could not re-read file (${doc.fileName}): ${(err as Error).message}. Falling back to text-only prompt.`,
+        );
+      }
+    }
+
+    const result = await this.vision.analyze({
+      fileBase64,
+      mimeType,
+      text: loaded.text || undefined,
+      fileName: doc.fileName,
+      documentContext: "invoice",
+      timeoutMs: 30_000,
+      tenantId,
+    });
+    return result?.extracted ?? null;
+  }
+
+  /**
    * Parse a PDF's embedded text layer. Returns the joined text plus a
    * source marker. pdf-parse (which wraps pdfjs-dist) always emits a
    * `-- N of M --` marker between pages; we treat that as noise and
@@ -3921,6 +6407,52 @@ export class ExtractionService implements OnModuleDestroy {
       /* swallow — queue may be uninitialised if Redis never came up */
     }
   }
+}
+
+/**
+ * Sprint H+ Part 2 — merge helper that collapses a vision payload
+ * (shape `VisionExtractedFields`) + a regex payload (shape
+ * `ExtractedFields`) into the focused supplier block used by
+ * `extractSupplierFromDocument`. Exported as a top-level function so
+ * the supplier controller can re-use it without dragging the whole
+ * ExtractionService into the controller's dependency tree.
+ *
+ * Priority: vision wins when it has a value, regex fills the gap.
+ * Rationale: vision carries the tenant-identity context block so it's
+ * the strongest signal for distinguishing supplier-vs-customer;
+ * regex is the safety net for offline / no-provider environments.
+ */
+export function mergeSupplierOnly(
+  vision: import("../ai/vision.service").VisionExtractedFields | null | undefined,
+  regex: ExtractedFields | null | undefined,
+): {
+  supplierName: string | null;
+  supplierNif: string | null;
+  supplierIban: string | null;
+  address: string | null;
+  country: string | null;
+} {
+  const vName = vision?.supplier?.trim() ?? undefined;
+  const vNif = vision?.supplierNif?.trim() ?? vision?.supplierVatId?.trim();
+  const vIban = vision?.iban?.trim();
+  const vCountry = vision?.country?.trim();
+
+  const rName = regex?.supplier?.trim();
+  const rNif = regex?.supplierNif?.trim() ?? regex?.supplierVatId?.trim();
+  const rIban = regex?.iban?.trim();
+  const rCountry = regex?.country?.trim();
+
+  return {
+    supplierName: (vName && vName.length > 0 ? vName : rName) ?? null,
+    supplierNif: (vNif && vNif.length > 0 ? vNif : rNif) ?? null,
+    supplierIban: (vIban && vIban.length > 0 ? vIban : rIban) ?? null,
+    // `address` is not extracted by the current vision prompt or the
+    // regex layer (free-text addresses are unreliable), so this slot
+    // is always null at extraction time. Operators fill it in via
+    // the manual-edit endpoint instead.
+    address: null,
+    country: (vCountry && vCountry.length > 0 ? vCountry : rCountry) ?? null,
+  };
 }
 
 /** Minimal port for the storage layer; matches StorageService shape. */

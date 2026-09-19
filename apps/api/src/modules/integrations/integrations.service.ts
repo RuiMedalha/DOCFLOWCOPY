@@ -138,7 +138,10 @@ export class IntegrationsService {
     const rows = await this.prisma.integration.findMany({
       where: {
         tenantId,
-        NOT: { provider: { startsWith: '__state__:' } },
+        NOT: [
+          { provider: { startsWith: '__state__:' } },
+          { provider: 'ai_settings' },
+        ],
       },
       orderBy: { provider: 'asc' },
     });

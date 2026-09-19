@@ -149,6 +149,44 @@ describe('TaxSimulatorService', () => {
       );
     });
 
+    it('Fase 4.3 (P0.3) — nota de crédito de fornecedor reduz o IVA dedutível', async () => {
+      prisma.document.findMany.mockResolvedValue([
+        // Fatura de compra: 100€ + 23€ IVA
+        {
+          id: 'ft1',
+          type: 'FATURA_RECEBIDA',
+          supplierNif: '500842019',
+          isIntracommunity: false,
+          netAmount: 100,
+          taxAmount: 23,
+          total: 123,
+          items: [{ total: 123, taxRate: 23, taxAmount: 23 }],
+        },
+        // Nota de crédito do fornecedor: -50€ - 11.5€ IVA
+        {
+          id: 'nc1',
+          type: 'NOTA_CREDITO',
+          supplierNif: '500842019',
+          isIntracommunity: false,
+          netAmount: -50,
+          taxAmount: -11.5,
+          total: -61.5,
+          items: [{ total: -61.5, taxRate: 23, taxAmount: -11.5 }],
+        },
+      ]);
+
+      const out = await svc.simulateIva(TENANT_ID, USER_ID, {
+        year: 2026,
+        quarter: 1,
+      });
+
+      const b23 = out.buckets['23']!;
+      expect(b23.baseDeductivel).toBe(50);
+      expect(b23.taxDeductivel).toBeCloseTo(11.5, 2);
+      expect(out.totalDeductivel).toBeCloseTo(11.5, 2);
+      expect(out.totalLiquidado).toBe(0);
+    });
+
     it('produces zero-filled output and writes the audit row when no documents exist', async () => {
       prisma.document.findMany.mockResolvedValue([]);
 

@@ -10,7 +10,7 @@
  */
 
 import { useDropzone } from 'react-dropzone';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   UploadCloud,
@@ -20,6 +20,8 @@ import {
   Info,
   X,
   ExternalLink,
+  Camera,
+  FolderUp,
 } from 'lucide-react';
 import { useUploadDocuments, type UploadProgressEvent } from './use-documents';
 
@@ -36,6 +38,13 @@ export function UploadZone() {
   const upload = useUploadDocuments();
   const router = useRouter();
   const [items, setItems] = useState<UploadItem[]>([]);
+  // Hidden file input for the camera-capture path. We can't reuse
+  // `getInputProps` from react-dropzone because react-dropzone
+  // intentionally strips `capture` to keep the contract neutral —
+  // we need our own input here so iOS Safari / Android Chrome will
+  // open the rear camera directly.
+  const cameraInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const onProgress = useCallback((evt: UploadProgressEvent) => {
     setItems((prev) => {
@@ -55,17 +64,43 @@ export function UploadZone() {
     });
   }, []);
 
-  const onDrop = useCallback(
-    (accepted: File[]) => {
-      if (!accepted.length) return;
-      // Seed rows immediately so the user sees something happen.
+  const startUpload = useCallback(
+    (files: File[]) => {
+      if (!files.length) return;
       setItems((prev) => [
         ...prev.filter((p) => p.status === 'uploading'),
-        ...accepted.map((f) => ({ fileName: f.name, progress: 0, status: 'uploading' as const })),
+        ...files.map((f) => ({ fileName: f.name, progress: 0, status: 'uploading' as const })),
       ]);
-      upload.mutate({ files: accepted, onProgress });
+      upload.mutate({ files, onProgress });
     },
     [upload, onProgress],
+  );
+
+  const onDrop = useCallback(
+    (accepted: File[]) => {
+      startUpload(accepted);
+    },
+    [startUpload],
+  );
+
+  const onCameraCapture = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files ? Array.from(e.target.files) : [];
+      // Reset the input so picking the same file twice fires `change`
+      // again (mobile browsers cache the FileList otherwise).
+      e.target.value = '';
+      startUpload(files);
+    },
+    [startUpload],
+  );
+
+  const onFilePicker = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files ? Array.from(e.target.files) : [];
+      e.target.value = '';
+      startUpload(files);
+    },
+    [startUpload],
   );
 
   const { getRootProps, getInputProps, isDragActive, isDragReject } = useDropzone({
@@ -127,6 +162,77 @@ export function UploadZone() {
         <p className="text-xs mt-1.5" style={{ color: 'var(--text-subtle)' }}>
           PDF, JPG, PNG, WEBP, DOCX · até 20 MB por ficheiro · multi-ficheiro
         </p>
+      </div>
+
+      {/*
+        Camera capture path. Two distinct actions:
+        - "Tirar foto" → mobile opens the rear camera (capture="environment"),
+          desktop opens the system camera picker.
+        - "Escolher ficheiro" → same file picker as the dropzone, for users
+          who want explicit control without drag-and-drop.
+
+        We render the hidden input once and click() it programmatically so
+        both buttons reuse a single DOM node — and reset its value on
+        change (see onCameraCapture) so the same file can be re-picked.
+      */}
+      <input
+        ref={cameraInputRef}
+        type="file"
+        accept="image/*"
+        // The single most important attribute for the user's complaint:
+        // on iOS Safari this opens the rear camera directly instead of
+        // the photo library. On desktop with no camera, the OS falls back
+        // to a normal file picker (image MIME filter still applies).
+        capture="environment"
+        onChange={onCameraCapture}
+        className="sr-only"
+        aria-hidden="true"
+        tabIndex={-1}
+      />
+      {/*
+        Plain file picker — NO capture attribute, so on mobile this opens
+        the photo library / Files app instead of the camera. Desktop gets
+        a normal file picker.
+      */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="application/pdf,image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        multiple
+        onChange={onFilePicker}
+        className="sr-only"
+        aria-hidden="true"
+        tabIndex={-1}
+      />
+      <div className="flex flex-wrap items-center justify-center gap-3">
+        <button
+          type="button"
+          onClick={() => cameraInputRef.current?.click()}
+          className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-colors"
+          style={{
+            background: 'linear-gradient(135deg, rgba(56,189,248,0.18), rgba(129,140,248,0.12))',
+            border: '1px solid rgba(56,189,248,0.35)',
+            color: 'var(--text)',
+          }}
+          aria-label="Tirar foto com a câmara"
+        >
+          <Camera size={16} className="text-sky-400" />
+          📷 Tirar foto
+        </button>
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-colors"
+          style={{
+            background: 'var(--hover)',
+            border: '1px solid var(--border-strong)',
+            color: 'var(--text)',
+          }}
+          aria-label="Selecionar ficheiro do dispositivo"
+        >
+          <FolderUp size={16} style={{ color: 'var(--text-subtle)' }} />
+          📁 Escolher ficheiro
+        </button>
       </div>
 
       {items.filter((i) => i.status === 'uploading').length > 0 && (
@@ -237,7 +343,7 @@ function DuplicateRow({
         <button
           type="button"
           onClick={onDismiss}
-          className="p-1 rounded-md hover:bg-white/5"
+          className="p-1 rounded-md hover:bg-[var(--hover)]"
           aria-label={`Dispensar ${item.fileName}`}
         >
           <X size={14} style={{ color: 'var(--text-subtle)' }} />
@@ -316,7 +422,7 @@ function UploadRow({ item, onDismiss }: { item: UploadItem; onDismiss?: () => vo
         <button
           type="button"
           onClick={onDismiss}
-          className="p-1 rounded-md hover:bg-white/5"
+          className="p-1 rounded-md hover:bg-[var(--hover)]"
           aria-label={`Remover ${item.fileName}`}
         >
           <X size={14} style={{ color: 'var(--text-subtle)' }} />

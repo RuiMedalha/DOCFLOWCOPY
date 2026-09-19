@@ -35,6 +35,21 @@ const nextConfig: NextConfig = {
       },
     ];
   },
+
+  async headers() {
+    return [
+      {
+        // Prevent browser/CDN caching of dynamic HTML routes
+        source: '/((?!_next/static|_next/image|favicon.ico).*)',
+        headers: [
+          {
+            key: 'Cache-Control',
+            value: 'no-cache, no-store, must-revalidate',
+          },
+        ],
+      },
+    ];
+  },
 };
 
 export default nextConfig;

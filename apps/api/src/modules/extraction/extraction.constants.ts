@@ -25,6 +25,9 @@ export interface ExtractionJob {
   documentId: string;
   /** Optional pre-parsed QR payload — avoids re-OCR when the caller already has it. */
   qrText?: string;
+  modelOverride?: string;
+  providerOverride?: string;
+  forceReextract?: boolean;
 }
 
 export interface ExtractionJobResult {

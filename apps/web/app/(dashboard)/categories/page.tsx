@@ -199,7 +199,7 @@ export default function CategoriesPage() {
                           onClick={() => setEditing(c)}
                           disabled={savingId === c.id || deletingId === c.id}
                           aria-label={`Editar ${c.name}`}
-                          className="inline-flex items-center justify-center w-7 h-7 rounded hover:bg-white/5 transition-colors"
+                          className="inline-flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--hover)] transition-colors"
                           style={{ color: 'var(--text-muted)' }}
                         >
                           <Pencil size={12} aria-hidden="true" />
@@ -209,7 +209,7 @@ export default function CategoriesPage() {
                           onClick={() => setConfirmDelete(c)}
                           disabled={deletingId === c.id}
                           aria-label={`Remover ${c.name}`}
-                          className="inline-flex items-center justify-center w-7 h-7 rounded hover:bg-white/5 transition-colors"
+                          className="inline-flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--hover)] transition-colors"
                           style={{ color: 'var(--danger)' }}
                         >
                           {deletingId === c.id ? (
@@ -278,7 +278,7 @@ function ToastStrip({ toast, onClose }: { toast: Toast; onClose: () => void }) {
         type="button"
         onClick={onClose}
         aria-label="Fechar"
-        className="ml-2 inline-flex items-center justify-center w-5 h-5 rounded hover:bg-white/5"
+        className="ml-2 inline-flex items-center justify-center w-5 h-5 rounded hover:bg-[var(--hover)]"
       >
         <X size={11} aria-hidden="true" />
       </button>

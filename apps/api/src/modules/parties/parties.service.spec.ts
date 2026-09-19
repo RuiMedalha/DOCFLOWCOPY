@@ -428,7 +428,19 @@ describe('PartiesService', () => {
   beforeEach(() => {
     prisma = buildPrismaStub();
     audit = buildAuditStub();
-    svc = new PartiesService(prisma as any, audit as any);
+    // Sprint E: PartyCategoriesService is injected for the FK validation
+    // path. Tests below don't touch the partyCategoryId branch, but the
+    // constructor still requires the third arg.
+    const partyCategories = {
+      assertCategoryInTenant: jest.fn(async (_tenantId: string, id: string) => ({
+        id,
+        slug: 'fake',
+        name: 'Fake',
+        color: null,
+        sortOrder: 100,
+      })),
+    };
+    svc = new PartiesService(prisma as any, audit as any, partyCategories as any);
   });
 
   // ──────────────────────────────────────────── CRUD: create

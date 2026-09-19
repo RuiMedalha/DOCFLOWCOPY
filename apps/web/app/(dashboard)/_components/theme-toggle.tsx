@@ -1,9 +1,14 @@
 'use client';
 
 /**
- * ThemeToggle — sun/moon button bound to next-themes.
+ * ThemeToggle — cycles between the Editorial / Contábil skin (default)
+ * and the legacy dark chrome.
  *
- * Animates the icon swap with a quick rotate/fade.
+ * The provider now keys off `data-skin`, so the only meaningful values
+ * are `'editorial'` (Blueprint Edition — cream + navy + gold) and
+ * `'dark'` (legacy chrome — kept as a fallback for users who want the
+ * old look). We expose the same sun/moon affordance: Sun = editorial,
+ * Moon = dark.
  */
 
 import { useEffect, useState } from 'react';
@@ -20,26 +25,26 @@ export function ThemeToggle({ className = '' }: { className?: string }) {
     return (
       <button
         type="button"
-        aria-label="Alternar tema"
+        aria-label="Alternar skin"
         className={`btn-ghost p-2 ${className}`}
         disabled
       >
-        <Moon size={16} />
+        <Sun size={16} />
       </button>
     );
   }
 
-  const isDark = resolvedTheme === 'dark';
+  const isEditorial = resolvedTheme === 'editorial';
   return (
     <button
       type="button"
-      onClick={() => setTheme(isDark ? 'light' : 'dark')}
+      onClick={() => setTheme(isEditorial ? 'dark' : 'editorial')}
       className={`btn-ghost p-2 ${className}`}
-      aria-label={isDark ? 'Mudar para tema claro' : 'Mudar para tema escuro'}
-      title={isDark ? 'Tema claro' : 'Tema escuro'}
+      aria-label={isEditorial ? 'Mudar para tema escuro' : 'Mudar para skin editorial'}
+      title={isEditorial ? 'Tema escuro' : 'Skin editorial'}
     >
-      <span key={isDark ? 'sun' : 'moon'} className="inline-flex animate-pop">
-        {isDark ? <Sun size={16} /> : <Moon size={16} />}
+      <span key={isEditorial ? 'editorial' : 'dark'} className="inline-flex animate-pop">
+        {isEditorial ? <Sun size={16} /> : <Moon size={16} />}
       </span>
     </button>
   );

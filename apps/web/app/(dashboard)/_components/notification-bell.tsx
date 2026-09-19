@@ -83,7 +83,7 @@ export function NotificationBell() {
                   key={n.id}
                   href={n.href ?? '/dashboard'}
                   onClick={() => setOpen(false)}
-                  className="block px-4 py-3 border-b last:border-0 transition-colors hover:bg-white/5"
+                  className="block px-4 py-3 border-b last:border-0 transition-colors hover:bg-[var(--hover)]"
                   style={{ borderColor: 'var(--border)' }}
                 >
                   <div

@@ -53,7 +53,7 @@ export function UserMenu() {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex items-center gap-2 rounded-xl p-1 transition-colors hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-sky-400/40 outline-none"
+        className="inline-flex items-center gap-2 rounded-xl p-1 transition-colors hover:bg-[var(--hover)] focus-visible:ring-2 focus-visible:ring-[var(--accent)] outline-none"
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label="Menu do utilizador"
@@ -177,7 +177,7 @@ function MenuItem({
       type="button"
       role="menuitem"
       onClick={onClick}
-      className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-left transition-colors hover:bg-white/5 focus-visible:bg-white/5 outline-none"
+      className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-left transition-colors hover:bg-[var(--hover)] focus-visible:bg-[var(--hover)] outline-none"
       style={{ color: danger ? 'var(--danger)' : 'var(--text-muted)' }}
     >
       <span className="flex-shrink-0">{icon}</span>

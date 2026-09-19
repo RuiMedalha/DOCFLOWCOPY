@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
+import { StorageModule } from '../documents/storage/storage.module';
 import { HealthController } from './health.controller';
 import { RedisPingService } from './redis-ping.service';
+import { VersionController } from '../version/version.controller';
 
 /**
  * HealthModule — public liveness + readiness probes used by load balancers,
@@ -11,7 +13,8 @@ import { RedisPingService } from './redis-ping.service';
  * don't keep a second persistent connection in the API process.
  */
 @Module({
-  controllers: [HealthController],
+  imports: [StorageModule],
+  controllers: [HealthController, VersionController],
   providers: [RedisPingService],
 })
 export class HealthModule {}

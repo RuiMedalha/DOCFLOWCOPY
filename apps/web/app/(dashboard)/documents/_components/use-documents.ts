@@ -29,8 +29,15 @@ function buildQuery(
   if (filters.search) sp.set('search', filters.search);
   if (filters.status) sp.set('status', filters.status);
   if (filters.type) sp.set('type', filters.type);
+  if (filters.excludeType) sp.set('excludeType', filters.excludeType);
+  if (filters.fiscalStatus) sp.set('fiscalStatus', filters.fiscalStatus);
   if (filters.dateFrom) sp.set('dateFrom', filters.dateFrom);
   if (filters.dateTo) sp.set('dateTo', filters.dateTo);
+  // Origin filter (Sprint F): the backend DTO accepts both CSV strings
+  // and repeated query params; CSV is the more compact URL shape.
+  if (filters.origin && filters.origin.length > 0) {
+    sp.set('origin', filters.origin.join(','));
+  }
   sp.set('page', String(page));
   // API DTO expects `limit`, not `pageSize` (forbidNonWhitelisted rejects it).
   sp.set('limit', String(pageSize));
@@ -220,6 +227,41 @@ export function useBulkUpdateDocuments() {
         throw new Error(`HTTP ${res.status}`);
       }
       return true;
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: documentKeys.all });
+    },
+  });
+}
+
+export function useReExtractAllDocuments() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const res = await authedFetch(`${API_BASE}/documents/batch/re-extract-all`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return (await res.json()) as { queuedCount: number; status: string };
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: documentKeys.all });
+    },
+  });
+}
+
+export function useReExtractBatchDocuments() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (ids: string[]) => {
+      const results = await Promise.all(
+        ids.map((id) =>
+          authedFetch(`${API_BASE}/documents/${id}/re-extract`, {
+            method: 'POST',
+          }),
+        ),
+      );
+      return results.length;
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: documentKeys.all });

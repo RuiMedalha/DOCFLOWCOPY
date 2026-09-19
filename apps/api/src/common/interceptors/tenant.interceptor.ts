@@ -32,13 +32,24 @@ export class TenantInterceptor implements NestInterceptor {
     return next.handle().pipe(
       tap(() => {
         const elapsed = Date.now() - start;
-        if (ctx?.tenantId) {
+        // The download endpoint uses @Res({ passthrough: false }) and
+        // calls res.end(buffer) itself. By the time tap() runs the
+        // response has already been flushed; setHeader / send would
+        // throw ERR_HTTP_HEADERS_SENT and the global filter would try
+        // to re-send, producing the misleading "Cannot set headers
+        // after they are sent → 500" we used to see on /download. We
+        // detect that and skip the header write + summary log when
+        // headers have already been sent.
+        const headersAlreadySent = res.headersSent || res.writableEnded;
+        if (!headersAlreadySent && ctx?.tenantId) {
           res.setHeader('x-tenant-id', ctx.tenantId);
         }
-        this.logger.log(
-          `${req.method} ${req.url} tenant=${ctx?.tenantId ?? 'public'} ` +
-            `user=${ctx?.userId ?? 'anonymous'} ${elapsed}ms`,
-        );
+        if (!headersAlreadySent) {
+          this.logger.log(
+            `${req.method} ${req.url} tenant=${ctx?.tenantId ?? 'public'} ` +
+              `user=${ctx?.userId ?? 'anonymous'} ${elapsed}ms`,
+          );
+        }
       }),
     );
   }

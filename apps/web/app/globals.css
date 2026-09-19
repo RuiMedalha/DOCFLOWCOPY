@@ -142,6 +142,137 @@
   color-scheme: light;
 }
 
+/* ================================================================
+   DocFlow — Editorial Skin (Blueprint Edition)
+   ================================================================
+   Ativado por [data-skin='editorial'] no <body> ou num wrapper.
+   Aplicado de momento apenas em /documents/[id].
+   NÃO remove nem substitui nenhum token do sistema base —
+   apenas adiciona um sistema paralelo com paleta cream + navy + gold,
+   tipografia editorial (Editorial New + Inter Tight + JetBrains Mono)
+   e geometria deliberadamente comprometida.
+   ================================================================ */
+
+:root,
+[data-skin='editorial'] {
+  /* Canvas — cream dominante (papel de escritório) */
+  --ed-canvas:    #fbf9f4;
+  --ed-canvas-2:  #f6f2e8;
+  --ed-panel:    #ffffff;
+
+  /* Ink — navy (tinta de carimbo) */
+  --ed-ink:          #14213d;
+  --ed-ink-soft:     #5c6478;
+  --ed-ink-faint:    #6b7280;            /* slate-500 — WCAG AA ≥4.5:1 sobre --ed-canvas */
+  --ed-rule:         rgba(20, 33, 61, 0.12);
+  --ed-rule-strong:  rgba(20, 33, 61, 0.28);
+
+  /* Accent — gold (selo de cartório) */
+  --ed-accent-gold:        #cba65a;
+  --ed-accent-gold-dim:    rgba(203, 166, 90, 0.16);
+  --ed-accent-gold-strong: #a8893f;
+
+  /* Status — 4 tons distintos, AA sobre cream */
+  --ed-status-ok:          #4f7942;
+  --ed-status-ok-dim:      rgba(79, 121, 66, 0.14);
+  --ed-status-warn:        #b8860b;
+  --ed-status-warn-dim:    rgba(184, 134, 11, 0.14);
+  --ed-status-alert:       #8b2e2a;
+  --ed-status-alert-dim:   rgba(139, 46, 42, 0.12);
+  --ed-status-neutral:     #5c6478;
+  --ed-status-neutral-dim: rgba(92, 100, 120, 0.10);
+
+  /* Geometry — committee editorial */
+  --ed-radius-hairline: 0;
+  --ed-radius-chip:     4px;
+  --ed-radius-card:     12px;
+  --ed-radius-pill:     999px;
+
+  /* Shadows — só flutuantes */
+  --ed-shadow-popover: 0 1px 0 var(--ed-rule), 0 8px 24px -8px rgba(20, 33, 61, 0.10);
+  --ed-shadow-hover:   0 1px 0 var(--ed-rule), 0 12px 28px -10px rgba(20, 33, 61, 0.18);
+
+  /* Motion — 2 timings apenas */
+  --ed-ease:        cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ed-motion:      240ms;
+  --ed-motion-slow: 380ms;
+
+  /* Hover overlay (substitui --hover do dark quando skin editorial) */
+  --ed-hover:       rgba(20, 33, 61, 0.04);
+  --ed-input-bg:    #ffffff;
+}
+
+/* Editorial skin — BASE TOKEN ALIASES
+   Quando a skin editorial está ativa, re-mapear os tokens base
+   (--bg, --text, --accent, --input-bg, ...) para os --ed-* correspondentes.
+   Isto faz com que TODOS os componentes que dependem dos tokens base
+   (sidebar, topbar, brand-header, login form, ...) herdem automaticamente
+   a paleta cream + navy + gold — sem mexer classe-por-classe em cada arquivo.
+   ======================================================================== */
+[data-skin='editorial'] {
+  /* Surfaces — cream / paper */
+  --bg: var(--ed-canvas);
+  --bg-elevated: var(--ed-panel);
+  --bg-card: var(--ed-canvas-2);
+  --bg-card-solid: var(--ed-panel);
+  --sidebar: var(--ed-canvas-2);
+
+  /* Borders — navy hairlines */
+  --border: var(--ed-rule);
+  --border-strong: var(--ed-rule-strong);
+
+  /* Text — navy ink */
+  --text: var(--ed-ink);
+  --text-muted: var(--ed-ink-soft);
+  --text-subtle: var(--ed-ink-faint);
+
+  /* Brand — gold (substitui cyan/violet do dark) */
+  --accent: var(--ed-accent-gold-strong);
+  --accent-2: var(--ed-accent-gold);
+  --accent-3: var(--ed-accent-gold);
+
+  /* Inputs / hover — light, paper-feel */
+  --input-bg: var(--ed-input-bg);
+  --hover: var(--ed-hover);
+
+  /* Brand gradient — gold editorial */
+  --brand-gradient: linear-gradient(135deg, var(--ed-accent-gold) 0%, var(--ed-accent-gold-strong) 100%);
+  --brand-gradient-soft: linear-gradient(135deg, var(--ed-accent-gold-dim) 0%, rgba(203, 166, 90, 0.10) 100%);
+
+  /* Mesh — tons dourados suaves (em vez de cyan/violet) */
+  --mesh-1: rgba(203, 166, 90, 0.14);
+  --mesh-2: rgba(20, 33, 61, 0.08);
+  --mesh-3: rgba(184, 134, 11, 0.06);
+  --grid: rgba(20, 33, 61, 0.04);
+
+  /* Shadows — usar editorial */
+  --shadow-xs: 0 1px 0 var(--ed-rule);
+  --shadow-sm: var(--ed-shadow-popover);
+  --shadow-md: var(--ed-shadow-popover);
+  --shadow-lg: var(--ed-shadow-popover);
+  --shadow-xl: var(--ed-shadow-hover);
+
+  color-scheme: light;
+}
+
+/* Editorial skin — body override
+   Sobrescreve o `body { background: var(--bg); color: var(--text); }` base
+   (que resolve para slate-950 no dark mode) e força a paleta cream + navy.
+   Seletor + !important garante vitória sobre a regra genérica do body,
+   mesmo quando [data-theme='dark'] está em :root.
+   ================================================================ */
+[data-skin='editorial'] body {
+  background: var(--ed-canvas) !important;
+  color: var(--ed-ink) !important;
+  font-family: var(--font-inter-tight), system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif !important;
+}
+
+[data-skin='editorial'] html {
+  background: var(--ed-canvas);
+  color: var(--ed-ink);
+  font-family: var(--font-inter-tight), system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
 * { box-sizing: border-box; }
 
 html, body {
@@ -181,6 +312,247 @@ body {
 .bg-noise {
   /* Tiny noise overlay for premium feel — pure SVG embedded as data URI */
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.05 0'/></filter><rect width='120' height='120' filter='url(%23n)'/></svg>");
+}
+
+/* ================================================================
+   Editorial skin — COMPONENT OVERRIDES
+   Quando [data-skin='editorial'] está ativo, sobrescrever as classes
+   component-level (.input, .btn-*, .glass-card, ...) para usar a
+   paleta cream + navy + gold. Os tokens base já estão re-mapeados
+   acima, mas algumas classes têm valores literais (ex: .btn-primary
+   usa #020617 literal para color) que precisam de override.
+
+   IMPORTANTE: estes seletores são achatados (não aninhados) porque
+   o PostCSS do projeto não tem o plugin tailwindcss/nesting.
+   ======================================================================== */
+
+/* Inputs — paper-feel: fundo branco, texto navy, borda hairline navy */
+[data-skin='editorial'] .input {
+  background: var(--ed-input-bg) !important;
+  color: var(--ed-ink) !important;
+  border-color: var(--ed-rule-strong) !important;
+  border-radius: var(--ed-radius-chip) !important;
+}
+[data-skin='editorial'] .input::placeholder { color: var(--ed-ink-faint) !important; }
+[data-skin='editorial'] .input:hover { border-color: var(--ed-ink-soft) !important; }
+[data-skin='editorial'] .input:focus {
+  background: var(--ed-input-bg) !important;
+  border-color: var(--ed-accent-gold-strong) !important;
+  box-shadow: 0 0 0 3px var(--ed-accent-gold-dim) !important;
+}
+[data-skin='editorial'] .input[aria-invalid='true'] {
+  border-color: var(--ed-status-alert) !important;
+  box-shadow: 0 0 0 3px var(--ed-status-alert-dim) !important;
+}
+
+/* Botões — gold editorial */
+[data-skin='editorial'] .btn-primary {
+  color: #ffffff !important;
+  background: linear-gradient(135deg, var(--ed-accent-gold) 0%, var(--ed-accent-gold-strong) 100%) !important;
+  border-radius: var(--ed-radius-chip) !important;
+  box-shadow: 0 6px 24px -8px rgba(168, 137, 63, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.20) !important;
+}
+[data-skin='editorial'] .btn-primary:hover {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 14px 36px -8px rgba(168, 137, 63, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.25) !important;
+}
+[data-skin='editorial'] .btn-primary:active {
+  transform: translateY(0) !important;
+  box-shadow: 0 4px 14px -4px rgba(168, 137, 63, 0.55) !important;
+}
+[data-skin='editorial'] .btn-primary:focus-visible {
+  box-shadow: 0 0 0 3px var(--ed-accent-gold-dim), 0 6px 24px -8px rgba(168, 137, 63, 0.45) !important;
+}
+
+[data-skin='editorial'] .btn-secondary {
+  color: var(--ed-ink) !important;
+  background: var(--ed-panel) !important;
+  border: 1px solid var(--ed-rule-strong) !important;
+  border-radius: var(--ed-radius-chip) !important;
+}
+[data-skin='editorial'] .btn-secondary:hover {
+  background: var(--ed-hover) !important;
+  border-color: var(--ed-accent-gold-strong) !important;
+}
+[data-skin='editorial'] .btn-secondary:focus-visible {
+  box-shadow: 0 0 0 3px var(--ed-accent-gold-dim) !important;
+}
+
+/* Inline dialog input — editorial underline field, matches FieldPanel's EdInput */
+[data-skin='editorial'] .ed-dialog-input {
+  width: 100%;
+  background: transparent;
+  color: var(--ed-ink);
+  font-family: var(--font-inter-tight), system-ui, sans-serif;
+  font-size: 14px;
+  border: none;
+  border-bottom: 1px solid var(--ed-rule);
+  padding: 8px 4px;
+  outline: none;
+  transition: border-color 120ms ease;
+}
+[data-skin='editorial'] .ed-dialog-input:focus {
+  border-bottom: 2px solid var(--ed-accent-gold);
+}
+[data-skin='editorial'] .ed-dialog-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+[data-skin='editorial'] .btn-ghost {
+  color: var(--ed-ink-soft) !important;
+}
+[data-skin='editorial'] .btn-ghost:hover {
+  color: var(--ed-ink) !important;
+  background: var(--ed-hover) !important;
+}
+[data-skin='editorial'] .btn-ghost:focus-visible {
+  box-shadow: 0 0 0 3px var(--ed-accent-gold-dim) !important;
+}
+
+[data-skin='editorial'] .btn-danger {
+  background: var(--ed-status-alert-dim) !important;
+  color: var(--ed-status-alert) !important;
+  border: 1px solid rgba(139, 46, 42, 0.28) !important;
+}
+[data-skin='editorial'] .btn-danger:hover {
+  background: rgba(139, 46, 42, 0.18) !important;
+}
+
+/* Cards / glass — paper-feel (cream + hairline navy) */
+[data-skin='editorial'] .card,
+[data-skin='editorial'] .card-solid {
+  background: var(--ed-panel) !important;
+  border-color: var(--ed-rule) !important;
+  border-radius: var(--ed-radius-card) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: var(--ed-shadow-popover) !important;
+}
+[data-skin='editorial'] .glass-card {
+  background: var(--ed-panel) !important;
+  border-color: var(--ed-rule) !important;
+  border-radius: var(--ed-radius-card) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: var(--ed-shadow-popover) !important;
+}
+[data-skin='editorial'] .glass {
+  background: var(--ed-canvas-2) !important;
+  border-color: var(--ed-rule) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+[data-skin='editorial'] .card-hover:hover {
+  border-color: var(--ed-accent-gold-strong) !important;
+  box-shadow: var(--ed-shadow-hover) !important;
+}
+
+/* Navegação */
+[data-skin='editorial'] .nav-item {
+  border-radius: var(--ed-radius-chip) !important;
+}
+[data-skin='editorial'] .nav-item-active {
+  color: var(--ed-ink) !important;
+  background: var(--ed-accent-gold-dim) !important;
+  border: 1px solid var(--ed-accent-gold-strong) !important;
+  box-shadow: none !important;
+}
+[data-skin='editorial'] .nav-item-idle {
+  color: var(--ed-ink-soft) !important;
+}
+[data-skin='editorial'] .nav-item-idle:hover {
+  color: var(--ed-ink) !important;
+  background: var(--ed-hover) !important;
+}
+
+/* Tipografia */
+[data-skin='editorial'] .label {
+  color: var(--ed-ink-soft) !important;
+}
+[data-skin='editorial'] .field-help {
+  color: var(--ed-ink-faint) !important;
+}
+[data-skin='editorial'] .field-error {
+  color: var(--ed-status-alert) !important;
+}
+[data-skin='editorial'] .page-title {
+  color: var(--ed-ink) !important;
+}
+[data-skin='editorial'] .page-subtitle {
+  color: var(--ed-ink-soft) !important;
+}
+[data-skin='editorial'] .stat-value {
+  color: var(--ed-ink) !important;
+}
+
+/* Badges */
+[data-skin='editorial'] .badge-neutral {
+  background: var(--ed-hover) !important;
+  color: var(--ed-ink-soft) !important;
+  border-color: var(--ed-rule) !important;
+}
+[data-skin='editorial'] .badge-sky {
+  background: var(--ed-accent-gold-dim) !important;
+  color: var(--ed-accent-gold-strong) !important;
+  border-color: var(--ed-accent-gold-strong) !important;
+}
+[data-skin='editorial'] .badge-emerald {
+  background: var(--ed-status-ok-dim) !important;
+  color: var(--ed-status-ok) !important;
+  border-color: var(--ed-status-ok) !important;
+}
+[data-skin='editorial'] .badge-amber {
+  background: var(--ed-status-warn-dim) !important;
+  color: var(--ed-status-warn) !important;
+  border-color: var(--ed-status-warn) !important;
+}
+[data-skin='editorial'] .badge-violet {
+  background: var(--ed-accent-gold-dim) !important;
+  color: var(--ed-accent-gold-strong) !important;
+  border-color: var(--ed-accent-gold-strong) !important;
+}
+[data-skin='editorial'] .badge-rose {
+  background: var(--ed-status-alert-dim) !important;
+  color: var(--ed-status-alert) !important;
+  border-color: var(--ed-status-alert) !important;
+}
+
+/* Brand mark — gold editorial */
+[data-skin='editorial'] .brand-mark {
+  background: linear-gradient(135deg, var(--ed-accent-gold) 0%, var(--ed-accent-gold-strong) 100%) !important;
+  box-shadow: 0 6px 18px -4px rgba(168, 137, 63, 0.40), inset 0 1px 0 rgba(255, 255, 255, 0.25) !important;
+}
+
+/* Kbd */
+[data-skin='editorial'] .kbd {
+  background: var(--ed-canvas-2) !important;
+  border-color: var(--ed-rule-strong) !important;
+  color: var(--ed-ink-soft) !important;
+}
+
+/* Divider or */
+[data-skin='editorial'] .divider-or {
+  color: var(--ed-ink-faint) !important;
+}
+[data-skin='editorial'] .divider-or::before,
+[data-skin='editorial'] .divider-or::after {
+  background: var(--ed-rule) !important;
+}
+
+/* Skip link */
+[data-skin='editorial'] .skip-link {
+  background: var(--ed-panel) !important;
+  color: var(--ed-ink) !important;
+  border-color: var(--ed-accent-gold-strong) !important;
+}
+
+/* Scrollbars — discreet cream */
+[data-skin='editorial'] ::-webkit-scrollbar-thumb {
+  background: var(--ed-rule-strong) !important;
+}
+[data-skin='editorial'] ::-webkit-scrollbar-thumb:hover {
+  background: var(--ed-ink-faint) !important;
 }
 
 /* ================================================================
@@ -503,6 +875,25 @@ body {
 @keyframes orbDrift {
   0%, 100% { transform: translate(0, 0); }
   50% { transform: translate(40px, -20px); }
+}
+
+/* Editorial skin keyframes — APENAS 2 */
+@keyframes edFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes edPulseGold {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(203, 166, 90, 0.35); }
+  50%      { box-shadow: 0 0 0 8px rgba(203, 166, 90, 0); }
+}
+
+.animate-ed-fade {
+  animation: edFadeIn var(--ed-motion) var(--ed-ease) both;
+}
+
+.animate-ed-pulse-gold {
+  animation: edPulseGold 2.4s var(--ed-ease) infinite;
 }
 
 .animate-in {

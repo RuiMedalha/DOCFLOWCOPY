@@ -12,29 +12,56 @@ import { Search, X, CalendarDays } from 'lucide-react';
 import {
   DOCUMENT_STATUS_LABEL,
   DOCUMENT_TYPE_LABEL,
+  FISCAL_STATUS_LABEL,
   type DocumentFiltersState,
   type DocumentStatus,
   type DocumentType,
+  type FiscalStatus,
 } from './types';
+
+const STATUS_VALUES: DocumentStatus[] = [
+  'NOVO',
+  'PROCESSADO',
+  'EM_REVISAO',
+  'PENDING_APPROVAL',
+  'APROVADO',
+  'REJEITADO',
+  'DUPLICADO',
+  'ARQUIVADO',
+];
 
 const STATUS_OPTIONS: Array<{ value: '' | DocumentStatus; label: string }> = [
   { value: '', label: 'Todos os estados' },
-  { value: 'novo', label: DOCUMENT_STATUS_LABEL.novo },
-  { value: 'processado', label: DOCUMENT_STATUS_LABEL.processado },
-  { value: 'em_revisao', label: DOCUMENT_STATUS_LABEL.em_revisao },
-  { value: 'conciliado', label: DOCUMENT_STATUS_LABEL.conciliado },
-  { value: 'arquivado', label: DOCUMENT_STATUS_LABEL.arquivado },
-  { value: 'erro', label: DOCUMENT_STATUS_LABEL.erro },
+  ...STATUS_VALUES.map((v) => ({ value: v, label: DOCUMENT_STATUS_LABEL[v] })),
+];
+
+const TYPE_VALUES: DocumentType[] = [
+  'FATURA_RECEBIDA',
+  'FATURA_SIMPLIFICADA',
+  'RECIBO',
+  'NOTA_CREDITO',
+  'NOTA_DEBITO',
+  'PROFORMA',
+  'ORCAMENTO',
+  'ENCOMENDA',
+  'AVISO_PAGAMENTO',
+  'EXTRATO_FORNECEDOR',
+  'GUIA_TRANSPORTE',
+  'OUTRO',
 ];
 
 const TYPE_OPTIONS: Array<{ value: '' | DocumentType; label: string }> = [
   { value: '', label: 'Todos os tipos' },
-  { value: 'fatura', label: DOCUMENT_TYPE_LABEL.fatura },
-  { value: 'recibo', label: DOCUMENT_TYPE_LABEL.recibo },
-  { value: 'nota_credito', label: DOCUMENT_TYPE_LABEL.nota_credito },
-  { value: 'nota_debito', label: DOCUMENT_TYPE_LABEL.nota_debito },
-  { value: 'guia_transporte', label: DOCUMENT_TYPE_LABEL.guia_transporte },
-  { value: 'outro', label: DOCUMENT_TYPE_LABEL.outro },
+  ...TYPE_VALUES.map((v) => ({ value: v, label: DOCUMENT_TYPE_LABEL[v] })),
+];
+
+/** Fase 4.1 — filtrar por validade fiscal determinística. */
+const FISCAL_OPTIONS: Array<{ value: '' | FiscalStatus; label: string }> = [
+  { value: '', label: 'Toda a validade fiscal' },
+  { value: 'FISCAL', label: FISCAL_STATUS_LABEL.FISCAL },
+  { value: 'NAO_FISCAL', label: FISCAL_STATUS_LABEL.NAO_FISCAL },
+  { value: 'INDETERMINADO', label: FISCAL_STATUS_LABEL.INDETERMINADO },
+  { value: 'NAO_APLICAVEL', label: FISCAL_STATUS_LABEL.NAO_APLICAVEL },
 ];
 
 export function DocumentFilters({
@@ -50,11 +77,12 @@ export function DocumentFilters({
     Boolean(value.search) ||
     Boolean(value.status) ||
     Boolean(value.type) ||
+    Boolean(value.fiscalStatus) ||
     Boolean(value.dateFrom) ||
     Boolean(value.dateTo);
 
   const reset = () =>
-    onChange({ search: '', status: '', type: '', dateFrom: '', dateTo: '' });
+    onChange({ search: '', status: '', type: '', fiscalStatus: '', dateFrom: '', dateTo: '' });
 
   return (
     <div className="card p-4 animate-in animate-delay-1 space-y-3">
@@ -99,6 +127,25 @@ export function DocumentFilters({
           aria-label="Filtrar por tipo"
         >
           {TYPE_OPTIONS.map((o) => (
+            <option key={o.value || 'all'} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+
+        {/* Fase 4.1 — validade fiscal determinística */}
+        <select
+          className="input md:w-48"
+          value={value.fiscalStatus}
+          onChange={(e) =>
+            onChange({
+              ...value,
+              fiscalStatus: e.target.value as DocumentFiltersState['fiscalStatus'],
+            })
+          }
+          aria-label="Filtrar por validade fiscal"
+        >
+          {FISCAL_OPTIONS.map((o) => (
             <option key={o.value || 'all'} value={o.value}>
               {o.label}
             </option>

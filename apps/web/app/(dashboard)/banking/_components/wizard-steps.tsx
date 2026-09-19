@@ -20,20 +20,20 @@ export function WizardSteps({ current }: { current: WizardStep }) {
                 idx < WIZARD_STEPS.length - 1 ? 'after:content-[""] after:w-full after:h-0.5 after:mx-2' : ''
               } ${
                 isDone
-                  ? 'after:bg-emerald-500 text-emerald-500'
+                  ? 'after:bg-[var(--ed-status-ok)] text-[var(--ed-status-ok)]'
                   : isCurrent
-                  ? 'after:bg-slate-300 dark:after:bg-slate-700 text-sky-500'
-                  : 'after:bg-slate-200 dark:after:bg-slate-800 text-slate-400'
+                  ? 'after:bg-[var(--accent)] text-[var(--accent)]'
+                  : 'after:bg-[var(--ed-rule-strong)] text-[var(--ed-ink-faint)]'
               }`}
             >
               <div className="flex flex-col items-center gap-1.5 flex-shrink-0">
                 <span
                   className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold transition-all ${
                     isDone
-                      ? 'bg-emerald-500 text-white shadow-sm'
+                      ? 'bg-[var(--ed-status-ok)] text-white shadow-sm'
                       : isCurrent
-                      ? 'border-2 border-sky-500 text-sky-500 bg-sky-500/10'
-                      : 'border border-slate-300 dark:border-slate-700 text-slate-400'
+                      ? 'border-2 border-[var(--accent)] text-[var(--accent)] bg-[var(--ed-accent-gold-dim)]'
+                      : 'border border-[var(--ed-rule-strong)] text-[var(--ed-ink-faint)]'
                   }`}
                 >
                   {isDone ? <Check size={14} /> : idx + 1}

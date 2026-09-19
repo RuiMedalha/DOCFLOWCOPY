@@ -120,3 +120,120 @@ export function PartyIbanPanel({ partyId }: { partyId: string }) {
     </div>
   );
 }
+
+function formatWebsiteUrl(raw?: string | null): string | null {
+  if (!raw || !raw.trim()) return null;
+  const trimmed = raw.trim();
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  return `https://${trimmed}`;
+}
+
+export function PartyDetailCard({
+  party,
+}: {
+  party: any;
+}) {
+  if (!party) return null;
+
+  const websiteUrl = formatWebsiteUrl(party.website);
+  const formattedAddress = [party.address, party.postalCode, party.city, party.country]
+    .filter(Boolean)
+    .join(' · ');
+
+  return (
+    <div className="card p-5 mb-4 space-y-4" data-testid="party-detail-card">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-3" style={{ borderColor: 'var(--border)' }}>
+        <div>
+          <h3 className="text-base font-semibold" style={{ color: 'var(--text)' }}>
+            {party.name}
+          </h3>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            {party.type} {party.nif ? `· NIF: ${party.nif}` : '· Sem NIF'}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {party.ibanVerified && (
+            <span className="badge-emerald inline-flex items-center gap-1 text-xs">
+              <ShieldCheck size={13} /> NIB Verificado
+            </span>
+          )}
+          {party.vatRegime && (
+            <span className="badge-sky text-xs">
+              {party.vatRegime === 'PT' ? 'IVA Normal (PT)' : 'Autoliquidação UE'}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-3 text-xs">
+        {websiteUrl ? (
+          <div>
+            <span className="block text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>Página Web:</span>
+            <a
+              href={websiteUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sky-600 hover:underline inline-flex items-center gap-1 font-medium mt-0.5"
+            >
+              {party.website} ↗
+            </a>
+          </div>
+        ) : null}
+
+        {party.email ? (
+          <div>
+            <span className="block text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>Email Geral:</span>
+            <a href={`mailto:${party.email}`} className="text-sky-600 hover:underline font-medium mt-0.5 block">
+              {party.email}
+            </a>
+          </div>
+        ) : null}
+
+        {party.billingEmail ? (
+          <div>
+            <span className="block text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>Email de Faturação:</span>
+            <a href={`mailto:${party.billingEmail}`} className="text-sky-600 hover:underline font-medium mt-0.5 block">
+              {party.billingEmail}
+            </a>
+          </div>
+        ) : null}
+
+        {party.phone ? (
+          <div>
+            <span className="block text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>Telefone:</span>
+            <a href={`tel:${party.phone.replace(/\s+/g, '')}`} className="text-sky-600 hover:underline font-medium mt-0.5 block">
+              {party.phone}
+            </a>
+          </div>
+        ) : null}
+
+        {party.mobile ? (
+          <div>
+            <span className="block text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>Telemóvel:</span>
+            <a href={`tel:${party.mobile.replace(/\s+/g, '')}`} className="text-sky-600 hover:underline font-medium mt-0.5 block">
+              {party.mobile}
+            </a>
+          </div>
+        ) : null}
+
+        {party.iban ? (
+          <div>
+            <span className="block text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>NIB / IBAN:</span>
+            <span className="font-mono mt-0.5 block" style={{ color: 'var(--text)' }}>
+              {party.iban}
+            </span>
+          </div>
+        ) : null}
+      </div>
+
+      {formattedAddress ? (
+        <div className="pt-2 border-t text-xs" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+          <span className="font-medium" style={{ color: 'var(--text)' }}>Morada: </span>
+          {formattedAddress}
+        </div>
+      ) : null}
+    </div>
+  );
+}

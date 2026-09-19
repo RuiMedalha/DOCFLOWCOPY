@@ -3,19 +3,21 @@
 /**
  * DocumentViewer — PDF / image preview pane for DocFlow documents.
  *
- * Renders the document binary fetched from the API. The preview is read
- * through the auth-aware API client (Bearer token attached automatically)
- * and turned into a blob URL on the client; the URL is revoked when the
- * component unmounts to avoid leaking references.
+ * Editorial / Contábil · Blueprint Edition (commit 2026-09-04).
+ *   - Frame navy 1px + gold inset top border (documento "dentro de uma capa
+ *     editorial").
+ *   - Toolbar: filename em Inter Tight 14px ink + badge em Fraunces 11px
+ *     uppercase.
+ *   - Body background em --ed-panel (paper-white) em vez de rgba(0,0,0,0.18).
  *
  * Three render modes:
  *   - application/pdf → <object>/<iframe> embed with the blob URL
  *   - image/*         → <img> with the blob URL
  *   - other           → fallback panel + download CTA
  *
- * Renders a skeleton while loading and an error card when the file can't
- * be fetched. Field highlights from the QR-AT decoder are mirrored as
- * badge overlays when present (PDF mode only).
+ * Renders a skeleton while loading and an error card when the file can't be
+ * fetched. Field highlights from the QR-AT decoder are mirrored as badge
+ * overlays when present (PDF mode only).
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -94,29 +96,72 @@ export function DocumentViewer({ src, fileName = 'documento', mimeType, highligh
 
   return (
     <div
-      className="card overflow-hidden flex flex-col h-full min-h-[420px]"
-      style={{ background: 'var(--bg-card)' }}
+      className="flex flex-col overflow-hidden"
+      style={{
+        // Frame navy 1px + gold inset top border — "documento dentro de uma
+        // capa editorial". O inset shadow desenha uma hairline gold no topo
+        // sem precisar de :before pseudo-element.
+        // Aspect ratio portrait (3/4) garante letterbox em vez de caixa
+        // quadrada — antes era `min-h-[420px]` que esticava o viewer pra
+        // ficar alto e narrow na coluna 4/12.
+        aspectRatio: '3 / 4',
+        maxWidth: '100%',
+        background: 'var(--ed-panel)',
+        border: '1px solid var(--ed-ink)',
+        borderRadius: 'var(--ed-radius-card)',
+        boxShadow: 'inset 0 1px 0 var(--ed-accent-gold)',
+      }}
     >
-      {/* Toolbar */}
+      {/* Toolbar — altura fixa (não esticar) */}
       <header
-        className="flex items-center gap-2 px-4 py-2.5 border-b border-border"
-        style={{ background: 'var(--bg-elevated)' }}
+        className="flex items-center gap-2 px-4 py-3 border-b flex-shrink-0"
+        style={{
+          height: '52px',
+          background: 'var(--ed-canvas-2)',
+          borderColor: 'var(--ed-rule)',
+        }}
       >
-        <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg" style={{ background: 'var(--hover)' }}>
+        <span
+          className="inline-flex items-center justify-center w-7 h-7"
+          style={{
+            background: 'var(--ed-canvas)',
+            borderRadius: 'var(--ed-radius-chip)',
+          }}
+        >
           {icon === 'pdf' ? (
-            <FileText size={14} aria-hidden="true" style={{ color: 'var(--accent)' }} />
+            <FileText size={14} aria-hidden="true" style={{ color: 'var(--ed-accent-gold-strong)' }} />
           ) : icon === 'image' ? (
-            <ImageIcon size={14} aria-hidden="true" style={{ color: 'var(--accent)' }} />
+            <ImageIcon size={14} aria-hidden="true" style={{ color: 'var(--ed-accent-gold-strong)' }} />
           ) : (
-            <FileText size={14} aria-hidden="true" style={{ color: 'var(--text-muted)' }} />
+            <FileText size={14} aria-hidden="true" style={{ color: 'var(--ed-ink-faint)' }} />
           )}
         </span>
-        <span className="text-sm font-medium truncate flex-1" style={{ color: 'var(--text)' }} title={fileName}>
+        <span
+          className="truncate flex-1"
+          style={{
+            fontFamily: 'var(--font-inter-tight), system-ui, sans-serif',
+            fontSize: '14px',
+            fontWeight: 500,
+            color: 'var(--ed-ink)',
+          }}
+          title={fileName}
+        >
           {fileName}
         </span>
         {highlightFields.length > 0 && (
-          <span className="badge-violet text-[10px]" title="Campos QR-AT detetados">
-            {highlightFields.length} campo{highlightFields.length === 1 ? '' : 's'} destacado{highlightFields.length === 1 ? '' : 's'}
+          <span
+            className="uppercase tracking-wider"
+            style={{
+              fontFamily: 'var(--font-editorial), ui-serif, Georgia, serif',
+              fontSize: '11px',
+              color: 'var(--ed-accent-gold-strong)',
+              background: 'var(--ed-accent-gold-dim)',
+              padding: '2px 8px',
+              borderRadius: 'var(--ed-radius-chip)',
+            }}
+            title="Campos QR-AT detetados"
+          >
+            {highlightFields.length} campo{highlightFields.length === 1 ? '' : 's'} QR-AT
           </span>
         )}
         {blobUrl && (
@@ -125,22 +170,40 @@ export function DocumentViewer({ src, fileName = 'documento', mimeType, highligh
               href={blobUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="btn-ghost text-xs px-2.5 py-1.5"
+              className="inline-flex items-center justify-center w-7 h-7 hover:opacity-70 transition-opacity"
+              style={{
+                color: 'var(--ed-ink-soft)',
+                background: 'transparent',
+                borderRadius: 'var(--ed-radius-chip)',
+              }}
               title="Abrir numa nova janela"
             >
               <ExternalLink size={12} aria-hidden="true" />
             </a>
-            <a href={blobUrl} download={fileName} className="btn-ghost text-xs px-2.5 py-1.5" title="Transferir">
+            <a
+              href={blobUrl}
+              download={fileName}
+              className="inline-flex items-center justify-center w-7 h-7 hover:opacity-70 transition-opacity"
+              style={{
+                color: 'var(--ed-ink-soft)',
+                background: 'transparent',
+                borderRadius: 'var(--ed-radius-chip)',
+              }}
+              title="Transferir"
+            >
               <Download size={12} aria-hidden="true" />
             </a>
           </>
         )}
       </header>
 
-      {/* Body */}
-      <div className="flex-1 min-h-0 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.18)' }}>
+      {/* Body — fundo --ed-panel (paper-white) em vez de rgba(0,0,0,0.18) */}
+      <div
+        className="flex-1 min-h-0 flex items-center justify-center overflow-hidden"
+        style={{ background: 'var(--ed-panel)' }}
+      >
         {state === 'loading' && (
-          <div className="flex flex-col items-center gap-2 text-sm" style={{ color: 'var(--text-muted)' }}>
+          <div className="flex flex-col items-center gap-2 text-sm" style={{ color: 'var(--ed-ink-soft)' }}>
             <Loader2 size={22} className="animate-spin" aria-hidden="true" />
             A carregar documento…
           </div>
@@ -148,11 +211,11 @@ export function DocumentViewer({ src, fileName = 'documento', mimeType, highligh
 
         {state === 'error' && (
           <div className="text-center max-w-xs px-6">
-            <FileText size={28} className="mx-auto mb-2" aria-hidden="true" style={{ color: 'var(--danger)' }} />
-            <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+            <FileText size={28} className="mx-auto mb-2" aria-hidden="true" style={{ color: 'var(--ed-status-alert)' }} />
+            <p className="text-sm font-medium" style={{ color: 'var(--ed-ink)' }}>
               Não foi possível carregar o documento
             </p>
-            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+            <p className="text-xs mt-1" style={{ color: 'var(--ed-ink-soft)' }}>
               {error ?? 'Erro desconhecido'}
             </p>
           </div>
@@ -163,7 +226,7 @@ export function DocumentViewer({ src, fileName = 'documento', mimeType, highligh
         )}
 
         {state === 'idle' && (
-          <div className="flex flex-col items-center gap-2 text-sm" style={{ color: 'var(--text-muted)' }}>
+          <div className="flex flex-col items-center gap-2 text-sm" style={{ color: 'var(--ed-ink-faint)' }}>
             <FileText size={22} aria-hidden="true" />
             Sem documento
           </div>
@@ -179,8 +242,8 @@ function PdfOrImage({ blobUrl, mime }: { blobUrl: string; mime?: string }) {
       <iframe
         src={blobUrl}
         title="Pré-visualização do documento PDF"
-        className="w-full h-full min-h-[420px]"
-        style={{ border: 'none' }}
+        className="w-full h-full"
+        style={{ border: 'none', minHeight: 0 }}
       />
     );
   }
@@ -196,11 +259,11 @@ function PdfOrImage({ blobUrl, mime }: { blobUrl: string; mime?: string }) {
   }
   return (
     <div className="text-center px-6">
-      <FileText size={28} className="mx-auto mb-2" aria-hidden="true" style={{ color: 'var(--text-muted)' }} />
-      <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+      <FileText size={28} className="mx-auto mb-2" aria-hidden="true" style={{ color: 'var(--ed-ink-faint)' }} />
+      <p className="text-sm font-medium" style={{ color: 'var(--ed-ink)' }}>
         Tipo de ficheiro sem pré-visualização
       </p>
-      <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+      <p className="text-xs mt-1" style={{ color: 'var(--ed-ink-soft)' }}>
         Transfira o ficheiro para o abrir na aplicação nativa.
       </p>
     </div>

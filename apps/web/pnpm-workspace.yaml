@@ -1,0 +1,6 @@
+# pnpm >= 10 reads overrides here (package.json "pnpm" field is ignored).
+# Keep in sync with the Dockerfile pnpm version (corepack prepare pnpm@11.10.0).
+overrides:
+  postcss: '>=8.5.18'
+  sharp: '>=0.35.4'
+  serialize-javascript: '>=7.0.3'

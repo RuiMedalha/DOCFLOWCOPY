@@ -88,8 +88,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
       ({ status, message, errorName } = mapPrismaError(exception));
     } else if (exception instanceof Prisma.PrismaClientValidationError) {
       status = HttpStatus.BAD_REQUEST;
-      message = 'Invalid query parameters';
+      message = exception.message.replace(/\n+/g, ' ').trim();
       errorName = 'PrismaValidationError';
+      this.logger.error(`PrismaClientValidationError on ${req.method} ${req.url}: ${message}`);
     } else if (exception instanceof Error) {
       message = exception.message;
       errorName = exception.name;
@@ -114,6 +115,20 @@ export class AllExceptionsFilter implements ExceptionFilter {
       this.logger.warn(
         `${req.method} ${req.url} → ${status} ${errorName}: ${JSON.stringify(message)}`,
       );
+    }
+
+    // The download endpoint (and any other passthrough:false handler) may
+    // have already flushed the response. Trying to write a JSON envelope
+    // here would throw ERR_HTTP_HEADERS_SENT and cascade into a second
+    // 500. End the socket instead so the client gets the bytes that
+    // already went out and nothing more.
+    if (res.headersSent || res.writableEnded) {
+      try {
+        res.end();
+      } catch {
+        // socket already closed — nothing we can do.
+      }
+      return;
     }
 
     res.status(status).json(payload);

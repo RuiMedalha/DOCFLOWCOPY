@@ -25,9 +25,21 @@ async function bootstrap(): Promise<void> {
   // Honor X-Forwarded-For from the LB / reverse proxy so that
   // IP-keyed rate limits (e.g. /auth/login) bucket by real client IP,
   // not by the proxy's IP. Required when running behind Coolify /
-  // nginx / Cloudflare.
+  // Traefik / nginx / Cloudflare.
+  // When running behind Docker reverse proxy, trust proxy must be true (or 1)
+  // so Express reads X-Forwarded-For rather than the internal Docker bridge IP.
   const expressApp = app.getHttpAdapter().getInstance();
-  expressApp.set('trust proxy', process.env.TRUST_PROXY ?? 'loopback');
+  const trustProxyEnv = process.env.TRUST_PROXY;
+  if (trustProxyEnv === 'true' || trustProxyEnv === '1') {
+    expressApp.set('trust proxy', true);
+  } else if (trustProxyEnv === 'false' || trustProxyEnv === '0') {
+    expressApp.set('trust proxy', false);
+  } else if (trustProxyEnv) {
+    expressApp.set('trust proxy', trustProxyEnv);
+  } else {
+    // Default to true in production/behind reverse proxies (Coolify/Traefik)
+    expressApp.set('trust proxy', true);
+  }
 
   const logger = new Logger('Bootstrap');
 

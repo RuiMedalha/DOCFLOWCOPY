@@ -21,6 +21,13 @@ export interface ExpenseCategory {
   id: string;
   name: string;
   slug: string;
+  /** Fase 4.1 — eixo contabilístico (mercadorias / FSE / despesa / imobilizado). */
+  nature?:
+    | 'MERCADORIAS_REVENDA'
+    | 'MATERIAS_PRIMAS_SUBSIDIARIAS'
+    | 'SERVICOS_EXTERNOS'
+    | 'DESPESA_OPERACIONAL'
+    | 'IMOBILIZADO';
   color?: string | null;
   defaultIvaDeductibilityPct?: number | null;
   notes?: string | null;

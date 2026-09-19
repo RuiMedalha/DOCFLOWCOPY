@@ -1,0 +1,199 @@
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
+import { createHash } from 'crypto';
+import { Queue, Worker, type ConnectionOptions } from 'bullmq';
+import IORedis from 'ioredis';
+import type { QueueAdapter, QueueHandler } from './queue-adapter.interface';
+
+/**
+ * Queue name shared by the producer and the worker this adapter
+ * boots. Single channel for all pipeline stages — stages are
+ * distinguished by `job.name` (the BullMQ term for the topic).
+ */
+export const DOCUMENT_PROCESSING_QUEUE = 'document-processing' as const;
+
+const DEFAULT_JOB_OPTIONS = {
+  attempts: 3,
+  backoff: { type: 'exponential' as const, delay: 1000 },
+  removeOnComplete: 200,
+  removeOnFail: 1000,
+};
+
+/**
+ * BullmqAdapter — Redis-backed queue.
+ *
+ * Publishes a Job with `name = topic` and a deterministic jobId
+ * derived from `topic + payload`. Two publishes with the same payload
+ * collapse to the same job, so consumers stay idempotent across
+ * retries without extra application code. When BullMQ rejects the
+ * duplicate (EEXIST), we swallow — the message is already in flight.
+ *
+ * Worker handlers are kept in an internal map keyed by topic and
+ * dispatched from a single Worker (BullMQ's recommended pattern —
+ * one queue, multiple job names). On a connection refused we let
+ * the underlying IORedis client fail fast; callers see the rejection.
+ *
+ * The default job policy is 3 retries with exponential backoff
+ * (1s, 2s, 4s). After the third failure BullMQ moves the job to
+ * its built-in failed-set — DLQ is a future-sprint concern.
+ */
+@Injectable()
+export class BullmqAdapter
+  implements QueueAdapter, OnModuleInit, OnModuleDestroy
+{
+  readonly driver = 'bullmq' as const;
+  private readonly logger = new Logger(BullmqAdapter.name);
+
+  private queue!: Queue;
+  private worker!: Worker;
+  private connection!: IORedis;
+  /** Exposed for tests that want to inspect the wiring directly. */
+  readonly handlersByTopic = new Map<string, QueueHandler>();
+
+  async onModuleInit(): Promise<void> {
+    const connection = this.buildConnection();
+    this.connection = connection;
+    this.queue = new Queue(DOCUMENT_PROCESSING_QUEUE, {
+      connection: this.connectionOptions(),
+      defaultJobOptions: DEFAULT_JOB_OPTIONS,
+    });
+    this.worker = new Worker(
+      DOCUMENT_PROCESSING_QUEUE,
+      async (job) => this.dispatch(job.name, this.unwrapEnvelope(job.name, job.data)),
+      {
+        connection: this.connectionOptions(),
+        concurrency: 1,
+      },
+    );
+    // Surface worker errors instead of letting them die silently.
+    this.worker.on('failed', (job, err) => {
+      this.logger.error(
+        `[worker] job=${job?.id} name=${job?.name} attempt=${job?.attemptsMade} failed: ${err.message}`,
+      );
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      await this.worker?.close();
+    } catch (err) {
+      this.logger.warn(
+        `[onModuleDestroy] worker close threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    try {
+      await this.queue?.close();
+    } catch (err) {
+      this.logger.warn(
+        `[onModuleDestroy] queue close threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    try {
+      await this.connection?.quit();
+    } catch {
+      // ioredis throws on an already-disconnected socket — ignore.
+    }
+  }
+
+  async publish(topic: string, payload: unknown): Promise<void> {
+    const jobId = this.deriveJobId(topic, payload);
+    const envelope = { topic, payload };
+    try {
+      await this.queue.add(topic, envelope, { jobId });
+    } catch (err) {
+      if (this.isDedupError(err)) return;
+      throw err;
+    }
+  }
+
+  subscribe(topic: string, handler: QueueHandler): void {
+    this.handlersByTopic.set(topic, handler);
+  }
+
+  subscribeBatch(topics: readonly string[], handler: QueueHandler): void {
+    for (const topic of topics) this.subscribe(topic, handler);
+  }
+
+  // ============================================================ internals
+
+  private buildConnection(): IORedis {
+    // Redis is provisioned at deploy time — we read connection params
+    // from env and let ioredis connect lazily. Failures surface on
+    // first publish.
+    const host = process.env.REDIS_HOST ?? '127.0.0.1';
+    const port = Number.parseInt(process.env.REDIS_PORT ?? '6379', 10);
+    return new IORedis({
+      host,
+      port,
+      maxRetriesPerRequest: null,
+      enableReadyCheck: false,
+      lazyConnect: true,
+    });
+  }
+
+  private connectionOptions(): ConnectionOptions {
+    const host = process.env.REDIS_HOST ?? '127.0.0.1';
+    const port = Number.parseInt(process.env.REDIS_PORT ?? '6379', 10);
+    return { host, port, maxRetriesPerRequest: null };
+  }
+
+  private async dispatch(topic: string, payload: unknown): Promise<void> {
+    const handler = this.handlersByTopic.get(topic);
+    if (!handler) {
+      this.logger.warn(`[dispatch] no handler for topic=${topic} — dropping`);
+      return;
+    }
+    await handler(payload);
+  }
+
+  /**
+   * BullMQ persists the `{ topic, payload }` envelope created by publish().
+   * Queue handlers, however, share the QueueAdapter contract with the
+   * EventEmitter adapter and must receive the original payload. Job.name is
+   * authoritative so malformed or stale envelopes cannot redirect dispatch.
+   */
+  private unwrapEnvelope(topic: string, data: unknown): unknown {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+    const envelope = data as { topic?: unknown; payload?: unknown };
+    return envelope.topic === topic && Object.prototype.hasOwnProperty.call(envelope, 'payload')
+      ? envelope.payload
+      : data;
+  }
+
+  private deriveJobId(topic: string, payload: unknown): string {
+    const hash = createHash('sha256')
+      .update(topic)
+      .update(String.fromCharCode(0))
+      .update(this.canonicalJson(payload))
+      .digest('hex');
+    // 24 hex chars is plenty for a deterministic id (96 bits of
+    // entropy). Prefix with the queue name so different adapters in
+    // the same Redis never collide on `jobId`.
+    return `sh-${hash.slice(0, 24)}`;
+  }
+
+  private canonicalJson(value: unknown): string {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) {
+      return '[' + value.map((v) => this.canonicalJson(v)).join(',') + ']';
+    }
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    return (
+      '{' +
+      keys
+        .map((k) => JSON.stringify(k) + ':' + this.canonicalJson(obj[k]))
+        .join(',') +
+      '}'
+    );
+  }
+
+  private isDedupError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    return /jobId already exists|duplicate|already exists/i.test(err.message);
+  }
+}

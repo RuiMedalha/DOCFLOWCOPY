@@ -21,12 +21,14 @@ function buildPrismaStub() {
   const folder = { findFirst: jest.fn(), create: jest.fn() };
   const folderRule = { findMany: jest.fn() };
   const party = { findFirst: jest.fn() };
+  const account = { upsert: jest.fn() };
 
   return {
     document,
     folder,
     folderRule,
     party,
+    account,
   };
 }
 
@@ -45,6 +47,7 @@ function buildStorageStub(): StorageService {
     getBuffer: jest.fn(async (_key) => ({ buffer: Buffer.from(''), size: 0 })),
     remove: jest.fn(async () => undefined),
     exists: jest.fn(async () => true),
+    move: jest.fn(async () => undefined),
     getSignedUrl: jest.fn(async (key) => `/api/v1/documents/storage/${encodeURIComponent(key)}`),
   };
 }
@@ -67,7 +70,16 @@ function buildImageToPdfStub() {
 }
 
 function makePdfBuffer(payload = 'hello docflow'): Buffer {
-  return Buffer.from(payload);
+  // Magic-bytes fix (AUDIT §4.8): prepend the PDF `%PDF-` signature so the
+  // buffer survives the new MIME-confusion check in `upload()`. The trailing
+  // payload is whatever the test asserts about.
+  return Buffer.concat([Buffer.from('%PDF-1.4\n', 'utf8'), Buffer.from(payload, 'utf8')]);
+}
+
+function makeJpegBuffer(payload = 'jpeg-bytes'): Buffer {
+  // Magic-bytes fix: prepend the JPEG SOI + APP0 signature so the buffer
+  // survives `assertMimeMatchesSignature` in `upload()`.
+  return Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(payload, 'utf8')]);
 }
 
 // ──────────────────────────────────────────────── tests
@@ -107,6 +119,14 @@ describe('DocumentsService', () => {
       // upload(), so a no-op stub is enough for the dedup tests.
       { enqueue: jest.fn().mockResolvedValue({ queued: false, documentId: 'doc-1', ok: true }) } as any,
       imageToPdf as any,
+      // QueueAdapter stub — Sprint H pipeline trigger publishes
+      // `document.uploaded` to this adapter; tests don't assert on it.
+      {
+        driver: 'eventemitter' as const,
+        publish: jest.fn().mockResolvedValue(undefined),
+        subscribe: jest.fn(),
+        subscribeBatch: jest.fn(),
+      } as any,
     );
   });
 
@@ -139,7 +159,9 @@ describe('DocumentsService', () => {
       expect(prisma.document.create).toHaveBeenCalledTimes(1);
       const createArgs = prisma.document.create.mock.calls[0][0];
       expect(createArgs.data.fileHash).toBe(expectedHash);
-      expect(createArgs.data.fileKey).toMatch(/^tenant-test-1\/\d{4}\/\d{2}\//);
+      // Sprint E fix-up: every upload lands under `_inbox/` so the
+      // approve → relocate flow can move it to the party/category folder.
+      expect(createArgs.data.fileKey).toMatch(/^_inbox\/tenant-test-1\/\d{4}\/\d{2}\//);
       expect(createArgs.data.fileKey.endsWith('.pdf')).toBe(true);
       expect(createArgs.data.status).toBe(DocumentStatus.NOVO);
       expect(createArgs.data.suggestedFolder).toBe('/2026/08/fatura_recebida/_');
@@ -244,7 +266,7 @@ describe('DocumentsService', () => {
 
   // ──────────────────────────────────────────────── image → PDF derivative
   describe('upload() — image → PDF derivative', () => {
-    const makeJpeg = (payload = 'jpeg-bytes') => Buffer.from(payload);
+    const makeJpeg = (payload = 'jpeg-bytes') => makeJpegBuffer(payload);
 
     beforeEach(() => {
       // Default imageToPdf stub: yes it supports jpeg, returns a
@@ -301,7 +323,7 @@ describe('DocumentsService', () => {
         encoding: '7bit',
         mimetype: 'application/pdf',
         size: 4,
-        buffer: Buffer.from('pdf!'),
+        buffer: makePdfBuffer('pdf!'),
       };
       prisma.document.findFirst.mockResolvedValue(null);
       rules.suggest.mockResolvedValue('/Inbox/2026/08/OUTRO');
@@ -707,7 +729,7 @@ describe('DocumentsService', () => {
       encoding: '7bit',
       mimetype: 'image/jpeg',
       size: 11,
-      buffer: Buffer.from('jpeg-bytes'),
+      buffer: makeJpegBuffer('jpeg-bytes'),
     };
 
     beforeEach(() => {
@@ -763,10 +785,10 @@ describe('DocumentsService', () => {
         docDate: new Date(Date.UTC(2026, 6, 31)),
       });
 
-      expect(out).toBe('AMERICO-ALVES-LDA_2026-07-31_FT-2026-1751.jpg');
+      expect(out).toBe('AMERICO-ALVES-LDA_2026-07-31_FT-2026-1751.pdf');
       expect(prisma.document.update).toHaveBeenCalledTimes(1);
       expect(prisma.document.update.mock.calls[0][0].data.fileName).toBe(
-        'AMERICO-ALVES-LDA_2026-07-31_FT-2026-1751.jpg',
+        'AMERICO-ALVES-LDA_2026-07-31_FT-2026-1751.pdf',
       );
     });
 
@@ -852,7 +874,7 @@ describe('DocumentsService', () => {
       });
 
       // The row already has fields — we should still rename.
-      expect(out).toBe('NOS_2026-06-01_FT-9.jpg');
+      expect(out).toBe('NOS_2026-06-01_FT-9.pdf');
       expect(prisma.document.update).toHaveBeenCalledTimes(1);
     });
 
@@ -877,7 +899,7 @@ describe('DocumentsService', () => {
       // rename is purely a `fileName` column write.
       expect(updateArgs.data).not.toHaveProperty('fileKey');
       expect(updateArgs.data).not.toHaveProperty('pdfKey');
-      expect(updateArgs.data.fileName).toBe('EDP_2026-01-01_FT-1.jpg');
+      expect(updateArgs.data.fileName).toBe('EDP_2026-01-01_FT-1.pdf');
     });
 
     it('logs and returns null when the update throws (does not abort the caller)', async () => {
@@ -911,6 +933,120 @@ describe('DocumentsService', () => {
 
       expect(out).toBeNull();
       expect(prisma.document.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // ──────────────────────────────────────────────── Fase 4.2 (P2) — contabilização
+  describe('sanitize() via findOne() — a conta atribuída sobrevive a reabrir o documento', () => {
+    it('achata o objeto Account em código (string), como o frontend espera', async () => {
+      prisma.document.findFirst.mockResolvedValue({
+        id: 'doc-1',
+        debitAccount: { code: '312' },
+        creditAccount: { code: '2211' },
+      });
+      const out = await svc.findOne(TENANT_ID, 'doc-1');
+      expect(out.debitAccount).toBe('312');
+      expect(out.creditAccount).toBe('2211');
+    });
+
+    it('sem conta atribuída, devolve null em vez do objeto vazio', async () => {
+      prisma.document.findFirst.mockResolvedValue({
+        id: 'doc-1',
+        debitAccount: null,
+        creditAccount: null,
+      });
+      const out = await svc.findOne(TENANT_ID, 'doc-1');
+      expect(out.debitAccount).toBeNull();
+      expect(out.creditAccount).toBeNull();
+    });
+  });
+
+  describe('assignAccounting() — o frontend já chamava esta rota; não existia', () => {
+    it('resolve o código para uma Account (cria-a se não existir) e liga o documento', async () => {
+      prisma.document.findFirst.mockResolvedValue({ id: 'doc-acc' });
+      prisma.account.upsert
+        .mockResolvedValueOnce({ id: 'acc-312' })
+        .mockResolvedValueOnce({ id: 'acc-2211' });
+      prisma.document.update.mockResolvedValue({
+        id: 'doc-acc',
+        debitAccountId: 'acc-312',
+        creditAccountId: 'acc-2211',
+      });
+
+      const out = await svc.assignAccounting(TENANT_ID, USER_ID, 'doc-acc', {
+        debitAccount: '312',
+        creditAccount: '2211',
+      });
+
+      expect(prisma.account.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { tenantId_code: { tenantId: TENANT_ID, code: '312' } },
+          create: expect.objectContaining({ code: '312', name: 'Compras — mercadorias' }),
+        }),
+      );
+      expect(prisma.document.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'doc-acc' },
+          data: { debitAccountId: 'acc-312', creditAccountId: 'acc-2211' },
+        }),
+      );
+      expect(out.debitAccountId).toBe('acc-312');
+      expect(audit.log).toHaveBeenCalled();
+    });
+
+    it('um código fora do SNC_BASELINE ainda é aceite, com rótulo genérico', async () => {
+      prisma.document.findFirst.mockResolvedValue({ id: 'doc-acc' });
+      prisma.account.upsert.mockResolvedValueOnce({ id: 'acc-custom' });
+      prisma.document.update.mockResolvedValue({ id: 'doc-acc' });
+
+      await svc.assignAccounting(TENANT_ID, USER_ID, 'doc-acc', { debitAccount: '9999' });
+
+      expect(prisma.account.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ create: expect.objectContaining({ code: '9999', name: 'Conta 9999' }) }),
+      );
+    });
+
+    it('null limpa a atribuição; undefined não mexe', async () => {
+      prisma.document.findFirst.mockResolvedValue({ id: 'doc-acc' });
+      prisma.document.update.mockResolvedValue({ id: 'doc-acc' });
+
+      await svc.assignAccounting(TENANT_ID, USER_ID, 'doc-acc', { debitAccount: null });
+
+      expect(prisma.account.upsert).not.toHaveBeenCalled();
+      expect(prisma.document.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { debitAccountId: null } }),
+      );
+    });
+
+    it('404 quando o documento não existe', async () => {
+      prisma.document.findFirst.mockResolvedValue(null);
+      await expect(
+        svc.assignAccounting(TENANT_ID, USER_ID, 'doc-missing', { debitAccount: '312' }),
+      ).rejects.toThrow('Document not found');
+    });
+  });
+
+  describe('getAccountingProposal() — determinística, natureza + regime de IVA', () => {
+    it('compra nacional de mercadorias', async () => {
+      prisma.document.findFirst.mockResolvedValue({
+        expenseNature: 'MERCADORIAS_REVENDA',
+        party: { vatRegime: 'PT' },
+      });
+      const out = await svc.getAccountingProposal(TENANT_ID, 'doc-1');
+      expect(out.debit.map((l: { code: string }) => l.code)).toEqual(['312', '2432']);
+    });
+
+    it('sem fornecedor ligado, sem regime — não propõe nada', async () => {
+      prisma.document.findFirst.mockResolvedValue({ expenseNature: 'MERCADORIAS_REVENDA', party: null });
+      const out = await svc.getAccountingProposal(TENANT_ID, 'doc-1');
+      expect(out.reason).toBe('sem_regime_iva_definido');
+    });
+
+    it('404 quando o documento não existe', async () => {
+      prisma.document.findFirst.mockResolvedValue(null);
+      await expect(svc.getAccountingProposal(TENANT_ID, 'doc-missing')).rejects.toThrow(
+        'Document not found',
+      );
     });
   });
 });

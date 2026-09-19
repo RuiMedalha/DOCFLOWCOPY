@@ -1,87 +1,66 @@
 # ─────────────────────────────────────────────────────────────────────────
-# DocFlow Web (Next.js 15 + React 19) — multi-stage standalone image
-#
-# Stage 1 (deps):  pnpm install (frozen lockfile)
-# Stage 2 (build): next build with output: "standalone" → copy .next/standalone + static
-# Stage 3 (runtime): minimal Alpine + node + standalone server, non-root
-#
-# NOTE: Next.js `output: "standalone"` must be set in next.config.ts to enable
-#       the production self-contained build used below. See DEPLOYMENT.md.
-#
-# Build: docker build -f apps/web/Dockerfile -t docflow/web:tag .
-# Run:   docker run -p 3000:3000 docflow/web:tag
-#
-# Image size target: ~400 MB on alpine
+# DocFlow Web (Next.js 15, output: "standalone"). Not a pnpm workspace
+# member — its own package.json + pnpm-lock.yaml. @docflow/shared linked
+# via "file:../../packages/shared". Next's standalone file-tracer can't
+# follow a symlink pointing outside apps/web, so we replace it with a
+# real copy before building.
 # ─────────────────────────────────────────────────────────────────────────
 
-# ───────────────────────── Stage 1: deps ─────────────────────────
-FROM node:22-alpine AS deps
-
+# ───────────────────────── Stage 1: shared ────────────────────────
+FROM node:22-alpine AS shared
 WORKDIR /repo
-
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+RUN corepack enable && corepack prepare pnpm@11.10.0 --activate
+COPY packages/shared ./packages/shared
+WORKDIR /repo/packages/shared
+RUN pnpm install --no-frozen-lockfile --ignore-scripts
+RUN pnpm run build
 
-# Workspace manifests
-COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
-COPY apps/web/package.json     ./apps/web/package.json
-COPY packages/shared/package.json ./packages/shared/package.json
+# ───────────────────────── Stage 2: deps ──────────────────────────
+FROM node:22-alpine AS deps
+WORKDIR /repo
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
+RUN corepack enable && corepack prepare pnpm@11.10.0 --activate
+COPY --from=shared /repo/packages ./packages
+COPY apps/web/package.json apps/web/pnpm-lock.yaml apps/web/pnpm-workspace.yaml ./apps/web/
+WORKDIR /repo/apps/web
+RUN --mount=type=cache,id=pnpm-store-web,target=/pnpm/store \
+    pnpm install --frozen-lockfile --ignore-scripts
 
-RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
-    pnpm install --frozen-lockfile --filter @docflow/web... --ignore-scripts
-
-# ───────────────────────── Stage 2: build ────────────────────────
+# ───────────────────────── Stage 3: build ─────────────────────────
 FROM node:22-alpine AS build
 WORKDIR /repo
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+RUN corepack enable && corepack prepare pnpm@11.10.0 --activate
 COPY --from=deps /repo ./
-
+COPY apps/web ./apps/web
 WORKDIR /repo/apps/web
-
-# Public env baked at build time (read by `next build` / `next runtimeConfig`)
+RUN rm -rf node_modules/@docflow/shared \
+ && cp -R /repo/packages/shared node_modules/@docflow/shared
 ARG NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+RUN pnpm run build
 
-# Build the standalone bundle. Build-time env vars only — runtime secrets go in headers.
-RUN pnpm --filter @docflow/web run build
-
-# Strip dev deps to slim the runtime install
-RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
-    pnpm install --frozen-lockfile --prod --filter @docflow/web... --ignore-scripts
-
-# ───────────────────────── Stage 3: runtime ──────────────────────
+# ───────────────────────── Stage 4: runtime ───────────────────────
 FROM node:22-alpine AS runtime
-
 RUN apk add --no-cache tini wget
-
 ENV NODE_ENV=production \
     PORT=3000 \
-    HOSTNAME=0.0.0.0 \
-    NODE_OPTIONS="--enable-source-maps"
-
+    HOSTNAME=0.0.0.0
 RUN addgroup -g 10001 -S docflow \
  && adduser  -u 10001 -S docflow -G docflow -h /app -s /sbin/nologin
-
 WORKDIR /app
-
-# Standalone output bundles the runtime + a minimal `node_modules` tree.
-# Static assets and public/ live alongside it.
-COPY --from=build --chown=docflow:docflow /repo/apps/web/.next/standalone ./apps/web
-COPY --from=build --chown=docflow:docflow /repo/apps/web/.next/static     ./apps/web/.next/static
-COPY --from=build --chown=docflow:docflow /repo/apps/web/public           ./apps/web/public
-COPY --from=build --chown=docflow:docflow /repo/packages                  ./packages
-
+COPY --from=build --chown=docflow:docflow /repo/apps/web/.next/standalone ./
+COPY --from=build --chown=docflow:docflow /repo/apps/web/.next/static ./.next/static
+COPY --from=build --chown=docflow:docflow /repo/apps/web/public       ./public
 USER docflow
-
 EXPOSE 3000
 
-# Lightweight HTTP probe against the homepage. A 200 response is enough for liveness;
-# the deep `/api/v1/health` is owned by the API container, not the web.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -qO- http://127.0.0.1:3000/ >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["node", "apps/web/server.js"]
+CMD ["node", "server.js"]

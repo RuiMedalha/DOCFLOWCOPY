@@ -22,7 +22,16 @@ import {
 
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/strategies/jwt.strategy';
+import { Roles } from '../../common/decorators/roles.decorator';
+import { Role } from '../../common/guards/rbac.guard';
 import { PartiesService } from './parties.service';
+import { ViesService } from '../vies/vies.service';
+import { PartyImportService } from './party-import.service';
+import { PartyProductsService } from './party-products.service';
+import { PartyMergeService } from './party-merge.service';
+import { UploadedFile, UseInterceptors, BadRequestException as PartiesBadRequest } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { DocumentsService } from '../documents/documents.service';
 import {
   AccountQueryDto,
   CreateAccountDto,
@@ -32,6 +41,7 @@ import {
   CreatePartyDto,
   FlagIbanDto,
   MarkVerifiedIbanDto,
+  MergePartyDto,
   PartyQueryDto,
   UpdatePartyDto,
 } from './dto/party.dto';
@@ -74,7 +84,97 @@ import {
 @ApiBearerAuth()
 @Controller()
 export class PartiesController {
-  constructor(private readonly parties: PartiesService) {}
+  constructor(
+    private readonly parties: PartiesService,
+    private readonly documents: DocumentsService,
+    private readonly vies: ViesService,
+    private readonly partyImport: PartyImportService,
+    private readonly partyProducts: PartyProductsService,
+    private readonly partyMerge: PartyMergeService,
+  ) {}
+
+  // ── Fase 4 ─────────────────────────────────────────────────────────
+  @Post('parties/import')
+  @Roles(Role.ADMIN)
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 10 * 1024 * 1024 } }))
+  @ApiOperation({
+    summary: 'Import suppliers from CSV (Moloni export or any CSV)',
+    description:
+      'multipart/form-data: `file` (CSV, UTF-8, `;` or `,`), optional `mapping` (JSON string: DocFlow field → CSV column), optional `dryRun=true`. Upsert by NIF / NIF-IVA / exact name.',
+  })
+  importCsv(
+    @CurrentUser() user: AuthenticatedUser,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Body('mapping') mapping?: string,
+    @Body('dryRun') dryRun?: string,
+    @Body('type') type?: string,
+  ) {
+    if (!file?.buffer?.length) throw new PartiesBadRequest('CSV file is required (field "file")');
+    let parsedMapping: Record<string, string> | undefined;
+    if (mapping) {
+      try {
+        parsedMapping = JSON.parse(mapping);
+      } catch {
+        throw new PartiesBadRequest('mapping must be a JSON object');
+      }
+    }
+    return this.partyImport.importCsv(user.tenantId, user.id, file.buffer, parsedMapping, {
+      dryRun: dryRun === 'true' || dryRun === '1',
+      type: type === 'CLIENTE' || type === 'AMBOS' ? (type as 'CLIENTE' | 'AMBOS') : undefined,
+    });
+  }
+
+  @Post('parties/:id/vies')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Validate the party VAT number in VIES (EC REST API, 30-day cache)' })
+  validateVies(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id') id: string,
+    @Query('force') force?: string,
+  ) {
+    return this.vies.validateParty(user.tenantId, id, force === 'true' || force === '1');
+  }
+
+  // ── Fase 4.1 — fundir entidades ────────────────────────────────────
+  // Em produção o mesmo fornecedor ficou partido por várias Party (três
+  // "CreateInfor"). Esta rota corrige o que já está partido; o
+  // party-identity impede que volte a acontecer.
+  @Get('parties/duplicates')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary: 'Grupos de entidades que parecem ser o mesmo fornecedor',
+    description:
+      'Agrupa por NIF ou por nome normalizado (sem acentos, sem formas jurídicas) + país. '
+      + 'Sugere como destino a mais antiga que tenha NIF.',
+  })
+  duplicates(@CurrentUser() user: AuthenticatedUser) {
+    return this.partyMerge.findDuplicates(user.tenantId);
+  }
+
+  @Post('parties/:id/merge')
+  @Roles(Role.ADMIN)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Fundir outra entidade nesta (move documentos, contactos, IBANs e histórico)',
+    description:
+      'O `:id` é o DESTINO (sobrevive); `sourceId` no corpo é a entidade absorvida, '
+      + 'que fica inativa mas nunca é apagada. Recusa fundir entidades que não partilhem '
+      + 'NIF nem nome normalizado. Fica registado na auditoria.',
+  })
+  mergeParty(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id') id: string,
+    @Body() dto: MergePartyDto,
+  ) {
+    return this.partyMerge.merge(user.tenantId, user.id, id, dto.sourceId);
+  }
+
+  @Get('parties/:id/products')
+  @ApiOperation({ summary: 'Products bought from this supplier (aggregated document line items)' })
+  products(@CurrentUser() user: AuthenticatedUser, @Param('id') id: string) {
+    return this.partyProducts.list(user.tenantId, id);
+  }
 
   // ─────────────────────────────────────────── parties CRUD ───────────────
 
@@ -149,7 +249,49 @@ export class PartiesController {
     return this.parties.findOne(user.tenantId, id);
   }
 
+  /**
+   * Recent documents linked to a party. Powers the "Faturas recentes"
+   * section on `/parties/:id`. Same shape as `GET /documents` so the
+   * UI can reuse its list primitives — and so the "Ver todas" button
+   * just redirects to `/documents?partyId=...` (which the documents
+   * controller already accepts).
+   */
+  @Get('parties/:id/documents')
+  @ApiOperation({
+    summary: 'List documents linked to this party (supplier/customer)',
+    description:
+      'Paginates by limit (default 10, capped at 50). Optional from/to ' +
+      'filter the createdAt range. Returns the same { items, meta } shape ' +
+      'as GET /documents so the UI list primitive is shared.',
+  })
+  @ApiQuery({ name: 'limit', required: false, description: '1..50 (default 10)' })
+  @ApiQuery({ name: 'from', required: false, description: 'ISO date — inclusive' })
+  @ApiQuery({ name: 'to', required: false, description: 'ISO date — inclusive' })
+  @ApiResponse({ status: 200, description: 'Paginated documents for the party' })
+  @ApiResponse({ status: 404, description: 'Party not found' })
+  async findPartyDocuments(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    // Validate the party exists in this tenant before returning an
+    // empty list — keeps 404 vs empty-list semantics predictable for
+    // the UI (which renders a "no docs" card vs an error toast).
+    await this.parties.findOne(user.tenantId, id);
+    const parsedLimit = limit ? Number(limit) : 10;
+    return this.documents.findByParty(
+      user.tenantId,
+      id,
+      Number.isFinite(parsedLimit) ? parsedLimit : 10,
+      from,
+      to,
+    );
+  }
+
   @Patch('parties/:id')
+  @Roles(Role.ADMIN)
   @ApiOperation({
     summary: 'Update a party',
     description:
@@ -157,12 +299,16 @@ export class PartiesController {
   })
   @ApiResponse({ status: 404, description: 'Party not found' })
   @ApiResponse({ status: 400, description: 'Invalid NIF / IBAN' })
+  @ApiResponse({
+    status: 403,
+    description: 'Only ADMIN may set isRecurring / isRecurringManualOverride',
+  })
   update(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id') id: string,
     @Body() dto: UpdatePartyDto,
   ) {
-    return this.parties.update(user.tenantId, user.id, id, dto);
+    return this.parties.update(user.tenantId, user.id, id, dto, user.role);
   }
 
   @Delete('parties/:id')

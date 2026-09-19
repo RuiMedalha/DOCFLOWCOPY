@@ -29,8 +29,11 @@ export class ThrottleBucketGuard extends ThrottlerGuard {
    * the developer out for the full window. In production the configured
    * buckets (global / login / extract / export) apply as normal.
    */
-  protected async shouldSkip(_context: ExecutionContext): Promise<boolean> {
-    return process.env.NODE_ENV !== 'production';
+  protected async shouldSkip(context: ExecutionContext): Promise<boolean> {
+      if (process.env.NODE_ENV !== 'production') return true;
+      const req = context.switchToHttp().getRequest<Request>();
+      const path = req?.originalUrl ?? req?.url ?? '';
+      return path.startsWith('/api/v1/health');
   }
 
   protected async getTracker(req: Record<string, unknown>): Promise<string> {

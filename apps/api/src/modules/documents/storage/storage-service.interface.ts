@@ -25,6 +25,17 @@ export interface GetObjectResult {
   size: number;
 }
 
+export interface StorageListEntry {
+  name: string;
+  size?: number;
+  modifiedAt?: string;
+}
+
+export interface StorageListResult {
+  folders: StorageListEntry[];
+  files: StorageListEntry[];
+}
+
 export interface StorageService {
   /**
    * Persist `buffer` at `key`. Overwrites if it exists (object storage is
@@ -50,6 +61,17 @@ export interface StorageService {
   exists(key: string): Promise<boolean>;
 
   /**
+   * Move an object from `oldKey` to `newKey` atomically. Sprint E uses this
+   * to relocate approved documents from `_inbox/` to the party/category
+   * folder without copying bytes through the controller. Implementations must:
+   *   - Refuse if `oldKey === newKey` (no-op).
+   *   - Verify size after copy-fallback (size mismatch ⇒ throw + cleanup dest).
+   *   - Be safe across volumes: prefer native `rename` when possible, fall
+   *     back to copy+verify+unlink otherwise.
+   */
+  move(oldKey: string, newKey: string): Promise<void>;
+
+  /**
    * Return a URL the client can use to fetch the file. Local driver
    * returns the controller route `/api/v1/documents/<id>/download`. S3/MinIO
    * returns a presigned URL. Returned value is opaque to callers — only
@@ -58,9 +80,29 @@ export interface StorageService {
   getSignedUrl(key: string, ttlSeconds?: number): Promise<string>;
 
   /**
-   * Driver label for logging/metrics.
+   * Immediate children (folders + files) of a directory-like prefix.
+   * `prefix` is a POSIX path relative to the storage root ('' = root).
+   * Used by the storage tree browser; optional so test doubles that only
+   * exercise put/get/move don't have to implement it.
    */
-  readonly driver: 'local' | 's3' | 'minio';
+  list?(prefix: string): Promise<StorageListResult>;
+
+  /**
+   * Cheap reachability probe for /health (bucket HEAD, root dir access).
+   * Optional for the same reason as `list`.
+   */
+  healthCheck?(): Promise<boolean>;
+
+  /**
+   * Driver label for logging/metrics.
+   *
+   * `supabase` was added (security-audit M-13 / SCOUT §2.2) even
+   * though no driver implementation ships yet — the storage factory
+   * already reads `STORAGE_DRIVER` and falls back to `local` with a
+   * loud log for any other value, so listing it here is documentation
+   * of the public contract rather than a runtime change.
+   */
+  readonly driver: 'local' | 's3' | 'minio' | 'supabase';
 }
 
 /** Nest DI token for the provider-agnostic storage interface. */

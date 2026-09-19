@@ -27,6 +27,12 @@ enum Role {
   GESTOR_RH
   OPERADOR
   APPROVER
+  // Sprint 1.C — dedicated role for the SAF-T exporter + NIF
+  // base lookup. Distinct from CONTABILIDADE so we can grant
+  // read-only access to accounting partners without exposing
+  // them to the operator write surface (which CONTABILIDADE
+  // already carries in some flows).
+  ACCOUNTANT
 }
 
 enum DocumentOrigin {
@@ -36,6 +42,10 @@ enum DocumentOrigin {
   MOBILE
   WHATSAPP
   API
+  GMAIL
+  OUTLOOK
+  INBOUND_WEBHOOK
+  ONEDRIVE
 }
 
 enum DocumentType {
@@ -48,6 +58,35 @@ enum DocumentType {
   ENCOMENDA
   GUIA_TRANSPORTE
   OUTRO
+  // Fase 3 — tipos não fiscais / simplificados detetados de forma
+  // determinística pelo classificador (fiscal-status.ts).
+  PROFORMA
+  ORCAMENTO
+  AVISO_PAGAMENTO
+  EXTRATO_FORNECEDOR
+  FATURA_SIMPLIFICADA
+  FATURA_RECIBO
+}
+
+// Fase 3 — validade fiscal de um documento (determinística, nunca IA).
+//   FISCAL         QR-AT válido (NIF emitente mod-11, ATCUD, Q e R) ou fatura
+//                  estrangeira com NIF-IVA validado no VIES + nº + data
+//   NAO_FISCAL     proforma / orçamento / aviso / extrato — nunca vai ao TOC
+//                  nem entra no IVA
+//   INDETERMINADO  tudo o resto → revisão
+//   NAO_APLICAVEL  documento com NIF da própria empresa como emitente (encomenda de cliente / fatura emitida)
+enum FiscalStatus {
+  FISCAL
+  NAO_FISCAL
+  INDETERMINADO
+  NAO_APLICAVEL
+}
+
+// Fase 4 — regime de IVA do fornecedor (determina autoliquidação / dedução).
+enum VatRegime {
+  PT
+  UE_REVERSE_CHARGE
+  EXTRA_UE
 }
 
 enum DocumentStatus {
@@ -57,6 +96,29 @@ enum DocumentStatus {
   APROVADO
   REJEITADO
   ARQUIVADO
+  // Sprint 1.B — approval workflow states. The new values
+  // cover the PENDING → DECIDED lifecycle the approval
+  // module drives; ARQUIVADO/PROCESSADO/EM_REVISAO remain
+  // for legacy rows that pre-date the workflow.
+  PENDING_APPROVAL
+  CHANGES_REQUESTED
+  // Fase 3 — segundo documento com a mesma chave fiscal
+  // (tenant + NIF emitente + nº documento [+ ATCUD]); fica ligado ao
+  // original via duplicateOfId e nunca é apagado.
+  DUPLICADO
+}
+
+// Sprint H — async processing pipeline state machine.
+// Nullable on the column so legacy docs (created before the migration)
+// keep their status untouched until the next upload retriggers them.
+enum DocumentProcessingStatus {
+  RECEIVED
+  EXTRACTING
+  ENRICHING
+  ROUTING
+  COMPLETED
+  FAILED
+  SKIPPED
 }
 
 enum PaymentStatus {
@@ -111,6 +173,13 @@ enum PartyType {
   AMBOS
 }
 
+enum PartyAddressType {
+  BILLING // faturação
+  CORRESPONDENCE // morada postal
+  OPERATIONAL // armazém / sede
+  OTHER
+}
+
 enum AccountType {
   ASSET
   LIABILITY
@@ -128,6 +197,7 @@ enum AuditAction {
   DELETE
   APPROVE
   REJECT
+  CONFIRM
   IMPORT
   EXPORT
   RECONCILE
@@ -143,6 +213,15 @@ enum MatchType {
   STRONG
   MEDIUM
   WEAK
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+  // Operator withdrew their own request before a decision was made.
+  WITHDRAWN
 }
 
 enum MatchStatus {
@@ -183,24 +262,24 @@ enum EmployeeStatus {
 // =============================================================================
 
 model Tenant {
-  id          String   @id @default(cuid())
-  name        String
-  slug        String   @unique
-  nif         String?
-  iban        String?
-  bic         String?
-  bankName    String?
-  address     String?
-  city        String?
-  postalCode  String?
-  country     String   @default("PT")
-  logoUrl     String?
-  settings    Json?
-  scanToken   String?  @unique
-  scanEmail   String?  @unique
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id         String   @id @default(cuid())
+  name       String
+  slug       String   @unique
+  nif        String?
+  iban       String?
+  bic        String?
+  bankName   String?
+  address    String?
+  city       String?
+  postalCode String?
+  country    String   @default("PT")
+  logoUrl    String?
+  settings   Json?
+  scanToken  String?  @unique
+  scanEmail  String?  @unique
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
   users            User[]
   folders          Folder[]
@@ -234,6 +313,9 @@ model Tenant {
   ibanBlacklist    IbanBlacklist[]
   notifications    Notification[]
   categories       Category[]
+  partyCategories  PartyCategory[]
+  partyContacts    PartyContact[]
+  partyAddresses   PartyAddress[]
 
   @@index([slug])
   @@index([active])
@@ -245,43 +327,45 @@ model Tenant {
 // =============================================================================
 
 model User {
-  id           String   @id @default(cuid())
+  id           String    @id @default(cuid())
   tenantId     String
-  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   email        String
   passwordHash String
   name         String
-  role         Role     @default(OPERADOR)
-  isActive     Boolean  @default(true)
+  role         Role      @default(OPERADOR)
+  isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
   deletedAt    DateTime?
 
   // Granular RBAC flags (orthogonal to role enum)
-  canViewBankValues       Boolean @default(false)
-  canViewReconciliation   Boolean @default(false)
-  canApprovePayments      Boolean @default(false)
-  canExportData           Boolean @default(false)
-  canManagePayroll        Boolean @default(false)
-  canManageIntegrations   Boolean @default(false)
-  permissions             Json?
+  canViewBankValues     Boolean @default(false)
+  canViewReconciliation Boolean @default(false)
+  canApprovePayments    Boolean @default(false)
+  canExportData         Boolean @default(false)
+  canManagePayroll      Boolean @default(false)
+  canManageIntegrations Boolean @default(false)
+  permissions           Json?
 
   // 2FA
-  twoFactorSecret   String?
-  twoFactorEnabled  Boolean @default(false)
+  twoFactorSecret  String?
+  twoFactorEnabled Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  refreshTokens         RefreshToken[]
-  documentsUploaded     Document[]      @relation("DocumentUploadedBy")
-  documentsApproved     Document[]      @relation("DocumentApprovedBy")
-  auditLogs             AuditLog[]
+  refreshTokens           RefreshToken[]
+  documentsUploaded       Document[]        @relation("DocumentUploadedBy")
+  documentsApproved       Document[]        @relation("DocumentApprovedBy")
+  auditLogs               AuditLog[]
   paymentSchedulesCreated PaymentSchedule[]
-  activitiesAssigned    Activity[]      @relation("ActivityAssignedTo")
-  activitiesCreated     Activity[]      @relation("ActivityCreatedBy")
-  dealsCreated          Deal[]
-  notifications         Notification[]
-  payablesApproved      PayableItem[]   @relation("PayableApprovedBy")
+  activitiesAssigned      Activity[]        @relation("ActivityAssignedTo")
+  activitiesCreated       Activity[]        @relation("ActivityCreatedBy")
+  dealsCreated            Deal[]
+  notifications           Notification[]
+  payablesApproved        PayableItem[]     @relation("PayableApprovedBy")
+  approvalsRequested      Approval[]        @relation("ApprovalRequestedBy")
+  approvalsDecided        Approval[]        @relation("ApprovalDecidedBy")
 
   @@unique([tenantId, email])
   @@index([tenantId, role])
@@ -290,9 +374,9 @@ model User {
 }
 
 model RefreshToken {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   // C-03: refresh tokens are stored as sha256(rawToken). The raw token
   // is only ever emitted once at creation; on refresh/logout the caller
   // sends the raw token, we hash it, and look up by hash. A DB dump
@@ -303,11 +387,11 @@ model RefreshToken {
   // for the migration window so we can backfill without downtime, and
   // will be dropped in a follow-up migration once every environment
   // has been cut over.
-  tokenHash String?  @unique
-  token     String?  @unique
+  tokenHash String?   @unique
+  token     String?   @unique
   expiresAt DateTime
   revokedAt DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 
   @@index([userId])
   @@index([expiresAt])
@@ -319,35 +403,35 @@ model RefreshToken {
 // =============================================================================
 
 model AuditLog {
-  id            String      @id @default(cuid())
-  tenantId      String
-  tenant        Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  userId        String?
-  user          User?       @relation(fields: [userId], references: [id])
-  action        AuditAction
-  entityType    String?
-  entityId      String?
-  metadata      Json?
-  ip            String?
-  userAgent     String?
+  id         String      @id @default(cuid())
+  tenantId   String
+  tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId     String?
+  user       User?       @relation(fields: [userId], references: [id])
+  action     AuditAction
+  entityType String?
+  entityId   String?
+  metadata   Json?
+  ip         String?
+  userAgent  String?
 
   // Hash chain: each row seals the previous one. Tampering breaks the chain.
-  prevHash      String?
-  rowHash       String   // SHA-256 of (prevHash + canonical row payload)
+  prevHash String?
+  rowHash  String // SHA-256 of (prevHash + canonical row payload)
 
-  createdAt     DateTime   @default(now())
+  createdAt DateTime @default(now())
 
   // Append-only enforcement is application-level; no UPDATE/DELETE allowed.
 
-  @@index([tenantId, createdAt])
-  @@index([tenantId, userId, createdAt])
-  @@index([tenantId, entityType, entityId])
-  @@index([tenantId, action])
   // C-02: a duplicate rowHash under the same tenant indicates either a
   // hash-collision (astronomically unlikely for SHA-256) or a chain
   // corruption. The DB-level unique makes the latter detectable by
   // INSERT failure, and pairs with the $transaction in audit.service.ts.
   @@unique([tenantId, rowHash])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, userId, createdAt])
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, action])
   @@map("audit_logs")
 }
 
@@ -356,99 +440,213 @@ model AuditLog {
 // =============================================================================
 
 model Document {
-  id             String         @id @default(cuid())
-  tenantId       String
-  tenant         Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  fileName       String
-  fileKey        String         // S3 / object storage key — original file (image OR pdf OR whatever the user uploaded)
-  fileHash       String         // SHA-256 of the original bytes (duplicate detection)
-  mimeType       String
-  fileSize       Int
+  fileName String
+  fileKey  String // S3 / object storage key — original file (image OR pdf OR whatever the user uploaded)
+  fileHash String // SHA-256 of the original bytes (duplicate detection)
+  mimeType String
+  fileSize Int
   // PDF derivative: generated for image uploads so the UI can show a
   // single-page PDF next to the original photo (keep the photo around
   // for re-OCR / re-classification). Same tenant/year/month tree, just
   // a sibling key with `.pdf`. Null when the original is already a PDF
   // — no need to double-store the same bytes.
-  pdfKey         String?        // Object-storage key for the generated PDF (image uploads only)
-  origin         DocumentOrigin @default(UPLOAD)
-  type           DocumentType   @default(OUTRO)
-  status         DocumentStatus @default(NOVO)
+  pdfKey   String? // Object-storage key for the generated PDF (image uploads only)
+  origin   DocumentOrigin @default(UPLOAD)
+  type     DocumentType   @default(OUTRO)
+  status   DocumentStatus @default(NOVO)
 
   // Extracted header (PT AT QR-coded fields)
-  supplier       String?
-  supplierNif    String?
-  customer       String?
-  customerNif    String?
-  docNumber      String?
-  atcud          String?        // QR-AT unique code
-  docHash        String?        // hash inside QR-AT payload
-  iban           String?        // IBAN from QR-AT (for anti-fraud)
+  supplier           String?
+  supplierNif        String?
+  customer           String?
+  customerNif        String?
+  docNumber          String?
+  atcud              String? // QR-AT unique code
+  docHash            String? // hash inside QR-AT payload
+  iban               String? // IBAN from QR-AT (for anti-fraud)
+  // Sprint H+ — set by PATCH /documents/:id/verify-supplier when the
+  // operator explicitly confirms the AI-extracted supplier block is
+  // correct (no field edit). Distinct from `approvedAt`: a doc can be
+  // supplier-verified long before (or without ever being) approved.
+  supplierVerifiedAt DateTime?
 
-  docDate        DateTime?
-  dueDate        DateTime?
-  netAmount      Decimal?       @db.Decimal(12, 2)
-  taxAmount      Decimal?       @db.Decimal(12, 2)
-  total          Decimal?       @db.Decimal(12, 2)
-  currency       String         @default("EUR")
-  expenseCategoryId     String?
-  expenseCategory       Category? @relation("DocumentCategory", fields: [expenseCategoryId], references: [id])
-  ivaDeductibilityPct   Int?
-  docNature      String?
-  isNonFiscalDoc Boolean        @default(false)
-  isIntracommunity Boolean      @default(false)
+  docDate          DateTime?
+  dueDate          DateTime?
+  netAmount        Decimal?  @db.Decimal(12, 2)
+  taxAmount        Decimal?  @db.Decimal(12, 2)
+  total            Decimal?  @db.Decimal(12, 2)
+  currency         String    @default("EUR")
+  // Fase 4 — contravalor em EUR à taxa de referência do BCE na data da fatura
+  // (moeda ≠ EUR). Para EUR, amountEur = total.
+  amountEur        Decimal?  @db.Decimal(12, 2)
+  exchangeRate     Decimal?  @db.Decimal(14, 6) // unidades da moeda por 1 EUR
+  exchangeRateDate DateTime?
 
-  tags           String[]       @default([])
+  // ── Fase 4.1 — notas de crédito ────────────────────────────────────
+  // Uma NC nunca pode ser tratada como uma fatura normal. `total` fica
+  // como impresso (positivo); os campos `signed*` levam o sinal e são o
+  // que o saldo de fornecedor e o apuramento de IVA somam directamente,
+  // sem terem de conhecer a regra.
+  signedTotal         Decimal?   @db.Decimal(12, 2)
+  signedTaxAmount     Decimal?   @db.Decimal(12, 2)
+  signedNetAmount     Decimal?   @db.Decimal(12, 2)
+  // Documento retificado: o nº impresso na NC e, quando o encontramos na
+  // base, a ligação à fatura original.
+  correctedDocNumber  String?
+  correctedDocumentId String?
+  correctedDocument   Document?  @relation("DocumentCorrects", fields: [correctedDocumentId], references: [id])
+  corrections         Document[] @relation("DocumentCorrects")
+
+  // ── Fase 4.1 — descontos ───────────────────────────────────────────
+  // Desconto global do cabeçalho (o desconto por linha vive em
+  // DocumentItem.discount). `totalsReconciled` diz se
+  // soma(linhas) − descontos + IVA = total ao cêntimo; quando não fecha,
+  // `totalsDelta` guarda a diferença e o documento vai para revisão em
+  // vez de guardar uma diferença silenciosa.
+  discountAmount             Decimal?        @db.Decimal(12, 2)
+  lineDiscountTotal          Decimal?        @db.Decimal(12, 2)
+  totalsReconciled           Boolean?
+  totalsDelta                Decimal?        @db.Decimal(12, 2)
+  expenseCategoryId          String?
+  expenseCategory            Category?       @relation("DocumentCategory", fields: [expenseCategoryId], references: [id])
+  ivaDeductibilityPct        Int?
+  docNature                  String?
+  isNonFiscalDoc             Boolean         @default(false)
+  // Fase 4.1 — natureza efetiva do documento (herdada da categoria
+  // escolhida, ou definida pelo operador). Determina, com a categoria,
+  // a dedutibilidade do IVA.
+  expenseNature              CategoryNature?
+  // Fase 4.1 — correção manual do operador tem prioridade sobre a IA e
+  // não é revertida por uma re-extração (P2.2).
+  typeManualOverride         Boolean         @default(false)
+  fiscalStatusManualOverride Boolean         @default(false)
+  // Fase 3 — validade fiscal determinística + motivo legível.
+  fiscalStatus               FiscalStatus    @default(INDETERMINADO)
+  fiscalReason               String?
+  // Fase 3 — nº de documento normalizado (maiúsculas, sem separadores,
+  // sem prefixo de tipo) usado na chave fiscal de duplicados.
+  docNumberNorm              String?
+  // Fase 3 — quando status = DUPLICADO, aponta para o documento original.
+  duplicateOfId              String?
+  duplicateOf                Document?       @relation("DocumentDuplicateOf", fields: [duplicateOfId], references: [id])
+  duplicates                 Document[]      @relation("DocumentDuplicateOf")
+  isIntracommunity           Boolean         @default(false)
+
+  tags            String[]                @default([])
   suggestedFolder String?
-  finalFolder    String?
-  folderId       String?
-  folder         Folder?        @relation(fields: [folderId], references: [id])
-  metadata       Json?          // raw OCR payload
-  ocrConfidence  Float?
-  qrPayload      String?        // raw QR-AT decoded payload
-  searchVector   Unsupported("tsvector") @default(dbgenerated("''::tsvector"))
+  finalFolder     String?
+  folderId        String?
+  folder          Folder?                 @relation(fields: [folderId], references: [id])
+  metadata        Json? // raw OCR payload
+  ocrConfidence   Float?
+  qrPayload       String? // raw QR-AT decoded payload
+  searchVector    Unsupported("tsvector") @default(dbgenerated("''::tsvector"))
+
+  // Sprint 1.A — per-field extraction confidence + structural validators.
+  // Populated by ExtractionService when the AI/vision provider returns a
+  // confidence hint (Gemini does; regex/fallback path leaves them null and
+  // the UI falls back to the global ocrConfidence). All nullable: legacy
+  // rows that pre-date the column stay NULL until the next re-extraction.
+  supplierNameConfidence    Float?
+  supplierNifConfidence     Float?
+  supplierIbanConfidence    Float?
+  supplierAddressConfidence Float?
+  supplierCountryConfidence Float?
+  totalAmountConfidence     Float?
+  issueDateConfidence       Float?
+  dueDateConfidence         Float?
+  categoryConfidence        Float?
+  // Structural validators run on the persisted value. Cheap to compute
+  // (mod-11 / mod-97) so the column is set alongside the confidence
+  // write. Used by the review screen for the green/yellow/red chip and
+  // by the audit trail to flag "AI says confident, validator disagrees".
+  nifValid                  Boolean?
+  ibanValid                 Boolean?
 
   // Master data links
-  partyId          String?
-  party            Party?        @relation(fields: [partyId], references: [id])
-  crmContactId     String?
-  crmContact       CrmContact?   @relation(fields: [crmContactId], references: [id])
-  dealId           String?
-  deal             Deal?         @relation(fields: [dealId], references: [id])
+  partyId      String?
+  party        Party?      @relation(fields: [partyId], references: [id])
+  crmContactId String?
+  crmContact   CrmContact? @relation(fields: [crmContactId], references: [id])
+  dealId       String?
+  deal         Deal?       @relation(fields: [dealId], references: [id])
 
   // Accounting links
-  debitAccountId   String?
-  debitAccount     Account?      @relation("DocDebit",  fields: [debitAccountId],  references: [id])
-  creditAccountId  String?
-  creditAccount    Account?      @relation("DocCredit", fields: [creditAccountId], references: [id])
-  costCenter       String?
+  debitAccountId  String?
+  debitAccount    Account? @relation("DocDebit", fields: [debitAccountId], references: [id])
+  creditAccountId String?
+  creditAccount   Account? @relation("DocCredit", fields: [creditAccountId], references: [id])
+  costCenter      String?
 
-  paymentStatus    PaymentStatus @default(DRAFT)
-  paymentDueDate   DateTime?
+  paymentStatus  PaymentStatus @default(DRAFT)
+  paymentDueDate DateTime?
 
-  uploadedById     String?
-  uploadedBy       User?         @relation("DocumentUploadedBy", fields: [uploadedById], references: [id])
+  // Sprint H — async pipeline state. Set to RECEIVED on upload, then
+  // EXTRACTING → ENRICHING → ROUTING → COMPLETED (or FAILED). Null on
+  // legacy docs that pre-date the migration.
+  processingStatus      DocumentProcessingStatus?
+  processingStartedAt   DateTime?
+  processingCompletedAt DateTime?
+  processingError       String?
+  processingAttempt     Int                       @default(0)
+
+  uploadedById String?
+  uploadedBy   User?   @relation("DocumentUploadedBy", fields: [uploadedById], references: [id])
 
   // Approval — set by POST /documents/:id/approve. Cleared (NULL) when a
   // previously-approved document is unapproved (no such route today,
   // but the columns stay forward-compatible). approvedAt doubles as the
   // "immutable" audit timestamp surfaced on the detail page.
-  approvedAt       DateTime?
-  approvedById     String?
-  approvedBy       User?         @relation("DocumentApprovedBy", fields: [approvedById], references: [id])
+  approvedAt   DateTime?
+  approvedById String?
+  approvedBy   User?     @relation("DocumentApprovedBy", fields: [approvedById], references: [id])
 
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
+  // Sprint I+ — soft-delete (trash). `null` = live row; non-null = the
+  // moment the row was archived. The list / inbox / findByParty paths
+  // hide rows with a non-null value; the dedicated `/documents/trash`
+  // listing surfaces them so an ADMIN can restore. `DELETE /:id/hard`
+  // still physically removes the row + storage bytes (ADMIN-only,
+  // irreversible).
+  deletedAt DateTime?
 
-  items            DocumentItem[]
-  expenses         Expense[]
-  invoices         Invoice[]
-  paymentSchedules PaymentSchedule[]
-  paymentEvents    PaymentEvent[]
-  payableItems     PayableItem[]
-  journalLines     JournalLine[]
-  matches          MatchSuggestion[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
+  items              DocumentItem[]
+  expenses           Expense[]
+  invoices           Invoice[]
+  paymentSchedules   PaymentSchedule[]
+  paymentEvents      PaymentEvent[]
+  payableItems       PayableItem[]
+  journalLines       JournalLine[]
+  matches            MatchSuggestion[]
+  fieldConfirmations DocumentFieldConfirmation[]
+  approvals          Approval[]
+
+  // Sprint 1.B — denormalised pointer to the latest OPEN
+  // approval for this document. Lets the UI render "X awaiting
+  // review" without scanning the full approvals[] history on every
+  // list query. Cleared (NULL) when the approval is decided or
+  // when the document is un-approved through a separate path.
+  //
+  // We intentionally do NOT declare a Prisma relation here: a true
+  // one-to-one would require @unique on the FK (only one doc can
+  // point to the same approval — fine), but the inverse side (one
+  // approval can back many documents in theory) does not match
+  // Prisma's one-to-one rule. We model it as a plain FK column +
+  // explicit lookup in the service layer. The DB-level FK still
+  // enforces the integrity.
+  currentApprovalId String?
+
+  // H-06: per-tenant dedup on SHA-256. Removes the race window between
+  // findFirst + create where two concurrent uploads of the same bytes
+  // would both insert. Prisma will surface a unique-violation that the
+  // service maps to the existing-row conflict response.
+  @@unique([tenantId, fileHash])
   @@index([tenantId, status])
   @@index([tenantId, type])
   @@index([tenantId, fileHash])
@@ -456,46 +654,123 @@ model Document {
   @@index([tenantId, partyId])
   @@index([tenantId, paymentStatus])
   @@index([tenantId, atcud])
+  // Fase 3 — chave fiscal (o índice ÚNICO PARCIAL vive na migration em SQL
+  // porque o Prisma não exprime índices parciais/expressões).
+  @@index([tenantId, supplierNif, docNumberNorm])
+  @@index([tenantId, fiscalStatus])
   @@index([tenantId, docNumber, total, docDate])
-  // H-06: per-tenant dedup on SHA-256. Removes the race window between
-  // findFirst + create where two concurrent uploads of the same bytes
-  // would both insert. Prisma will surface a unique-violation that the
-  // service maps to the existing-row conflict response.
-  @@unique([tenantId, fileHash])
+  @@index([tenantId, supplierVerifiedAt])
+  // Trash listing / per-tenant restore lookups filter on `deletedAt`
+  // alongside `tenantId`, so a composite index keeps the query cheap.
+  @@index([tenantId, deletedAt])
   @@map("documents")
 }
 
 model DocumentItem {
-  id          String   @id @default(cuid())
-  documentId  String
-  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
-  code        String?
-  description String
-  quantity    Decimal  @default(1) @db.Decimal(12, 3)
-  unitPrice   Decimal  @db.Decimal(12, 4)
-  discount    Decimal  @default(0) @db.Decimal(12, 4)
-  taxRate    Decimal   @default(23) @db.Decimal(5, 2)
-  total       Decimal  @db.Decimal(12, 2)
-  createdAt   DateTime @default(now())
+  id              String   @id @default(cuid())
+  documentId      String
+  document        Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  code            String?
+  description     String
+  quantity        Decimal  @default(1) @db.Decimal(12, 3)
+  unitPrice       Decimal  @db.Decimal(12, 4)
+  discount        Decimal  @default(0) @db.Decimal(12, 4)
+  // Fase 4.2 (P0.3) — o valor impresso na coluna de desconto pode ser
+  // uma percentagem (a SAMMIC imprime "Dto. 30,00" = 30%, não 30 €).
+  // `discount` guarda sempre o VALOR resolvido em euros (para a soma
+  // das linhas continuar correta); `discountPercent` guarda a
+  // percentagem quando a classificação a determinou, para a interface
+  // mostrar "30%" em vez de "30,00 EUR".
+  discountPercent Decimal? @db.Decimal(6, 3)
+  taxRate         Decimal  @default(23) @db.Decimal(5, 2)
+  total           Decimal  @db.Decimal(12, 2)
+  createdAt       DateTime @default(now())
 
   @@index([documentId])
   @@map("document_items")
 }
 
+// Sprint 1.A — operator-confirmed field overrides recorded as immutable
+// rows so the audit trail can replay "who confirmed which field, when,
+// and with what value" without relying on the live Document snapshot.
+// One row per (documentId, field) pair — the latest write wins by
+// `confirmedAt DESC`, but rows are append-only (we never delete or
+// UPDATE these) so every historical confirmation survives even if the
+// Document row is hard-deleted later.
+model DocumentFieldConfirmation {
+  id            String   @id @default(cuid())
+  tenantId      String
+  documentId    String
+  document      Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  field         String // "supplierName" | "supplierNif" | "supplierIban" | ...
+  value         String // confirmed value as a string (decimal/date are stringified)
+  previousValue String? // optional pre-confirm snapshot — mirrors the diff in audit metadata
+  confirmedById String? // nullable so a tenant-wide bulk confirm can record `userId=null`
+  confirmedAt   DateTime @default(now())
+
+  @@index([tenantId, documentId])
+  @@index([tenantId, documentId, field])
+  @@index([tenantId, confirmedAt])
+  @@map("document_field_confirmations")
+}
+
+// Sprint 1.B — approval workflow.
+//
+// One row per approval request. The lifecycle is:
+//   1. Operator calls POST /:id/request-approval → row inserted with
+//      status=PENDING, Document.currentApprovalId points here.
+//   2. An APPROVER/ADMIN user calls POST /approvals/:id/{approve,
+//      reject, request-changes}. The row is mutated atomically with
+//      Document.status in a single Prisma transaction.
+//   3. After a decision, the row stays in history but
+//      Document.currentApprovalId is cleared so the document is no
+//      longer "pending".
+//
+// Audit row carries the BEFORE/AFTER diff so the forensic trail
+// survives even if the approval row is later purged. The self-decide
+// guard prevents the requester from approving their own request —
+// enforced at the service layer (controller-level RBAC is not enough
+// because requesters are OPERADOR, who would otherwise be allowed
+// through the role gate on the decide endpoints).
+model Approval {
+  id         String   @id @default(cuid())
+  tenantId   String
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  status        ApprovalStatus @default(PENDING)
+  requestedById String
+  requestedBy   User           @relation("ApprovalRequestedBy", fields: [requestedById], references: [id])
+  decidedById   String?
+  decidedBy     User?          @relation("ApprovalDecidedBy", fields: [decidedById], references: [id])
+  decidedAt     DateTime?
+  comment       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, status])
+  @@index([tenantId, documentId])
+  @@index([tenantId, requestedById])
+  @@index([tenantId, decidedById])
+  @@index([tenantId, createdAt])
+  @@map("approvals")
+}
+
 model Folder {
-  id        String   @id @default(cuid())
+  id        String     @id @default(cuid())
   tenantId  String
-  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   name      String
-  pattern   String?  // optional physical path pattern
+  pattern   String? // optional physical path pattern
   rules     Json?
   color     String?
   parentId  String?
-  parent    Folder?  @relation("FolderTree", fields: [parentId], references: [id])
-  children  Folder[] @relation("FolderTree")
+  parent    Folder?    @relation("FolderTree", fields: [parentId], references: [id])
+  children  Folder[]   @relation("FolderTree")
   documents Document[]
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
 
   @@unique([tenantId, name])
   @@index([tenantId, parentId])
@@ -508,8 +783,8 @@ model FolderRule {
   tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   name          String
   priority      Int      @default(0)
-  conditions    Json     // { type?, supplier?, emailDomain?, keywords?: [] }
-  folderPattern String   // e.g. "/{Ano}/{Mes}/{Tipo}/{Entidade}"
+  conditions    Json // { type?, supplier?, emailDomain?, keywords?: [] }
+  folderPattern String // e.g. "/{Ano}/{Mes}/{Tipo}/{Entidade}"
   isActive      Boolean  @default(true)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -519,19 +794,19 @@ model FolderRule {
 }
 
 model CsvTemplate {
-  id              String   @id @default(cuid())
-  tenantId        String
-  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  name            String
-  mapping         Json     // { date: "ColA", description: "ColB", amount: "ColC", ... }
-  dateFormat      String   @default("DD/MM/YYYY")
-  decimalSep      String   @default(",")
-  thousandSep     String   @default(".")
-  hasHeader       Boolean  @default(true)
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name          String
+  mapping       Json // { date: "ColA", description: "ColB", amount: "ColC", ... }
+  dateFormat    String   @default("DD/MM/YYYY")
+  decimalSep    String   @default(",")
+  thousandSep   String   @default(".")
+  hasHeader     Boolean  @default(true)
   // CAMT.053 support
-  camt053Config   Json?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  camt053Config Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   @@unique([tenantId, name])
   @@index([tenantId])
@@ -543,77 +818,173 @@ model CsvTemplate {
 // =============================================================================
 
 model Party {
-  id           String    @id @default(cuid())
-  tenantId     String
-  tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  type         PartyType @default(FORNECEDOR)
-  name         String
-  nif          String?
-  email        String?
-  phone        String?
-  mobile       String?
-  iban         String?
-  bic          String?
-  address      String?
-  city         String?
-  postalCode   String?
-  country      String    @default("PT")
-  website      String?
-  industry     String?
-  notes        String?
-  tags         String[]  @default([])
-  isActive     Boolean   @default(true)
+  id         String    @id @default(cuid())
+  tenantId   String
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  type       PartyType @default(FORNECEDOR)
+  name       String
+  nif        String?
+  email      String?
+  phone      String?
+  mobile     String?
+  iban       String?
+  bic        String?
+  address    String?
+  city       String?
+  postalCode String?
+  country    String    @default("PT")
+  website    String?
+  industry   String?
+  notes      String?
+  tags       String[]  @default([])
+  isActive   Boolean   @default(true)
 
   // Default accounting
-  defaultDebitAccountId   String?
-  defaultCreditAccountId  String?
-  paymentTermDays         Int?       @default(30)
+  defaultDebitAccountId  String?
+  defaultCreditAccountId String?
+  paymentTermDays        Int?    @default(30)
 
   // External CRM / ERP ids
-  externalIds Json?      // { hubspot, pipedrive, moloni, woocommerce }
+  externalIds Json? // { hubspot, pipedrive, moloni, woocommerce }
 
   // Anti-fraud flags
-  ibanVerified     Boolean   @default(false)
-  ibanVerifiedAt   DateTime?
-  ibanRiskScore    Int?      // 0..100
-  ibanFlagged      Boolean   @default(false)
+  ibanVerified   Boolean   @default(false)
+  ibanVerifiedAt DateTime?
+  ibanRiskScore  Int? // 0..100
+  ibanFlagged    Boolean   @default(false)
 
   // Recurring-supplier flag — flipped true by ExtractionService when
   // the supplier accumulates enough documents (>= 3) inside the tenant.
   // Drives folder-routing: recurring suppliers get their own folder,
   // occasional ones file under a general/category path. Set by the
   // auto-resolve supplier step on every Document extraction.
-  isRecurring      Boolean   @default(false)
+  isRecurring               Boolean @default(false)
+  // When true, suppresses the auto-flip on isRecurring in supplier-resolver.
+  // Only ADMIN may set/unset this flag via PATCH /parties/:id.
+  isRecurringManualOverride Boolean @default(false)
 
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  // Sprint E: URL/storage slug for the party — kebab-case ASCII of `name`.
+  // Persisted so the storage folder path stays stable across renames;
+  // regen on PATCH `name` (collision-checked with `<slug>-<id4>` suffix).
+  slug            String?
+  // Sprint E: free-text category the operator assigned (Estratégico,
+  // Operacional, Consultor, Recorrente, ...). Used by DocumentsService.approve
+  // to nest the file under `fornecedores/<slug>/<category>/<YYYY-MM>/`.
+  partyCategoryId String?
+  partyCategory   PartyCategory? @relation(fields: [partyCategoryId], references: [id], onDelete: SetNull)
 
+  // Sprint I: external-API enrichment metadata. Nullable — populated only
+  // when EnrichmentService runs the Sabi PT / VIES / manual provider chain.
+  // `enrichedAt` gates the 30-day TTL (skip re-fetch if recent). `source`
+  // records which provider succeeded. `error` records the last failure
+  // reason (timeout, rate-limit, manual-required) so the UI badge can
+  // surface "Sem dados externos disponíveis" honestly.
+  enrichedAt       DateTime?
+  enrichmentSource String?
+  enrichmentError  String?
+
+  // Fase 4 — perfil fiscal/comercial completo do fornecedor.
+  vatNumber         String? // NIF-IVA UE com prefixo de país (ESB06612386); PT usa `nif`
+  vatRegime         VatRegime @default(PT)
+  currency          String    @default("EUR")
+  directDebit       Boolean   @default(false)
+  billingEmail      String?
+  defaultCategoryId String?
+  defaultCategory   Category? @relation("PartyDefaultCategory", fields: [defaultCategoryId], references: [id], onDelete: SetNull)
+  // VIES (REST oficial da Comissão Europeia) — cache de 30 dias
+  viesValidatedAt   DateTime?
+  viesValid         Boolean?
+  viesName          String?
+  viesAddress       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  categoryStats PartyCategoryStat[]
   documents     Document[]
   payableItems  PayableItem[]
   ibanChanges   IbanHistory[]
-  contactRoles  String[]      @default([]) // legacy/projection of type
+  contacts      PartyContact[]
+  addresses     PartyAddress[]
+  contactRoles  String[]            @default([]) // legacy/projection of type
 
+  // Sprint E fix-up (audit §8 LOW-4): per-tenant unique on slug. Closes
+  // the race window between `generateUniqueSlug`'s findFirst and create —
+  // two concurrent creates with the same name both `findFirst` returns
+  // null and both attempt to insert the same `("tenantId", "slug")`
+  // pair, with the second hitting the unique violation deterministically.
+  // Replaces the previous plain @@index which only guarded the read.
+  @@unique([tenantId, slug])
   @@index([tenantId, name])
   @@index([tenantId, nif])
   @@index([tenantId, iban])
   @@index([tenantId, type])
   @@index([tenantId, ibanFlagged])
+  @@index([tenantId, partyCategoryId])
+  @@index([tenantId, vatNumber])
   @@map("parties")
+}
+
+// Fase 4 — contador de aprovações por (fornecedor, categoria de despesa).
+// Ao aprovar um documento com categoria incrementa; com >= 3 aprovações a
+// categoria passa a ser aplicada automaticamente na extração (confidence = 1).
+model PartyCategoryStat {
+  id             String    @id @default(cuid())
+  tenantId       String
+  partyId        String
+  party          Party     @relation(fields: [partyId], references: [id], onDelete: Cascade)
+  categoryId     String
+  category       Category  @relation("PartyCategoryStats", fields: [categoryId], references: [id], onDelete: Cascade)
+  approvedCount  Int       @default(0)
+  lastApprovedAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([partyId, categoryId])
+  @@index([tenantId, partyId])
+  @@map("party_category_stats")
+}
+
+// =============================================================================
+// PARTY CATEGORIES (Sprint E) — operator-defined buckets for master Parties.
+// Distinct from `Category` (which is per-expense classification of a
+// Document). A PartyCategory segments the master-record list — used to
+// group fornecedores/clientes for routing + reporting.
+// =============================================================================
+
+model PartyCategory {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  slug      String
+  name      String
+  color     String?
+  sortOrder Int     @default(100)
+
+  parties Party[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+  @@map("party_categories")
 }
 
 // IBAN anti-fraud vendor history (tracks every IBAN change per party)
 model IbanHistory {
-  id         String   @id @default(cuid())
-  tenantId   String
-  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  partyId    String
-  party      Party    @relation(fields: [partyId], references: [id], onDelete: Cascade)
-  oldIban    String?
-  newIban    String
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  partyId     String
+  party       Party    @relation(fields: [partyId], references: [id], onDelete: Cascade)
+  oldIban     String?
+  newIban     String
   changedById String?
-  reason     String?
-  verified   Boolean  @default(false)
-  createdAt  DateTime @default(now())
+  reason      String?
+  verified    Boolean  @default(false)
+  createdAt   DateTime @default(now())
 
   @@index([tenantId, partyId])
   @@index([tenantId, newIban])
@@ -627,12 +998,70 @@ model IbanBlacklist {
   tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   iban      String
   reason    String
-  source    String?  // "manual" | "fraud-network" | "validation"
+  source    String? // "manual" | "fraud-network" | "validation"
   createdAt DateTime @default(now())
 
   @@unique([tenantId, iban])
   @@index([tenantId])
   @@map("iban_blacklist")
+}
+
+// =============================================================================
+// PARTY CONTACTS + ADDRESSES (Sprint G — 360° file)
+// One-to-many from Party. Multiple contacts (CFO, contabilista, comercial) and
+// multiple addresses (BILLING / CORRESPONDENCE / OPERATIONAL / OTHER).
+// Migration of the legacy flatten columns (email/phone/mobile/address/city/
+// postalCode/country) is out of scope for Sprint G.1 — admin populates the
+// new tables manually via UI; flatten columns stay read/write.
+// =============================================================================
+
+model PartyContact {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  partyId   String
+  party     Party    @relation(fields: [partyId], references: [id], onDelete: Cascade)
+  name      String
+  role      String? // CFO, contabilista, comercial, etc.
+  email     String?
+  phone     String?
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Email unique-per-(tenant, party) only when present — Postgres treats
+  // NULL as distinct so multiple null emails on the same party are allowed.
+  // Service layer normalises "" to null before insert.
+  @@unique([tenantId, partyId, email])
+  @@index([partyId])
+  @@index([tenantId, partyId])
+  @@map("party_contacts")
+}
+
+model PartyAddress {
+  id         String           @id @default(cuid())
+  tenantId   String
+  tenant     Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  partyId    String
+  party      Party            @relation(fields: [partyId], references: [id], onDelete: Cascade)
+  type       PartyAddressType
+  line1      String
+  line2      String?
+  postalCode String?
+  city       String?
+  country    String           @default("PT")
+  isPrimary  Boolean          @default(false)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  // `isPrimary` is enforced per (partyId, type) in service-layer with
+  // `pg_advisory_xact_lock(hashtext('party_address_primary:' || partyId || ':' || type))`
+  // — Prisma 4 doesn't expose partial unique indexes in the DSL. The
+  // compound (partyId, type, isPrimary) index keeps "find the primary of
+  // type X" cheap.
+  @@index([partyId])
+  @@index([partyId, type, isPrimary])
+  @@map("party_addresses")
 }
 
 // =============================================================================
@@ -643,7 +1072,7 @@ model Account {
   id         String      @id @default(cuid())
   tenantId   String
   tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  code       String      // e.g. "221", "62", "31"
+  code       String // e.g. "221", "62", "31"
   name       String
   type       AccountType @default(EXPENSE)
   parentCode String?
@@ -654,9 +1083,9 @@ model Account {
   createdAt  DateTime    @default(now())
   updatedAt  DateTime    @updatedAt
 
-  debitDocs      Document[]    @relation("DocDebit")
-  creditDocs     Document[]    @relation("DocCredit")
-  journalLines   JournalLine[]
+  debitDocs    Document[]    @relation("DocDebit")
+  creditDocs   Document[]    @relation("DocCredit")
+  journalLines JournalLine[]
 
   @@unique([tenantId, code])
   @@index([tenantId, type])
@@ -665,18 +1094,18 @@ model Account {
 }
 
 model JournalLine {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   tenantId    String
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   documentId  String?
   document    Document? @relation(fields: [documentId], references: [id])
   accountId   String
-  account     Account  @relation(fields: [accountId], references: [id])
+  account     Account   @relation(fields: [accountId], references: [id])
   description String?
-  debit       Decimal  @default(0) @db.Decimal(14, 2)
-  credit      Decimal  @default(0) @db.Decimal(14, 2)
-  date        DateTime @default(now())
-  createdAt   DateTime @default(now())
+  debit       Decimal   @default(0) @db.Decimal(14, 2)
+  credit      Decimal   @default(0) @db.Decimal(14, 2)
+  date        DateTime  @default(now())
+  createdAt   DateTime  @default(now())
 
   @@index([tenantId, documentId])
   @@index([tenantId, accountId, date])
@@ -688,67 +1117,67 @@ model JournalLine {
 // =============================================================================
 
 model BankTransaction {
-  id          String   @id @default(cuid())
-  tenantId    String
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  date        DateTime
-  description String
-  amount      Decimal  @db.Decimal(14, 2) // +credit, -debit
-  balance     Decimal? @db.Decimal(14, 2)
-  reference   String?
+  date             DateTime
+  description      String
+  amount           Decimal  @db.Decimal(14, 2) // +credit, -debit
+  balance          Decimal? @db.Decimal(14, 2)
+  reference        String?
   counterpartyName String?
   counterpartyIban String?
-  rawRowJson  Json?
-  importHash  String   // SHA-256 of canonical row — duplicate guard
+  rawRowJson       Json?
+  importHash       String // SHA-256 of canonical row — duplicate guard
 
   // Optional direct link (after confirmed reconciliation)
-  expenseId       String?
-  expense         Expense?  @relation("BankExpense", fields: [expenseId], references: [id])
-  invoiceId       String?
-  invoice         Invoice?  @relation("BankInvoice", fields: [invoiceId], references: [id])
-  payableItemId   String?   @unique
-  payableItem     PayableItem? @relation("BankPayable", fields: [payableItemId], references: [id])
-  reconciledAt    DateTime?
-  reconciledById  String?
+  expenseId      String?
+  expense        Expense?     @relation("BankExpense", fields: [expenseId], references: [id])
+  invoiceId      String?
+  invoice        Invoice?     @relation("BankInvoice", fields: [invoiceId], references: [id])
+  payableItemId  String?      @unique
+  payableItem    PayableItem? @relation("BankPayable", fields: [payableItemId], references: [id])
+  reconciledAt   DateTime?
+  reconciledById String?
 
   importBatch String?
-  source      String?  // "CSV" | "CAMT.053"
+  source      String? // "CSV" | "CAMT.053"
   createdAt   DateTime @default(now())
 
   matches MatchSuggestion[]
 
-  @@index([tenantId, date])
-  @@index([tenantId, importHash])
-  @@index([tenantId, amount])
-  @@index([tenantId, reconciledAt])
   // H-08: per-tenant dedup on row/file hash. With `createMany({
   // skipDuplicates: true })` this turns the TOCTOU race (file-level
   // findFirst + then createMany) into a deterministic DB-level gate:
   // a concurrent import of the same file lands either-or-neither, never
   // both.
   @@unique([tenantId, importHash])
+  @@index([tenantId, date])
+  @@index([tenantId, importHash])
+  @@index([tenantId, amount])
+  @@index([tenantId, reconciledAt])
   @@map("bank_transactions")
 }
 
 model MatchSuggestion {
-  id                String      @id @default(cuid())
+  id                String          @id @default(cuid())
   tenantId          String
-  tenant            Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant            Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   bankTransactionId String
   bankTransaction   BankTransaction @relation(fields: [bankTransactionId], references: [id], onDelete: Cascade)
   expenseId         String?
-  expense           Expense?    @relation(fields: [expenseId], references: [id])
+  expense           Expense?        @relation(fields: [expenseId], references: [id])
   invoiceId         String?
-  invoice           Invoice?    @relation(fields: [invoiceId], references: [id])
+  invoice           Invoice?        @relation(fields: [invoiceId], references: [id])
   documentId        String?
-  document          Document?   @relation(fields: [documentId], references: [id])
-  score             Float       // 0..1
+  document          Document?       @relation(fields: [documentId], references: [id])
+  score             Float // 0..1
   matchType         MatchType
-  status            MatchStatus @default(PENDING)
-  reason            String?     // human-readable why matched
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
+  status            MatchStatus     @default(PENDING)
+  reason            String? // human-readable why matched
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
 
   @@index([tenantId, status])
   @@index([tenantId, bankTransactionId])
@@ -760,22 +1189,22 @@ model MatchSuggestion {
 // =============================================================================
 
 model Expense {
-  id                String   @id @default(cuid())
-  tenantId          String
-  tenant            Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  description       String?
-  amount            Decimal  @db.Decimal(14, 2)
-  date              DateTime?
-  supplier          String?
-  category          String?
-  documentId        String?
-  document          Document? @relation(fields: [documentId], references: [id])
-  status            String   @default("pendente")
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  id          String    @id @default(cuid())
+  tenantId    String
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  description String?
+  amount      Decimal   @db.Decimal(14, 2)
+  date        DateTime?
+  supplier    String?
+  category    String?
+  documentId  String?
+  document    Document? @relation(fields: [documentId], references: [id])
+  status      String    @default("pendente")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
-  bankTransactions  BankTransaction[] @relation("BankExpense")
-  matches           MatchSuggestion[]
+  bankTransactions BankTransaction[] @relation("BankExpense")
+  matches          MatchSuggestion[]
 
   @@index([tenantId, date])
   @@index([tenantId, status])
@@ -783,26 +1212,26 @@ model Expense {
 }
 
 model Invoice {
-  id           String   @id @default(cuid())
+  id           String      @id @default(cuid())
   tenantId     String
-  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant       Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   number       String?
   customer     String?
   supplier     String?
-  amount       Decimal  @db.Decimal(14, 2)
+  amount       Decimal     @db.Decimal(14, 2)
   date         DateTime?
   dueDate      DateTime?
-  status       String   @default("pending")
+  status       String      @default("pending")
   documentId   String?
-  document     Document? @relation(fields: [documentId], references: [id])
+  document     Document?   @relation(fields: [documentId], references: [id])
   crmContactId String?
   crmContact   CrmContact? @relation(fields: [crmContactId], references: [id])
   dealId       String?
   deal         Deal?       @relation(fields: [dealId], references: [id])
   payments     Payment[]
   source       String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
 
   bankTransactions BankTransaction[] @relation("BankInvoice")
   matches          MatchSuggestion[]
@@ -813,30 +1242,30 @@ model Invoice {
 }
 
 model PaymentSchedule {
-  id              String        @id @default(cuid())
-  tenantId        String
-  tenant          Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  title           String
-  description     String?
-  amount          Decimal       @db.Decimal(14, 2)
-  currency        String        @default("EUR")
-  dueDate         DateTime
-  paymentDate     DateTime?
-  status          PaymentStatus @default(TO_PAY)
-  category        String?
-  paymentMethod   String?       // sepa | mb | transfer | card | cash
-  documentId      String?
-  document        Document?     @relation(fields: [documentId], references: [id])
-  invoiceId       String?
-  crmContactId    String?
-  crmContact      CrmContact?   @relation(fields: [crmContactId], references: [id])
-  recurring       Boolean       @default(false)
-  recurrenceType  RecurrenceType?
+  id                 String          @id @default(cuid())
+  tenantId           String
+  tenant             Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  title              String
+  description        String?
+  amount             Decimal         @db.Decimal(14, 2)
+  currency           String          @default("EUR")
+  dueDate            DateTime
+  paymentDate        DateTime?
+  status             PaymentStatus   @default(TO_PAY)
+  category           String?
+  paymentMethod      String? // sepa | mb | transfer | card | cash
+  documentId         String?
+  document           Document?       @relation(fields: [documentId], references: [id])
+  invoiceId          String?
+  crmContactId       String?
+  crmContact         CrmContact?     @relation(fields: [crmContactId], references: [id])
+  recurring          Boolean         @default(false)
+  recurrenceType     RecurrenceType?
   recurrenceInterval Int?
-  createdById     String
-  createdBy       User          @relation(fields: [createdById], references: [id])
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  createdById        String
+  createdBy          User            @relation(fields: [createdById], references: [id])
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
 
   @@index([tenantId, dueDate])
   @@index([tenantId, status])
@@ -844,40 +1273,60 @@ model PaymentSchedule {
 }
 
 model Payment {
-  id         String   @id @default(cuid())
-  tenantId   String
-  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  invoiceId  String?
-  invoice    Invoice? @relation(fields: [invoiceId], references: [id])
+  id            String       @id @default(cuid())
+  tenantId      String
+  tenant        Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoiceId     String?
+  invoice       Invoice?     @relation(fields: [invoiceId], references: [id])
   payableItemId String?
-  payableItem PayableItem? @relation("PaymentToPayable", fields: [payableItemId], references: [id])
-  amount     Decimal  @db.Decimal(14, 2)
-  reference  String?
-  provider   String?  // ifthenpay | sepa | mbway
-  externalId String?
-  status     String   @default("pending")
-  rawPayload Json?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  payableItem   PayableItem? @relation("PaymentToPayable", fields: [payableItemId], references: [id])
+  amount        Decimal      @db.Decimal(14, 2)
+  reference     String?
+  provider      String? // ifthenpay | sepa | mbway
+  externalId    String?
+  status        String       @default("pending")
+  rawPayload    Json?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
 
   @@index([tenantId, status])
   @@index([tenantId, provider])
   @@map("payments")
 }
 
-model Category {
-  id                          String   @id @default(cuid())
-  tenantId                    String
-  tenant                      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  name                        String
-  slug                        String
-  color                       String?
-  defaultIvaDeductibilityPct  Int      @default(100)
-  notes                       String?
-  createdAt                   DateTime @default(now())
-  updatedAt                   DateTime @updatedAt
+/**
+ * Fase 4.1 — eixo "natureza" da classificação.
+ * A HotelEquip é revendedora: a maioria das faturas é compra de
+ * mercadoria para revenda, não despesa. Até aqui só existia "categoria
+ * de despesa", o que forçava a classificar compras como gastos. A
+ * natureza é o eixo contabilístico (CMVMC / FSE / gastos / imobilizado)
+ * e a categoria é o detalhe dentro dela.
+ */
+enum CategoryNature {
+  MERCADORIAS_REVENDA // 31.1 — compras para revenda (CMVMC)
+  MATERIAS_PRIMAS_SUBSIDIARIAS // 31.2 — matérias-primas e subsidiárias
+  SERVICOS_EXTERNOS // 62 — fornecimentos e serviços externos
+  DESPESA_OPERACIONAL // 62/63 — despesa corrente de funcionamento
+  IMOBILIZADO // 43 — ativos fixos tangíveis
+}
 
-  documents                   Document[] @relation("DocumentCategory")
+model Category {
+  id                         String         @id @default(cuid())
+  tenantId                   String
+  tenant                     Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name                       String
+  slug                       String
+  // Fase 4.1 — a que eixo contabilístico esta categoria pertence.
+  nature                     CategoryNature @default(DESPESA_OPERACIONAL)
+  color                      String?
+  defaultIvaDeductibilityPct Int            @default(100)
+  notes                      String?
+  createdAt                  DateTime       @default(now())
+  updatedAt                  DateTime       @updatedAt
+
+  documents         Document[]          @relation("DocumentCategory")
+  defaultForParties Party[]             @relation("PartyDefaultCategory")
+  partyStats        PartyCategoryStat[] @relation("PartyCategoryStats")
 
   @@unique([tenantId, slug])
   @@index([tenantId])
@@ -920,8 +1369,8 @@ model PayableItem {
   status        PaymentStatus @default(TO_PAY)
   paidAt        DateTime?
   paidAmount    Decimal?      @db.Decimal(14, 2)
-  paymentMethod String?       // sepa | mb | transfer | card | cash | other
-  paymentRef    String?       // ref MB, end-to-end SEPA, etc.
+  paymentMethod String? // sepa | mb | transfer | card | cash | other
+  paymentRef    String? // ref MB, end-to-end SEPA, etc.
   bankTxId      String?
   notes         String?
   approvedById  String?
@@ -944,32 +1393,32 @@ model PayableItem {
 // =============================================================================
 
 model CrmContact {
-  id           String   @id @default(cuid())
-  tenantId     String
-  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  type         ContactType @default(COMPANY)
-  name         String
-  nif          String?
-  email        String?
-  phone        String?
-  mobile       String?
-  address      String?
-  city         String?
-  postalCode   String?
-  country      String   @default("Portugal")
-  website      String?
-  industry     String?
-  notes        String?
-  tags         String[] @default([])
-  isActive     Boolean  @default(true)
-  partyId      String?  // optional link to master Party
+  id         String      @id @default(cuid())
+  tenantId   String
+  tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  type       ContactType @default(COMPANY)
+  name       String
+  nif        String?
+  email      String?
+  phone      String?
+  mobile     String?
+  address    String?
+  city       String?
+  postalCode String?
+  country    String      @default("Portugal")
+  website    String?
+  industry   String?
+  notes      String?
+  tags       String[]    @default([])
+  isActive   Boolean     @default(true)
+  partyId    String? // optional link to master Party
 
   contactPersons ContactPerson[]
-  deals        Deal[]
-  activities   Activity[]
-  documents    Document[]
-  invoices     Invoice[]
-  payments     PaymentSchedule[]
+  deals          Deal[]
+  activities     Activity[]
+  documents      Document[]
+  invoices       Invoice[]
+  payments       PaymentSchedule[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1001,7 +1450,7 @@ model CrmPipeline {
   tenantId  String
   tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   name      String
-  stages    Json     // ordered stage list
+  stages    Json // ordered stage list
   isDefault Boolean  @default(false)
   createdAt DateTime @default(now())
 
@@ -1010,28 +1459,28 @@ model CrmPipeline {
 }
 
 model Deal {
-  id               String    @id @default(cuid())
-  tenantId         String
-  tenant           Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  contactId        String
-  contact          CrmContact @relation(fields: [contactId], references: [id])
-  title            String
-  value            Decimal   @db.Decimal(14, 2)
-  stage            DealStage @default(LEAD)
-  probability      Int       @default(20)
+  id                String     @id @default(cuid())
+  tenantId          String
+  tenant            Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contactId         String
+  contact           CrmContact @relation(fields: [contactId], references: [id])
+  title             String
+  value             Decimal    @db.Decimal(14, 2)
+  stage             DealStage  @default(LEAD)
+  probability       Int        @default(20)
   expectedCloseDate DateTime?
-  wonAt            DateTime?
-  lostAt           DateTime?
-  pipelineId       String?
-  createdById      String
-  createdBy        User      @relation(fields: [createdById], references: [id])
+  wonAt             DateTime?
+  lostAt            DateTime?
+  pipelineId        String?
+  createdById       String
+  createdBy         User       @relation(fields: [createdById], references: [id])
 
-  invoices    Invoice[]
-  activities  Activity[]
-  documents   Document[]
+  invoices   Invoice[]
+  activities Activity[]
+  documents  Document[]
 
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([tenantId, stage])
   @@index([tenantId, contactId])
@@ -1068,17 +1517,17 @@ model Activity {
 // =============================================================================
 
 model Integration {
-  id          String   @id @default(cuid())
-  tenantId    String
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  provider    String   // toconline | ifthenpay | moloni | woocommerce | sage | quickbooks
-  credentials Json     // encrypted blob
-  config      Json?
-  isActive    Boolean  @default(true)
-  lastSyncAt  DateTime?
+  id             String    @id @default(cuid())
+  tenantId       String
+  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  provider       String // toconline | ifthenpay | moloni | woocommerce | sage | quickbooks
+  credentials    Json // encrypted blob
+  config         Json?
+  isActive       Boolean   @default(true)
+  lastSyncAt     DateTime?
   lastSyncStatus String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   @@unique([tenantId, provider])
   @@index([tenantId, isActive])
@@ -1096,7 +1545,7 @@ model Employee {
   employeeNumber  String
   fullName        String
   nif             String?
-  niss            String?        // Segurança Social
+  niss            String? // Segurança Social
   email           String?
   phone           String?
   address         String?
@@ -1111,13 +1560,13 @@ model Employee {
   department      String?
   baseSalary      Decimal?       @db.Decimal(12, 2)
   grossMonthly    Decimal?       @db.Decimal(12, 2)
-  irtConfig       Json?          // IRS config per employee
-  ssConfig        Json?          // SS config per employee
+  irtConfig       Json? // IRS config per employee
+  ssConfig        Json? // SS config per employee
   notes           String?
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 
-  payrollItems    PayrollItem[]
+  payrollItems PayrollItem[]
 
   @@unique([tenantId, employeeNumber])
   @@index([tenantId, status])
@@ -1126,22 +1575,22 @@ model Employee {
 }
 
 model PayrollPeriod {
-  id          String             @id @default(cuid())
-  tenantId    String
-  tenant      Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  year        Int
-  month       Int                // 1..12
-  status      PayrollPeriodStatus @default(OPEN)
-  closedAt    DateTime?
-  paidAt      DateTime?
-  totalGross  Decimal?           @db.Decimal(14, 2)
-  totalNet    Decimal?           @db.Decimal(14, 2)
-  totalTax    Decimal?           @db.Decimal(14, 2)
-  totalSS     Decimal?           @db.Decimal(14, 2)
-  createdAt   DateTime           @default(now())
-  updatedAt   DateTime           @updatedAt
+  id         String              @id @default(cuid())
+  tenantId   String
+  tenant     Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  year       Int
+  month      Int // 1..12
+  status     PayrollPeriodStatus @default(OPEN)
+  closedAt   DateTime?
+  paidAt     DateTime?
+  totalGross Decimal?            @db.Decimal(14, 2)
+  totalNet   Decimal?            @db.Decimal(14, 2)
+  totalTax   Decimal?            @db.Decimal(14, 2)
+  totalSS    Decimal?            @db.Decimal(14, 2)
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
 
-  items       PayrollItem[]
+  items PayrollItem[]
 
   @@unique([tenantId, year, month])
   @@index([tenantId, status])
@@ -1149,26 +1598,26 @@ model PayrollPeriod {
 }
 
 model PayrollItem {
-  id              String        @id @default(cuid())
-  tenantId        String
-  tenant          Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  periodId        String
-  period          PayrollPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
-  employeeId      String
-  employee        Employee      @relation(fields: [employeeId], references: [id])
-  baseSalary      Decimal       @db.Decimal(12, 2)
-  grossSalary     Decimal       @db.Decimal(12, 2)
-  irtTax          Decimal       @default(0) @db.Decimal(12, 2) // IRS retenção
-  ssEmployee      Decimal       @default(0) @db.Decimal(12, 2)
-  ssEmployer      Decimal       @default(0) @db.Decimal(12, 2)
-  netSalary       Decimal       @db.Decimal(12, 2)
-  status          PayrollStatus @default(DRAFT)
-  paidAt          DateTime?
-  receiptNumber   String?
-  receiptPdfKey   String?
-  breakdown       Json?         // line-by-line components
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  id            String        @id @default(cuid())
+  tenantId      String
+  tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  periodId      String
+  period        PayrollPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+  employeeId    String
+  employee      Employee      @relation(fields: [employeeId], references: [id])
+  baseSalary    Decimal       @db.Decimal(12, 2)
+  grossSalary   Decimal       @db.Decimal(12, 2)
+  irtTax        Decimal       @default(0) @db.Decimal(12, 2) // IRS retenção
+  ssEmployee    Decimal       @default(0) @db.Decimal(12, 2)
+  ssEmployer    Decimal       @default(0) @db.Decimal(12, 2)
+  netSalary     Decimal       @db.Decimal(12, 2)
+  status        PayrollStatus @default(DRAFT)
+  paidAt        DateTime?
+  receiptNumber String?
+  receiptPdfKey String?
+  breakdown     Json? // line-by-line components
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
 
   @@index([tenantId, periodId])
   @@index([tenantId, employeeId])
@@ -1180,28 +1629,28 @@ model PayrollItem {
 // =============================================================================
 
 model FleetVehicle {
-  id            String      @id @default(cuid())
-  tenantId      String
-  tenant        Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  plate         String
-  vin           String?
-  brand         String
-  model         String
-  year          Int?
-  fuelType      String?
-  status        FleetStatus @default(ATIVO)
-  purchaseDate  DateTime?
-  purchasePrice Decimal?    @db.Decimal(12, 2)
-  currentValue  Decimal?    @db.Decimal(12, 2)
-  insurance     Json?
-  inspection    Json?
+  id                   String      @id @default(cuid())
+  tenantId             String
+  tenant               Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  plate                String
+  vin                  String?
+  brand                String
+  model                String
+  year                 Int?
+  fuelType             String?
+  status               FleetStatus @default(ATIVO)
+  purchaseDate         DateTime?
+  purchasePrice        Decimal?    @db.Decimal(12, 2)
+  currentValue         Decimal?    @db.Decimal(12, 2)
+  insurance            Json?
+  inspection           Json?
   assignedToEmployeeId String?
-  notes         String?
-  createdAt     DateTime    @default(now())
-  updatedAt     DateTime    @updatedAt
+  notes                String?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
 
-  maintenance   FleetMaintenance[]
-  mileage       FleetMileage[]
+  maintenance FleetMaintenance[]
+  mileage     FleetMileage[]
 
   @@unique([tenantId, plate])
   @@index([tenantId, status])
@@ -1209,36 +1658,36 @@ model FleetVehicle {
 }
 
 model FleetMaintenance {
-  id          String   @id @default(cuid())
-  tenantId    String
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  vehicleId   String
-  vehicle     FleetVehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
-  date        DateTime
-  type        String   // oil | tires | repair | inspection | other
-  description String?
-  cost        Decimal  @db.Decimal(12, 2)
-  vendor      String?
-  mileage     Int?
+  id           String       @id @default(cuid())
+  tenantId     String
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  vehicleId    String
+  vehicle      FleetVehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  date         DateTime
+  type         String // oil | tires | repair | inspection | other
+  description  String?
+  cost         Decimal      @db.Decimal(12, 2)
+  vendor       String?
+  mileage      Int?
   receiptDocId String?
-  createdAt   DateTime @default(now())
+  createdAt    DateTime     @default(now())
 
   @@index([tenantId, vehicleId, date])
   @@map("fleet_maintenance")
 }
 
 model FleetMileage {
-  id        String   @id @default(cuid())
-  tenantId  String
-  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  vehicleId String
-  vehicle   FleetVehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
-  date      DateTime
-  km        Int
-  purpose   String?
+  id               String       @id @default(cuid())
+  tenantId         String
+  tenant           Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  vehicleId        String
+  vehicle          FleetVehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  date             DateTime
+  km               Int
+  purpose          String?
   driverEmployeeId String?
-  notes     String?
-  createdAt DateTime @default(now())
+  notes            String?
+  createdAt        DateTime     @default(now())
 
   @@index([tenantId, vehicleId, date])
   @@map("fleet_mileage")

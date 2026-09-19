@@ -25,6 +25,11 @@ apps/web/.env.local
 # User data — uploads
 apps/api/uploads/
 
+# DocFlow convention: scratch / trash dirs (underscore-prefixed = local-only)
+apps/api/_trash/
+apps/web/_trash/
+**/_trash/
+
 # Logs
 *.log
 npm-debug.log*
@@ -50,6 +55,13 @@ cloudflared.exe
 nohup.out
 
 # ============================================================
+# Local AI tooling — never commit
+# ============================================================
+.claude/
+.codex/
+docs/_overclock/
+
+# ============================================================
 # Test artifacts and scratch — never commit
 # ============================================================
 test-upload.sh
@@ -63,6 +75,95 @@ search.json
 e2e/
 apps/api/test-results/
 apps/api/dist/e2e/
+
+# Deploy worker noise (tunnel stderr from cloudflared runs)
+tunnel-*.err
+tunnel-*.log
+**/test-results/
+**/.last-run.json
+**/trace.zip
+**/*.zip
+# ============================================================
+# DocFlow — what to commit (everything below is EXCLUDED)
+# ============================================================
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+.turbo/
+
+# Env & secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+apps/api/.env
+apps/web/.env.local
+**/*.env
+**/*.env.local
+
+# User data — uploads
+apps/api/uploads/
+
+# DocFlow convention: scratch / trash dirs (underscore-prefixed = local-only)
+apps/api/_trash/
+apps/web/_trash/
+**/_trash/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+Thumbs.db
+
+# Cache
+.cache/
+.eslintcache
+*.tsbuildinfo
+
+# ============================================================
+# Overclock runtime — never commit
+# ============================================================
+.overclock-app/
+cloudflared.exe
+nohup.out
+
+# ============================================================
+# Local AI tooling — never commit
+# ============================================================
+.claude/
+.codex/
+docs/_overclock/
+
+# ============================================================
+# Test artifacts and scratch — never commit
+# ============================================================
+test-upload.sh
+login.json
+token.txt
+secrets.yml
+setup.sql
+search.json
+
+# Old load-test results from earlier exploration
+e2e/
+apps/api/test-results/
+apps/api/dist/e2e/
+
+# Deploy worker noise (tunnel stderr from cloudflared runs)
+tunnel-*.err
+tunnel-*.log
 **/test-results/
 **/.last-run.json
 **/trace.zip
@@ -71,3 +172,9 @@ apps/api/dist/e2e/
 **/*.webm
 **/*.log.lcov
 .playwright-mcp/
+
+samples/
+.coolify.env
+*.traineddata
+.agents/
+.gemini/

@@ -20,6 +20,11 @@ import { WooProvider } from './providers/woo.provider';
 @Module({
   controllers: [IntegrationsController],
   providers: [IntegrationsService, OAuthStateStore, WooProvider],
-  exports: [IntegrationsService],
+  // OAuthStateStore must be re-exported so that sibling modules (e.g.
+  // EmailInboundModule, which receives GmailService) can inject it through
+  // the IntegrationsModule DI boundary. Without this export NestJS raises
+  // "Nest can't resolve dependencies of the GmailService" at boot because
+  // the provider is module-private.
+  exports: [IntegrationsService, OAuthStateStore],
 })
 export class IntegrationsModule {}

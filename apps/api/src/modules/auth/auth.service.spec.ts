@@ -9,6 +9,7 @@ import * as bcrypt from 'bcryptjs';
 import { AuthService } from './auth.service';
 import { TwoFactorService } from './two-factor.service';
 import { AuditService } from '../audit/audit.service';
+import { __resetLoginLockoutForTests } from '../../common/auth/login-lockout';
 
 // ---------- helpers --------------------------------------------------------
 const TENANT = {
@@ -222,6 +223,11 @@ describe('AuthService', () => {
     config = buildConfig();
     audit = buildAuditMock();
     svc = new AuthService(prisma, jwt, config, twoFactor, audit);
+
+    // AUDIT §4.1: per-account lockout uses a process-wide singleton.
+    // Reset between tests so cross-test state never bleeds into the
+    // 5-failure threshold below.
+    __resetLoginLockoutForTests();
 
     hashedPassword = await bcrypt.hash('correct horse battery staple', 4); // low cost in tests
     ADMIN_USER.passwordHash = hashedPassword;

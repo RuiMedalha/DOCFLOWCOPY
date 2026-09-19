@@ -98,7 +98,9 @@ export class TaxSimulatorService {
         tenantId,
         docDate: { gte: windowStart, lt: windowEnd },
         // Excluded: drafts/archives that never had tax extracted.
-        status: { notIn: ['ARQUIVADO'] as never[] },
+        // Fase 3 — documentos não fiscais e duplicados nunca entram no IVA.
+        status: { notIn: ['ARQUIVADO', 'DUPLICADO'] as never[] },
+        fiscalStatus: { not: 'NAO_FISCAL' as never },
       },
       select: {
         id: true,
@@ -107,6 +109,10 @@ export class TaxSimulatorService {
         netAmount: true,
         taxAmount: true,
         total: true,
+        supplierNif: true,
+        correctedDocument: {
+          select: { id: true, type: true },
+        },
         items: {
           select: {
             total: true,
@@ -118,14 +124,10 @@ export class TaxSimulatorService {
 
     // Sale / purchase classification. NOTA_CREDITO flips direction (it
     // cancels a sale or a purchase), so it has to negate the originating
-    // document. Most credit notes cancel sales — so we classify NC as a
-    // sale (the sign flip via `sign` makes the contribution negative).
-    // TODO when `Document` learns `correctsDocumentId`, route each NC to
-    // the originating document's direction.
+    // document.
     const isSale = (type: string) =>
       type === 'FATURA_EMITIDA' ||
-      type === 'NOTA_DEBITO' ||
-      type === 'NOTA_CREDITO';
+      type === 'NOTA_DEBITO';
     const isPurchase = (type: string) =>
       type === 'FATURA_RECEBIDA' ||
       type === 'RECIBO' ||
@@ -142,9 +144,20 @@ export class TaxSimulatorService {
       documentCount++;
       if (doc.isIntracommunity) intracomunitarias++;
 
-      const sign = doc.type === 'NOTA_CREDITO' ? -1 : 1;
-      const liquidadoDoc = isSale(doc.type);
-      const deductivelDoc = isPurchase(doc.type);
+      const isNc = doc.type === 'NOTA_CREDITO';
+      const isPurchaseNc =
+        isNc &&
+        (doc.correctedDocument?.type === 'FATURA_RECEBIDA' ||
+          doc.correctedDocument?.type === 'RECIBO' ||
+          doc.correctedDocument?.type === 'COMPROVATIVO' ||
+          (Boolean(doc.supplierNif) && !doc.correctedDocument));
+      const isSaleNc =
+        isNc &&
+        (doc.correctedDocument?.type === 'FATURA_EMITIDA' || !isPurchaseNc);
+
+      const sign = isNc ? -1 : 1;
+      const liquidadoDoc = isSale(doc.type) || isSaleNc;
+      const deductivelDoc = isPurchase(doc.type) || isPurchaseNc;
 
       // Per-line buckets first (most accurate). If a doc has no items, fall
       // back to header totals with a synthetic rate derived from
@@ -152,9 +165,9 @@ export class TaxSimulatorService {
       if (doc.items.length > 0) {
         for (const item of doc.items) {
           const rate = Number(item.taxRate);
-          const lineTotal = Number(item.total);
-          const tax = lineTotal * (rate / (100 + rate)) * sign;
-          const base = (lineTotal - lineTotal * (rate / (100 + rate))) * sign;
+          const lineTotalAbs = Math.abs(Number(item.total));
+          const tax = lineTotalAbs * (rate / (100 + rate)) * sign;
+          const base = (lineTotalAbs - lineTotalAbs * (rate / (100 + rate))) * sign;
           this.addToBucket(buckets, rate, {
             baseLiquidado: liquidadoDoc ? base : 0,
             taxLiquidado: liquidadoDoc ? tax : 0,
@@ -164,12 +177,12 @@ export class TaxSimulatorService {
           });
         }
       } else if (doc.netAmount != null && doc.taxAmount != null) {
-        const base = Number(doc.netAmount) * sign;
-        const tax = Number(doc.taxAmount) * sign;
+        const base = Math.abs(Number(doc.netAmount)) * sign;
+        const tax = Math.abs(Number(doc.taxAmount)) * sign;
         // Derive a synthetic rate so the bucket exists for the validation
         // pass. Fall back to 0 (exempt) when the math doesn't work out.
         const syntheticRate =
-          base > 0 ? roundMoney((tax / base) * 100) : 0;
+          Math.abs(base) > 0 ? roundMoney((Math.abs(tax) / Math.abs(base)) * 100) : 0;
         this.addToBucket(buckets, syntheticRate, {
           baseLiquidado: liquidadoDoc ? base : 0,
           taxLiquidado: liquidadoDoc ? tax : 0,

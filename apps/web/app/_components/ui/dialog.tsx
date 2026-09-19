@@ -5,10 +5,13 @@
  *
  * - Closes on Escape, on backdrop click, on explicit close.
  * - Body scroll locked while open.
+ * - Rendered via React Portal into document.body to prevent parent container
+ *   CSS transforms/filters/scroll from clipping or mispositioning the modal.
  * - Focus trap is the caller's responsibility (keep the dialog small).
  */
 
-import { useEffect, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 
 export interface DialogProps {
@@ -36,6 +39,12 @@ export function Dialog({
   size = 'md',
   hideCloseButton = false,
 }: DialogProps) {
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
   useEffect(() => {
     if (!open) return;
     function onKey(e: KeyboardEvent) {
@@ -50,23 +59,23 @@ export function Dialog({
     };
   }, [open, onClose]);
 
-  if (!open) return null;
+  if (!open || !mounted) return null;
 
-  return (
+  return createPortal(
     <div
       role="dialog"
       aria-modal="true"
       aria-label={title}
       aria-describedby={description ? 'dialog-description' : undefined}
-      className="fixed inset-0 z-[100] flex items-center justify-center p-4"
+      className="fixed inset-0 z-[100] flex items-center justify-center p-4 overflow-y-auto"
     >
       <div
         aria-hidden="true"
-        className="absolute inset-0 bg-black/60 backdrop-blur-md animate-in"
+        className="fixed inset-0 bg-black/60 backdrop-blur-md animate-in"
         onClick={onClose}
       />
       <div
-        className={['relative w-full glass-card animate-pop p-6 md:p-7', SIZE_CLASS[size]].join(' ')}
+        className={['relative w-full glass-card animate-pop p-6 md:p-7 max-h-[90vh] overflow-y-auto shadow-2xl', SIZE_CLASS[size]].join(' ')}
       >
         {(title || !hideCloseButton) && (
           <div className="flex items-start justify-between gap-4 mb-4">
@@ -96,6 +105,7 @@ export function Dialog({
         )}
         {children}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

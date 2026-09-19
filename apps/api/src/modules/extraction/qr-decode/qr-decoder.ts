@@ -111,55 +111,109 @@ export async function autoOrientImage(
     if (logger) logger.warn(`[autoOrientImage] ${msg}`);
   };
   if (!/^image\//i.test(mime)) return buffer;
-  // Only JPEG carries the EXIF Orientation tag we care about. PNG /
-  // WebP / HEIC are passed through unchanged — the repo doesn't
-  // handle HEIC upstream of this function anyway.
+
+  // Sharp libvips pipeline de alta velocidade: auto-orientação EXIF + recorte inteligente + rotação landscape-to-portrait + contraste
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { ImageEnhancerService } = require('../image-enhancer.service');
+    const enhancer = new ImageEnhancerService();
+    if (enhancer.isAvailable()) {
+      return await enhancer.processDocumentImage(buffer, mime);
+    }
+  } catch (enhancerErr) {
+    log(`ImageEnhancer fallback: ${(enhancerErr as Error).message}`);
+  }
+
   const isJpeg = /^image\/(jpeg|jpg)$/i.test(mime);
   if (!isJpeg) return buffer;
 
-  // Detect rotation by reading the EXIF Orientation tag from the raw
-  // JPEG bytes BEFORE jimp auto-rotates (and clears the tag). We scan
-  // the EXIF segment directly so we don't depend on a parser module
-  // that may not be resolvable via pnpm's hoisting.
-  //
-  // JPEG structure: 0xFF 0xD8 (SOI) then segments. We look for the
-  // APP1 (EXIF) segment (0xFF 0xE1), then the TIFF header at offset 8
-  // (after `Exif\0\0`), then walk IFD entries until we find the
-  // Orientation tag (0x0112). Returns the orientation value (1..8)
-  // or undefined if any step fails.
   const orient = readExifOrientationFromJpeg(buffer);
-  const needsRotation = typeof orient === "number" && orient !== 1;
+  let needsRotation = typeof orient === "number" && orient !== 1;
   if (needsRotation) {
     log(`detected EXIF Orientation=${orient} — will re-encode upright`);
   }
 
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const jimpMod = require("jimp") as {
-      Jimp: { read: (b: Buffer) => Promise<unknown> };
+      Jimp: { read: (b: Buffer) => Promise<any> };
     };
     const Jimp = jimpMod.Jimp;
-    // Even when needsRotation is false, calling Jimp.read still applies
-    // the EXIF rotation internally — which is exactly what we want for
-    // ZXing (it sees upright pixels). We just skip the storage.put
-    // path below when needsRotation is false because the bytes are
-    // already upright.
-    const img = (await Jimp.read(buffer)) as {
-      bitmap: { width: number; height: number };
-      getBuffer: (
-        mime: string,
-        opts?: Record<string, unknown>,
-      ) => Promise<Buffer>;
-    };
+    const img = await Jimp.read(buffer);
+
+    // Apply EXIF rotation if present
+    if (typeof orient === "number" && orient !== 1) {
+      if (orient === 6) {
+        img.rotate(90);
+        needsRotation = true;
+        log(`applied EXIF Orientation 6 (90° CW rotation)`);
+      } else if (orient === 8) {
+        img.rotate(270);
+        needsRotation = true;
+        log(`applied EXIF Orientation 8 (270° CW rotation)`);
+      } else if (orient === 3) {
+        img.rotate(180);
+        needsRotation = true;
+        log(`applied EXIF Orientation 3 (180° rotation)`);
+      }
+    }
+
+    // ── Fase 4.3 (P0.2) — Rotação pelo conteúdo ────────────────────────
+    // Fotos de telemóvel muitas vezes não têm EXIF ou têm-no a 1 mesmo
+    // estando a imagem deitada. Se o EXIF não rodou ou não existe,
+    // usamos deteção de orientação pelo conteúdo (Tesseract OSD) e,
+    // caso a imagem continue na horizontal (width > height), comparamos
+    // o OCR a 90° e 270° para rodar para a vertical correta.
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { createWorker } = require("tesseract.js");
+      const worker = await createWorker("osd", 0);
+      const osd = await worker.detect(buffer);
+      await worker.terminate();
+
+      const deg = osd?.data?.orientation_degrees;
+      const conf = osd?.data?.orientation_confidence ?? 0;
+      if (typeof deg === "number" && deg > 0 && deg < 360 && conf >= 1.5) {
+        const rot = (360 - deg) % 360;
+        img.rotate(rot);
+        needsRotation = true;
+        log(`content OSD detected orientation_degrees=${deg} (conf=${conf.toFixed(2)}) — rotated by ${rot}°`);
+      }
+    } catch (osdErr) {
+      // OSD falhou ou sem caracteres suficientes — prosseguir para scoring se for horizontal
+    }
+
+    if (img.bitmap.width > img.bitmap.height) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { createWorker } = require("tesseract.js");
+        const worker = await createWorker("por+eng", 1);
+
+        const buf90 = await img.clone().rotate(90).getBuffer("image/jpeg", { quality: 75 });
+        const res90 = await worker.recognize(buf90);
+        const score90 = (res90?.data?.confidence || 0) * Math.max(1, (res90?.data?.text || "").trim().length);
+
+        const buf270 = await img.clone().rotate(270).getBuffer("image/jpeg", { quality: 75 });
+        const res270 = await worker.recognize(buf270);
+        const score270 = (res270?.data?.confidence || 0) * Math.max(1, (res270?.data?.text || "").trim().length);
+
+        await worker.terminate();
+
+        const winner = score270 >= score90 ? 270 : 90;
+        img.rotate(winner);
+        needsRotation = true;
+        log(
+          `landscape image (${img.bitmap.height}x${img.bitmap.width}) scored 90° (${score90}) vs 270° (${score270}) — rotated by ${winner}° to portrait`,
+        );
+      } catch (scoreErr) {
+        log(`landscape OCR scoring failed: ${(scoreErr as Error).message}`);
+      }
+    }
+
     if (!needsRotation) return buffer;
-    // Re-encode the upright bitmap as JPEG without the EXIF segment.
-    // jimp's getBuffer emits a fresh JPEG without copying the EXIF
-    // blocks from the source. 92% quality matches the upload default.
     const out = await img.getBuffer("image/jpeg", { quality: 92 });
-    const upright = Buffer.from(out as Buffer);
-    return upright;
+    return Buffer.from(out as Buffer);
   } catch (err) {
-    log(`jimp orientation failed: ${(err as Error).message}`);
+    log(`orientation failed: ${(err as Error).message}`);
     return buffer;
   }
 }
@@ -386,12 +440,9 @@ export async function decodeAtQr(
   const baseH = base.bitmap.height;
   log(`decodeAtQr: working bitmap ${baseW}×${baseH} (orig ${img.bitmap.width}×${img.bitmap.height})`);
 
-  // For real phone photos, jimp's EXIF auto-rotation puts the QR
-  // upright — so rotation 0 is the right answer >90% of the time.
-  // We try 90 (clockwise rotated, e.g. portrait sensor capture) and
-  // 270 (CCW) just in case the EXIF tag was wrong, and skip 180
-  // (which is rare and would have been the EXIF value if present).
-  const rotations: number[] = [0, 90, 270];
+  // For real phone photos, test 0°, 90°, 180°, and 270°. Inverted phone
+  // photos frequently place the QR at 180° when EXIF orientation is missing.
+  const rotations: number[] = [0, 90, 180, 270];
   // Scales: 1× first (the most likely answer — small QR vs working
   // bitmap is OK because ZXing's binarizer handles small modules
   // well), then 1.5× and 2× as upsamples to give the binarizer

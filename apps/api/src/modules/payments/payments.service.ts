@@ -8,6 +8,7 @@ import {
 import { randomUUID } from 'crypto';
 import {
   AuditAction,
+  DocumentStatus,
   PaymentEventStatus,
   PaymentStatus,
   Prisma,
@@ -109,6 +110,11 @@ export class PaymentsService {
    * window, partyId, approved-only, overdue-only.
    */
   async listPayables(tenantId: string, query: ListPayablesQueryDto) {
+    // Self-healing sync: bring in any active documents with payment dates that don't have a PayableItem
+    await this.syncMissingDocumentPayables(tenantId).catch((err) => {
+      this.logger.warn(`Failed auto-syncing document payables for tenant ${tenantId}: ${err.message}`);
+    });
+
     const where: Prisma.PayableItemWhereInput = { tenantId };
     if (query.status) where.status = query.status;
     if (query.partyId) where.partyId = query.partyId;
@@ -197,6 +203,85 @@ export class PaymentsService {
       await this.partyMap([p.partyId].filter(Boolean) as string[], tenantId),
       await this.documentMap([p.documentId].filter(Boolean) as string[], tenantId),
     );
+  }
+
+  /**
+   * Self-healing sync: scans the tenant's documents for any active items that
+   * have a dueDate or paymentDueDate but do NOT yet have a PayableItem linked.
+   * Auto-creates them so the "Contas a Pagar" view always reflects reality.
+   */
+  async syncMissingDocumentPayables(tenantId: string): Promise<number> {
+    const unlinkedDocs = await this.prisma.document.findMany({
+      where: {
+        tenantId,
+        deletedAt: null,
+        status: { notIn: [DocumentStatus.REJEITADO, DocumentStatus.ARQUIVADO] },
+        OR: [
+          { dueDate: { not: null } },
+          { paymentDueDate: { not: null } },
+          { total: { gt: 0 } },
+        ],
+        payableItems: { none: {} },
+      },
+      select: {
+        id: true,
+        tenantId: true,
+        partyId: true,
+        supplier: true,
+        docNumber: true,
+        fileName: true,
+        total: true,
+        netAmount: true,
+        docDate: true,
+        dueDate: true,
+        paymentDueDate: true,
+        status: true,
+        paymentStatus: true,
+        metadata: true,
+        createdAt: true,
+      },
+      take: 100,
+    });
+
+    let count = 0;
+    for (const doc of unlinkedDocs) {
+      const effectiveDueDate = doc.dueDate ?? doc.paymentDueDate ?? doc.docDate ?? doc.createdAt ?? new Date();
+      const effectiveAmount = doc.total ?? doc.netAmount;
+      const amountNum = effectiveAmount ? Number(effectiveAmount) : 0;
+
+      let payableStatus: PaymentStatus = PaymentStatus.TO_PAY;
+      if (doc.paymentStatus === PaymentStatus.PAID) {
+        payableStatus = PaymentStatus.PAID;
+      } else if (doc.paymentStatus === PaymentStatus.SCHEDULED) {
+        payableStatus = PaymentStatus.SCHEDULED;
+      } else if (doc.paymentStatus === PaymentStatus.CANCELLED) {
+        payableStatus = PaymentStatus.CANCELLED;
+      } else if (effectiveDueDate && new Date(effectiveDueDate) < new Date()) {
+        payableStatus = PaymentStatus.OVERDUE;
+      }
+
+      const description = `${doc.supplier ?? 'Fornecedor'} — ${doc.docNumber ?? doc.fileName}`;
+      const metaPaymentMethod =
+        doc.metadata && typeof doc.metadata === 'object' && (doc.metadata as any).paymentMethod
+          ? (doc.metadata as any).paymentMethod
+          : null;
+
+      await this.prisma.payableItem.create({
+        data: {
+          tenantId,
+          documentId: doc.id,
+          partyId: doc.partyId ?? null,
+          description,
+          amount: new Prisma.Decimal(amountNum > 0 ? amountNum : 0),
+          dueDate: effectiveDueDate ?? new Date(),
+          status: payableStatus,
+          paymentMethod: metaPaymentMethod ?? null,
+          approvedAt: doc.status === DocumentStatus.APROVADO ? new Date() : null,
+        },
+      });
+      count++;
+    }
+    return count;
   }
 
   /**
@@ -376,6 +461,7 @@ export class PaymentsService {
         approvedAt: true,
         amount: true,
         partyId: true,
+        documentId: true,
       },
     });
     if (!existing) throw new NotFoundException('PayableItem not found');
@@ -399,6 +485,15 @@ export class PaymentsService {
         status: PaymentStatus.SCHEDULED,
       },
     });
+
+    if (existing.documentId) {
+      await this.prisma.document.update({
+        where: { id: existing.documentId },
+        data: { paymentStatus: PaymentStatus.SCHEDULED },
+      }).catch((err) => {
+        this.logger.warn(`Failed updating document paymentStatus on approve: ${err.message}`);
+      });
+    }
 
     await this.audit.log({
       tenantId,
@@ -441,6 +536,7 @@ export class PaymentsService {
         status: true,
         amount: true,
         approvedAt: true,
+        documentId: true,
       },
     });
     if (!existing) throw new NotFoundException('PayableItem not found');
@@ -488,6 +584,15 @@ export class PaymentsService {
             : undefined,
       },
     });
+
+    if (existing.documentId) {
+      await this.prisma.document.update({
+        where: { id: existing.documentId },
+        data: { paymentStatus: PaymentStatus.PAID },
+      }).catch((err) => {
+        this.logger.warn(`Failed updating document status on mark-paid: ${err.message}`);
+      });
+    }
 
     await this.audit.log({
       tenantId,
